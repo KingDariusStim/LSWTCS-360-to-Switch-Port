@@ -1008,6 +1008,8 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
     ID3D12RootSignature* st_rs = nullptr; ID3D12PipelineState* st_pso = nullptr; int st_topo = -1;
     D3D12_VIEWPORT st_vp = {}; D3D12_RECT st_sc = {}; bool st_vp_valid = false; uint64_t st_blits = g_xd_blit_count;
     XdTexLast tl[2] = {}; XdSmpLast sl[2] = {};   // last texture / sampler table per stage (0 = PS, 1 = VS)
+    uint32_t st_cbv[5] = {~0u, ~0u, ~0u, ~0u, ~0u};   // arena offsets bound to root CBVs 0-4 (~0 = unknown)
+    uint64_t st_tbl[16] = {};                          // GPU handle bound per root descriptor-table slot (0 = unknown)
     uint32_t smp_overflow = 0;
     uint64_t bound_key = ~0ull;   // (color RT, depth RT) currently bound
     uint32_t resolves = 0, rt_draws = 0, res_tex_binds = 0;
@@ -1207,21 +1209,28 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         if (!pso) { ++skipped; continue; }
         uint64_t t_draw = gp_now();   // GP_RP_DRAW: root/state/draw calls, bind excluded
         if (g_xd_blit_count != st_blits) { st_rs = nullptr; st_pso = nullptr; st_topo = -1; st_vp_valid = false; st_blits = g_xd_blit_count; }   // a blit set its own state
-        if (rs != st_rs || !bindcache) { g_cmd->SetGraphicsRootSignature(rs); st_rs = rs; }
+        if (rs != st_rs || !bindcache) {   // a root signature change invalidates every root argument
+            g_cmd->SetGraphicsRootSignature(rs); st_rs = rs;
+            for (uint32_t& o : st_cbv) o = ~0u;
+            for (uint64_t& t : st_tbl) t = 0;
+            g_cmd->SetGraphicsRootDescriptorTable(5, shm_table);
+        }
         if (pso != st_pso || !bindcache) { g_cmd->SetPipelineState(pso); st_pso = pso; }
-        g_cmd->SetGraphicsRootConstantBufferView(0, up + r.cb_fetch_off);
-        g_cmd->SetGraphicsRootConstantBufferView(1, up + r.cb_vsf_off);
-        g_cmd->SetGraphicsRootConstantBufferView(2, up + r.cb_psf_off);
-        g_cmd->SetGraphicsRootConstantBufferView(3, up + r.cb_sys_off);
-        g_cmd->SetGraphicsRootConstantBufferView(4, up + r.cb_bool_off);
-        g_cmd->SetGraphicsRootDescriptorTable(5, shm_table);
+        const uint32_t cbv[5] = {r.cb_fetch_off, r.cb_vsf_off, r.cb_psf_off, r.cb_sys_off, r.cb_bool_off};
+        for (UINT k = 0; k < 5; ++k)
+            if (cbv[k] != st_cbv[k]) { g_cmd->SetGraphicsRootConstantBufferView(k, up + cbv[k]); st_cbv[k] = bindcache ? cbv[k] : ~0u; }
         UINT param = 6;
         const uint32_t* fetch_all = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
         static int notex = -1; if (notex < 0) { const char* e = getenv("LSWTCS_GPUDRAW_NOTEX"); notex = (e && e[0] == '1') ? 1 : 0; }
+        auto set_table = [&](UINT p, D3D12_GPU_DESCRIPTOR_HANDLE g) {   // skip if already bound at this root slot
+            if (p < 16 && st_tbl[p] == g.ptr) return;
+            g_cmd->SetGraphicsRootDescriptorTable(p, g);
+            if (p < 16) st_tbl[p] = g.ptr;
+        };
         // Texture table as view specs; a table identical to one already written this replay reuses its
         // descriptors (hub: ~2500 texture binds/frame, far fewer distinct tables) instead of creating SRVs.
         auto tex_table_cached = [&](int stage, uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
-            if (xd_tex_same(tl[stage], fetch_all, count, dims, fetches)) { g_cmd->SetGraphicsRootDescriptorTable(param++, tl[stage].g); return; }
+            if (xd_tex_same(tl[stage], fetch_all, count, dims, fetches)) { set_table(param++, tl[stage].g); return; }
             tl[stage].valid = false;
             if (count > 32) count = 32;
             XdSrvSpec sp[32];
@@ -1282,7 +1291,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                 g_xd_srv_tables[h] = XdSrvTable{first, count};
             }
             D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_srv_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_srv_inc;
-            g_cmd->SetGraphicsRootDescriptorTable(param++, g);
+            set_table(param++, g);
             xd_tex_remember(tl[stage], fetch_all, count, dims, fetches, g);
         };
         auto tex_table = [&](int stage, uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
@@ -1342,7 +1351,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             if (!count) return;
             if (count > LSW_GPU_MAX_TEX) count = LSW_GPU_MAX_TEX;
             if (bindcache) {
-                if (xd_smp_same(sl[stage], fetch_all, count, bind)) { g_cmd->SetGraphicsRootDescriptorTable(param++, sl[stage].g); return; }
+                if (xd_smp_same(sl[stage], fetch_all, count, bind)) { set_table(param++, sl[stage].g); return; }
                 sl[stage].valid = false;
             }
             GpScope gps(GP_RP_SMP);
@@ -1380,7 +1389,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                     if (++ntab <= 8 || (ntab % 64) == 0) { printf("[SMPCACHE] %u tables, %u/%u samplers used\n", ntab, g_xd_smp_next, kXdSmpPerFrame * kFrameCount); fflush(stdout); }
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_smp_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_smp_inc;
-                g_cmd->SetGraphicsRootDescriptorTable(param++, g);
+                set_table(param++, g);
                 xd_smp_remember(sl[stage], fetch_all, count, bind, g);
                 return;
             }

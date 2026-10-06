@@ -3259,7 +3259,11 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     r.ps_dxbc = d.ps_dxbc; r.ps_size = uint32_t(d.ps_dxbc_size); r.ps_key = d.ps_key;
     auto put = [&](const void* src0, uint32_t size, uint32_t& off_out) {
         off_out = f.alloc(size ? size : 16); if (size) memcpy(f.arena.data() + off_out, src0, size); };
-    r.cb_sys_size = d.system_constants_size; put(d.system_constants, d.system_constants_size, r.cb_sys_off);
+    // LSWTCS_CBDEDUP (default on): a constant block identical to the previous draw's reuses its arena copy.
+    static int cbdedup = -1; if (cbdedup < 0) { const char* e = getenv("LSWTCS_CBDEDUP"); cbdedup = (e && e[0] == '0') ? 0 : 1; }
+    auto put_cb = [&](int kind, const void* src0, uint32_t size, uint32_t& off_out) {
+        off_out = f.put_block(kind, size ? size : 16, src0, size, nullptr, 0, cbdedup == 1); };
+    r.cb_sys_size = d.system_constants_size; put_cb(0, d.system_constants, d.system_constants_size, r.cb_sys_off);
     // Float constants are bound as root CBVs, which have no size: a relative read c[a0+N] past the
     // block would return the next draw's arena bytes (NaN / huge -> exploded shadow-pass vertices).
     // A full 256-entry block means dynamic addressing, so reserve 512 entries. Xenos has ONE 512-entry
@@ -3276,19 +3280,16 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
           static const char* const kNames[4] = {"OFF (no padding)", "PS constants", "zeros (Xenia)", "wrap mod 256"};
           printf("[CBPAD] mode %d: %s\n", cbpad, kNames[cbpad]); fflush(stdout);
       } }
-    auto put_float = [&](const float* src0, uint32_t count, const uint32_t* tail, uint32_t& size_out, uint32_t& off_out) {
+    auto put_float = [&](int kind, const float* src0, uint32_t count, const uint32_t* tail, uint32_t& size_out, uint32_t& off_out) {
         size_out = count * 16;
-        if (!cbpad || count < 256) { put(src0, size_out, off_out); return; }
-        off_out = f.alloc(512 * 16);
-        memcpy(f.arena.data() + off_out, src0, size_out);
-        if (tail && cbpad == 1) memcpy(f.arena.data() + off_out + size_out, tail, 512 * 16 - size_out);
-        else if (tail && cbpad == 3) memcpy(f.arena.data() + off_out + size_out, src0, 512 * 16 - size_out);
-        else memset(f.arena.data() + off_out + size_out, 0, 512 * 16 - size_out);
+        if (!cbpad || count < 256) { put_cb(kind, src0, size_out, off_out); return; }
+        const void* b = (tail && cbpad == 1) ? (const void*)tail : (tail && cbpad == 3) ? (const void*)src0 : nullptr;
+        off_out = f.put_block(kind, 512 * 16, src0, size_out, b, b ? 512 * 16 - size_out : 0, cbdedup == 1);
     };
-    put_float(d.vs_float, d.vs_float_count, &g_xe_regs[0x4400], r.cb_vsf_size, r.cb_vsf_off);   // SHADER_CONSTANT_256_X
-    put_float(d.ps_float, d.ps_float_count, nullptr, r.cb_psf_size, r.cb_psf_off);
-    put(d.bool_loop, 40 * 4, r.cb_bool_off);
-    put(d.fetch, 192 * 4, r.cb_fetch_off);
+    put_float(1, d.vs_float, d.vs_float_count, &g_xe_regs[0x4400], r.cb_vsf_size, r.cb_vsf_off);   // SHADER_CONSTANT_256_X
+    put_float(2, d.ps_float, d.ps_float_count, nullptr, r.cb_psf_size, r.cb_psf_off);
+    put_cb(3, d.bool_loop, 40 * 4, r.cb_bool_off);
+    put_cb(4, d.fetch, 192 * 4, r.cb_fetch_off);
     // Vertex data snapshot (guest physical ranges -> shared memory at replay).
     r.first_range = uint32_t(f.ranges.size());
     gp0 = gp_now();

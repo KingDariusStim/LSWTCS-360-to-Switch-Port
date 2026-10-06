@@ -128,7 +128,18 @@ unchanged root CBVs. That is the next cheap win and also helps §5.2.
 d-pad movement, pause menu open (grayscale world, 48 draws) / navigate / Resume, 90 s idle: all screens
 correct. 160 hub samples: wall avg 16.86 ms (locked 60), max 21.96 (pause/resume transition), replay avg
 3.18 ms, guest wait for render thread 0.01 ms, no OVERFLOW/STALE/PSO-fail lines. Not covered: entering a
-level (press_now has no analog stick).
+level (press_now has no analog stick). Committed as `8c092ce`.
+
+**Constant-block dedup (`LSWTCS_CBDEDUP`, default on; `=0` for A/B):** `LswGpuFrame::put_block` reuses the
+previous draw's block of the same kind (sys / VS float / PS float / bool / fetch) when byte-identical
+(state reset in `clear()`); replay skips root CBVs whose offset didn't change and descriptor tables
+already bound at the same root slot (`st_cbv`/`st_tbl`, reset on root-signature change or any blit).
+A/B: arena 3.1 → 2.0 MB/frame, `draw` 1.35 → 0.9 ms; play test with the table-slot skip: replay avg
+3.18 → 2.42 ms, render thread (present) 4.87 → 3.00 ms, wall 16.81 locked, title/hub/pause/movement
+correct. Guest-side `record` change within noise. **What keeps the arena at 2 MB:** VS float blocks
+that differ per object (world matrices) are full 256-register snapshots padded to 8 KB (zero tail for
+dynamic indexing). Removing that needs sized CBVs (descriptor-table CBVs return 0 out of bounds) or
+per-register dirty tracking — a root-signature change, not done.
 
 ### 5.1 Render-thread CPU cost (was ~5 ms here, ~35–60 ms on Switch).
 Replay sub-stages last measured: bind ~3 ms, arena→upload ~0.3, prepass ~0.4, pso ~0.1, and the remainder

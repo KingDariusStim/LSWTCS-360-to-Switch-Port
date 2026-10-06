@@ -74,7 +74,26 @@ struct LswGpuFrame {
   // residency tracking assumed them done, so they are issued before this frame's draws.
   std::vector<LswGpuRange> prelude;
   uint32_t swap_fb = 0;   // frontbuffer address in the PM4_XE_SWAP packet that ended this frame
-  void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); }
+  // Last constant block written per kind (LswCbKind), for put_block's reuse check.
+  uint32_t cb_last_off[5] = {~0u, ~0u, ~0u, ~0u, ~0u}, cb_last_total[5] = {}, cb_last_na[5] = {}, cb_last_nb[5] = {};
+  void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); for (uint32_t& o : cb_last_off) o = ~0u; }
+  // Constant block = [a: na bytes][b: nb bytes][zeros up to total, then to the next 256 bytes]. Reuses
+  // the previous block of the same kind when identical (consecutive draws mostly share constants; every
+  // draw copying its own ~20 KB made the arena ~3 MB/frame). dedup=false always appends.
+  uint32_t put_block(int kind, uint32_t total, const void* a, uint32_t na, const void* b, uint32_t nb, bool dedup) {
+    if (dedup && cb_last_off[kind] != ~0u && cb_last_total[kind] == total && cb_last_na[kind] == na && cb_last_nb[kind] == nb) {
+      const uint8_t* p = arena.data() + cb_last_off[kind];
+      if ((!na || std::memcmp(p, a, na) == 0) && (!nb || std::memcmp(p + na, b, nb) == 0)) return cb_last_off[kind];
+    }
+    uint32_t padded = (total + 255u) & ~255u;
+    uint32_t off = alloc_uninit(padded);
+    uint8_t* p = arena.data() + off;
+    if (na) std::memcpy(p, a, na);
+    if (nb) std::memcpy(p + na, b, nb);
+    std::memset(p + na + nb, 0, padded - na - nb);
+    cb_last_off[kind] = off; cb_last_total[kind] = total; cb_last_na[kind] = na; cb_last_nb[kind] = nb;
+    return off;
+  }
   // Zero-filled (constant buffers: padding and short blocks must read as 0).
   uint32_t alloc(uint32_t size, uint32_t align = 256) {
     size_t old = arena.size();
