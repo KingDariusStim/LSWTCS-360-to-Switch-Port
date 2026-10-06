@@ -1,0 +1,31 @@
+diff --git a/src/xenia/gpu/dxbc_shader_translator.cc b/src/xenia/gpu/dxbc_shader_translator.cc
+index 7af15bc..3094eee 100644
+--- a/src/xenia/gpu/dxbc_shader_translator.cc
++++ b/src/xenia/gpu/dxbc_shader_translator.cc
+@@ -3431,7 +3431,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
+         dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_float_constants_,
+                       uint32_t(CbufferRegister::kFloatConstants),
+                       uint32_t(CbufferRegister::kFloatConstants)),
+-        constant_register_map.float_count,
++        // LSWTCS: relative addressing c[a0+N] can reach index 255+255; declare 512 so the
++        // driver reads the runtime's padding (kernel_stubs.cpp put_float) instead of treating
++        // reads past the declared size as undefined (observed: 0/NaN skinned vertices).
++        constant_register_map.float_dynamic_addressing
++            ? std::max(constant_register_map.float_count, uint32_t(512))
++            : constant_register_map.float_count,
+         constant_register_map.float_dynamic_addressing
+             ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
+             : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
+diff --git a/src/xenia/gpu/shader_interpreter.cc b/src/xenia/gpu/shader_interpreter.cc
+index ec7cf9a..a6be977 100644
+--- a/src/xenia/gpu/shader_interpreter.cc
++++ b/src/xenia/gpu/shader_interpreter.cc
+@@ -1038,7 +1038,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(
+           trace_writer_->WriteMemoryRead(
+               sizeof(uint32_t) * dword_address_dwords, sizeof(uint32_t));
+         }
+-        dword_value = xenos::GpuSwap(memory_dwords[dword_address_dwords],
++        dword_value = xenos::GpuSwap(memory_dwords[dword_address_dwords & 0x07FFFFFFu],  /* LSWTCS: 29-bit phys mask (512MB membase) */
+                                      fetch_constant.endian);
+       }
+       data[i] = dword_value;

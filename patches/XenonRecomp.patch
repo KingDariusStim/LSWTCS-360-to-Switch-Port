@@ -1,0 +1,22 @@
+diff --git a/XenonUtils/symbol_table.h b/XenonUtils/symbol_table.h
+index ca3ab70..355fce6 100644
+--- a/XenonUtils/symbol_table.h
++++ b/XenonUtils/symbol_table.h
+@@ -17,7 +17,7 @@ public:
+         auto match = end();
+         for (auto it = beginIt; it != endIt; ++it)
+         {
+-            if (address < it->address || address >= it->address + it->size)
++            if (address < it->address || (it->size != 0 && address >= it->address + it->size))
+             {
+                 continue;
+             }
+@@ -45,7 +45,7 @@ public:
+         auto match = end();
+         for (auto it = beginIt; it != endIt; ++it)
+         {
+-            if (address < it->address || address >= it->address + it->size)
++            if (address < it->address || (it->size != 0 && address >= it->address + it->size))
+             {
+                 continue;
+             }

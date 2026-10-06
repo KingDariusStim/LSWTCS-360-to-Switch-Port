@@ -1,0 +1,43 @@
+CANDIDATE FIX — sentinel/empty-list guard for the shader-compiler emit hang
+============================================================================
+Status: IMPLEMENTED + builds clean, but UNVALIDATED. Blocked by the startup
+non-determinism race: with the compiler enabled AND this guard added, the
+build reliably loses the startup race (29/29 runs stall at [T]10 / MGR=0)
+before the compile is ever reached, so end-to-end validation is impossible
+with the current binary layout. The guard itself is innocent of the T10 stall
+(it lives in the compile-only path sub_826937F8, which is not executed at T10;
+cdb of a T10 stall showed threads in 358/359/421 + gpu_d3d12.cpp, none in 454).
+
+WHERE: Convert 360/LSWTCS/output/ppc_recomp.454.cpp, function sub_826937F8
+(the emit loop — the ONLY twin of the 4 overlapping entry points that owns
+label loc_82693A90). Insert at EXACT line 896, immediately AFTER:
+        ctx.r30.u64 = PPC_LOAD_U32(ctx.r31.u32 + 124);
+
+INSERT (only into sub_826937F8 — NOT the twins sub_826937F0/AB8/AC0, which
+lack loc_82693A90 and will fail to build with "undeclared label"):
+
+        // LSWTCS (prior-art "treat list as empty" pattern, cf. 337 guards):
+        // null current node = instruction list ended/empty. Exit via
+        // loc_82693A90 (returns [r31+128], no r30 deref) instead of
+        // processing null -> sub_82693508/sub_82728490 spin on garbage near
+        // guest 0.
+        if (ctx.r30.u32 == 0u) goto loc_82693A90;
+
+APPLY SAFELY (awk at exact line, avoids hitting the twins via replace_all):
+        awk 'NR==896{print; print "        if (ctx.r30.u32 == 0u) goto loc_82693A90;"; next} {print}' \
+            output/ppc_recomp.454.cpp > /tmp/x && mv /tmp/x output/ppc_recomp.454.cpp
+
+WHY: cdb traced the compiler hang to sub_82728490 walking a NULL/circular
+[+4]-linked list forever. The null container (r3=0) originates in
+sub_826937F8's emit loop reaching a null node (r30 = [r31+124] = 0) and
+calling sub_82693508 with it. loc_82693A90 returns [r31+128] WITHOUT
+dereferencing r30 — the clean "list empty/ended" exit.
+
+CAVEAT: the empty list may be an UPSTREAM symptom (shader compiled to 0 real
+instructions). If so, this guard lets the compile COMPLETE but with an empty
+shader (still no real geometry). Needs validation once the startup race is
+solvable. To enable for a test: also re-add the compile call in
+ppc_recomp.407.cpp (after `ctx.lr = 0x824AAECC;`): sub_824A5D00(ctx, base);
+
+THE REAL META-BLOCKER: the startup non-determinism race. Until that is made
+deterministic (compile reliably reached), NO compile-side fix can be validated.

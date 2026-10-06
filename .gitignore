@@ -1,0 +1,34 @@
+# Allow-list: ignore everything, then opt in to our own source.
+# Game data (xex/iso/DAT/image.bin/pristine.bin), XenonRecomp output .cpp,
+# Xenia dumps, captures, logs and build dirs are deliberately NOT tracked.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/HANDOFF_*.md
+!/backup.sh
+!/run.sh
+!/*.ps1
+!/ladscan.c
+!/ghidra_scripts/
+!/patches/
+
+!/LSWTCSRuntime/
+/LSWTCSRuntime/*
+!/LSWTCSRuntime/CMakeLists.txt
+!/LSWTCSRuntime/ffmpeg_sources.cmake
+!/LSWTCSRuntime/source/
+!/LSWTCSRuntime/include/
+!/LSWTCSRuntime/xenos/
+!/LSWTCSRuntime/xenos_dxbc/
+!/LSWTCSRuntime/xma/
+
+!/Convert 360/
+/Convert 360/*
+!/Convert 360/LSWTCS/
+/Convert 360/LSWTCS/*
+!/Convert 360/LSWTCS/*.toml
+!/Convert 360/LSWTCS/*.patch.txt
+
+*.bak
+build/
