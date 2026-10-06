@@ -327,11 +327,30 @@ struct XdRt { ID3D12Resource* res; D3D12_RESOURCE_STATES state; UINT w; DXGI_FOR
 static std::unordered_map<uint64_t, XdRt> g_xd_rts;
 // Shader-visible descriptor cursor for the frame being recorded (draw textures + blit sources).
 static UINT g_xd_desc_base = 0, g_xd_desc_used = 0;
+// SRV table dedup (LSWTCS_BINDCACHE): view spec per written descriptor of the current replay, and
+// content hash -> table. Both are reset per replay; resources stay alive for the frame (garbage lists).
+struct XdSrvSpec { ID3D12Resource* res; uint32_t fmt, map, dim, mips, layers, pad; };   // no padding: hashed/compared as bytes
+struct XdSrvTable { UINT first, count; };
+static std::vector<XdSrvSpec> g_xd_srv_specs(kXdDescPerFrame);
+static std::unordered_map<uint64_t, XdSrvTable> g_xd_srv_tables;
+static void xd_srv_create(const XdSrvSpec& s, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = (DXGI_FORMAT)s.fmt; sv.Shader4ComponentMapping = s.map; sv.ViewDimension = (D3D12_SRV_DIMENSION)s.dim;
+    switch (s.dim) {
+        case D3D12_SRV_DIMENSION_TEXTURE3D: sv.Texture3D.MipLevels = s.mips; break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBE: sv.TextureCube.MipLevels = s.mips; break;
+        default: sv.Texture2DArray.MipLevels = s.mips; sv.Texture2DArray.ArraySize = s.layers; break;
+    }
+    g_device->CreateShaderResourceView(s.res, &sv, h);
+}
 // Sampler descriptor tables, deduplicated by content and kept for the whole run: a hub frame binds
 // ~2000 samplers but only a handful of distinct tables, and the shader-visible sampler heap is capped
 // at 2048. Tables are never rewritten, so frames in flight can share them safely.
 static std::unordered_map<std::string, UINT> g_xd_smp_cache;
 static UINT g_xd_smp_next = 0;
+// LSWTCS_BINDCACHE: same tables keyed by content hash, verified against the descs kept per heap slot.
+static std::unordered_map<uint64_t, struct XdSrvTable> g_xd_smp_hcache;
+static D3D12_SAMPLER_DESC g_xd_smp_descs[kXdSmpPerFrame * kFrameCount];
 
 static bool xd_gpurt() { static int v = -1; if (v < 0) { const char* e = getenv("LSWTCS_GPURT"); v = (e && e[0] == '0') ? 0 : 1; } return v == 1; }
 // RB_COLOR_INFO color_format (xenos::ColorRenderTargetFormat) -> host format.
@@ -814,14 +833,44 @@ static XdView* xd_resolved_view(uint32_t base, XdResolved& src, uint32_t w, uint
 // target itself, or a sized view when the fetch size differs.
 struct XdTexSrc { ID3D12Resource* res; DXGI_FORMAT fmt; D3D12_RESOURCE_STATES* state; };
 static std::unordered_map<uint32_t, XdResolved> g_xd_composed;
+static uint64_t g_xd_src_epoch = 0;   // bumps when xd_texture_source drops or replaces a target (memo below)
+static bool xd_texture_source_uncached(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, XdTexSrc& out);
+// LSWTCS_BINDCACHE (default on): per-replay memo of texture sources and per-frame dedup of SRV and
+// sampler tables. 0 = old per-draw path (A/B).
+static bool xd_bindcache() { static int v = -1; if (v < 0) { const char* e = getenv("LSWTCS_BINDCACHE"); v = (e && e[0] == '0') ? 0 : 1; } return v == 1; }
+// The source for (base, format, size) only changes when a resolve writes a target or a target is
+// dropped/replaced, so within one replay it is looked up once per resolve epoch instead of twice per
+// draw (prepass + bind), each of which re-probed ~4 KB of guest memory and scanned every target.
+struct XdSrcMemo { bool ok; XdTexSrc src; };
+static std::unordered_map<uint64_t, XdSrcMemo> g_xd_src_memo;
+static uint64_t g_xd_src_memo_key[3] = {~0ull, ~0ull, ~0ull};   // replay seq, resolve seq, src epoch
 static bool xd_texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, XdTexSrc& out) {
+    if (!xd_bindcache()) { GpScope gp(GP_RP_TEXSRC); return xd_texture_source_uncached(base, tfmt, w, h, out); }
+    if (g_xd_src_memo_key[0] != g_xd_replay_seq || g_xd_src_memo_key[1] != g_xd_resolve_seq || g_xd_src_memo_key[2] != g_xd_src_epoch) {
+        g_xd_src_memo.clear();
+        g_xd_src_memo_key[0] = g_xd_replay_seq; g_xd_src_memo_key[1] = g_xd_resolve_seq; g_xd_src_memo_key[2] = g_xd_src_epoch;
+    }
+    const uint64_t key = uint64_t(base & 0x1FFFFFFFu) | (uint64_t(tfmt & 63) << 29) | (uint64_t((w - 1) & 0x3FFF) << 35) | (uint64_t((h - 1) & 0x3FFF) << 49);
+    auto it = g_xd_src_memo.find(key);
+    if (it != g_xd_src_memo.end()) { if (it->second.ok) out = it->second.src; return it->second.ok; }
+    const uint64_t epoch = g_xd_src_epoch;
+    XdTexSrc s{};
+    bool ok; { GpScope gp(GP_RP_TEXSRC); ok = xd_texture_source_uncached(base, tfmt, w, h, s); }
+    if (g_xd_src_epoch != epoch) {   // this call dropped/replaced a target: other entries may dangle
+        g_xd_src_memo.clear(); g_xd_src_memo_key[2] = g_xd_src_epoch;
+    }
+    g_xd_src_memo.emplace(key, XdSrcMemo{ok, s});
+    if (ok) out = s;
+    return ok;
+}
+static bool xd_texture_source_uncached(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, XdTexSrc& out) {
     auto ex = g_xd_resolved.find(base);
     if (ex != g_xd_resolved.end() && (!ex->second.res || ex->second.composite)) ex = g_xd_resolved.end();
     if (ex != g_xd_resolved.end() && xd_resolved_stale(ex->second, base)) {
         static int ns = 0; if (++ns <= 200) { printf("[STALE] frame %llu: resolved 0x%08X %ux%u dropped (guest memory changed since resolve #%llu)\n",
             (unsigned long long)g_xd_frame_no, base, ex->second.w, ex->second.h, (unsigned long long)ex->second.frame); fflush(stdout); }
         xd_fstate(" STALE:%X", base);
-        g_xd_rt_garbage[g_frame_idx].push_back(ex->second.res); g_xd_resolved.erase(ex); ex = g_xd_resolved.end();
+        g_xd_rt_garbage[g_frame_idx].push_back(ex->second.res); g_xd_resolved.erase(ex); ex = g_xd_resolved.end(); ++g_xd_src_epoch;
     }
     static int on = -1; if (on < 0) { const char* e = getenv("LSWTCS_RESCOMPOSE"); on = (e && e[0] == '0') ? 0 : 1; }
     std::vector<std::pair<uint32_t, XdResolved*>> subs;
@@ -844,7 +893,7 @@ static bool xd_texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t
     uint64_t seq = ex != g_xd_resolved.end() ? ex->second.frame : 0;
     for (auto& sp : subs) seq = std::max<uint64_t>(seq, sp.second->frame);
     XdResolved& c = g_xd_composed[base];
-    if (c.res && (c.w != w || c.h != h || c.fmt != fmt)) { g_xd_rt_garbage[g_frame_idx].push_back(c.res); c = XdResolved{}; }
+    if (c.res && (c.w != w || c.h != h || c.fmt != fmt)) { g_xd_rt_garbage[g_frame_idx].push_back(c.res); c = XdResolved{}; ++g_xd_src_epoch; }
     if (!c.res) {
         if (g_xd_rtv_used >= kXdMaxRtv) return false;
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -889,6 +938,35 @@ static bool xd_texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t
     return true;
 }
 
+// LSWTCS_BINDCACHE: last texture / sampler table bound per stage (0 = PS, 1 = VS) in this replay.
+// A draw whose table inputs equal the previous draw's (same fetch words and dims, and for textures no
+// resolve, blit or target change since, so no source or resource state moved) rebinds that table.
+struct XdTexLast { bool valid; uint32_t count; uint64_t resolve_seq, src_epoch, blits; D3D12_GPU_DESCRIPTOR_HANDLE g;
+                   uint8_t dims[32]; uint32_t fw[32 * 6]; };
+struct XdSmpLast { bool valid; uint32_t count; D3D12_GPU_DESCRIPTOR_HANDLE g; uint32_t fw[32 * 6]; LswGpuSamplerBinding b[32]; };
+static bool xd_tex_same(const XdTexLast& L, const uint32_t* fa, uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
+    if (count > 32) count = 32;
+    if (!L.valid || L.count != count || L.resolve_seq != g_xd_resolve_seq || L.src_epoch != g_xd_src_epoch || L.blits != g_xd_blit_count) return false;
+    for (uint32_t t = 0; t < count; ++t)
+        if (L.dims[t] != dims[t] || memcmp(&L.fw[t * 6], fa + (fetches[t] & 31) * 6, 24) != 0) return false;
+    return true;
+}
+static void xd_tex_remember(XdTexLast& L, const uint32_t* fa, uint32_t count, const uint8_t* dims, const uint8_t* fetches, D3D12_GPU_DESCRIPTOR_HANDLE g) {
+    if (count > 32) count = 32;
+    L.valid = true; L.count = count; L.resolve_seq = g_xd_resolve_seq; L.src_epoch = g_xd_src_epoch; L.blits = g_xd_blit_count; L.g = g;
+    for (uint32_t t = 0; t < count; ++t) { L.dims[t] = dims[t]; memcpy(&L.fw[t * 6], fa + (fetches[t] & 31) * 6, 24); }
+}
+static bool xd_smp_same(const XdSmpLast& L, const uint32_t* fa, uint32_t count, const LswGpuSamplerBinding* b) {
+    if (!L.valid || L.count != count) return false;
+    for (uint32_t t = 0; t < count; ++t)
+        if (memcmp(&L.b[t], &b[t], sizeof b[t]) != 0 || memcmp(&L.fw[t * 6], fa + (b[t].fetch_constant & 31) * 6, 24) != 0) return false;
+    return true;
+}
+static void xd_smp_remember(XdSmpLast& L, const uint32_t* fa, uint32_t count, const LswGpuSamplerBinding* b, D3D12_GPU_DESCRIPTOR_HANDLE g) {
+    L.valid = true; L.count = count; L.g = g;
+    for (uint32_t t = 0; t < count; ++t) { L.b[t] = b[t]; memcpy(&L.fw[t * 6], fa + (b[t].fetch_constant & 31) * 6, 24); }
+}
+
 // Records the published guest frame's draws into the open command list (RT + DSV bound).
 static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t fb_phys);
 static void gpu_xedraw_replay(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t fb_phys) { gpu_xedraw_replay_impl(bb_rtv, fb_phys); }
@@ -924,6 +1002,12 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
     g_cmd->SetDescriptorHeaps(2, heaps);
     D3D12_GPU_DESCRIPTOR_HANDLE shm_table = g_xd_srv_heap->GetGPUDescriptorHandleForHeapStart();
     g_xd_desc_base = 2 + fi * kXdDescPerFrame; g_xd_desc_used = 0;
+    g_xd_srv_tables.clear();
+    const bool bindcache = xd_bindcache();
+    // Command-list state last set by a draw (skip redundant sets); invalid after any blit.
+    ID3D12RootSignature* st_rs = nullptr; ID3D12PipelineState* st_pso = nullptr; int st_topo = -1;
+    D3D12_VIEWPORT st_vp = {}; D3D12_RECT st_sc = {}; bool st_vp_valid = false; uint64_t st_blits = g_xd_blit_count;
+    XdTexLast tl[2] = {}; XdSmpLast sl[2] = {};   // last texture / sampler table per stage (0 = PS, 1 = VS)
     uint32_t smp_overflow = 0;
     uint64_t bound_key = ~0ull;   // (color RT, depth RT) currently bound
     uint32_t resolves = 0, rt_draws = 0, res_tex_binds = 0;
@@ -1003,8 +1087,12 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         // 1. Vertex data into shared memory: the ranges record time found not resident. Issued for
         // EVERY recorded draw, before any skip below, since the residency tracking assumed them.
         for (uint32_t k = 0; k < r.range_count; ++k) upload(f.ranges[r.first_range + k]);
-        // Texture pre-pass: build composed / sized resolve-target copies now (they are blits).
-        if (gpurt) {
+        // Texture pre-pass: build composed / sized resolve-target copies now (they are blits). Not
+        // needed when both tables repeat the previous draw's (their sources are already built).
+        const uint32_t* fa_draw = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
+        const bool tables_same = bindcache && xd_tex_same(tl[0], fa_draw, r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch)
+                                           && xd_tex_same(tl[1], fa_draw, r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
+        if (gpurt && !tables_same) {
             GpScope gp(GP_RP_PREPASS);
             const uint64_t blits_before = g_xd_blit_count;
             const uint32_t* fa = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
@@ -1028,6 +1116,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         UINT rt_w = kSwapW, rt_h = kSwapH;
         XdRt* crts[4] = {};
         if (gpurt) {
+            GpScope gprt(GP_RP_RT);
             xd_msaa_scale(r.surf_info, msx, msy);
             // Colour targets the pixel shader writes and RB_COLOR_MASK enables (LSWTCS_MRT=0: RT0 only).
             static int mrt_on = -1; if (mrt_on < 0) { const char* e = getenv("LSWTCS_MRT"); mrt_on = (e && e[0] == '0') ? 0 : 1; }
@@ -1116,8 +1205,10 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         ID3D12PipelineState* pso;
         { GpScope gp(GP_RP_PSO); pso = rs ? xd_pso(r, rs, rt_fmts, nrt) : nullptr; }
         if (!pso) { ++skipped; continue; }
-        g_cmd->SetGraphicsRootSignature(rs);
-        g_cmd->SetPipelineState(pso);
+        uint64_t t_draw = gp_now();   // GP_RP_DRAW: root/state/draw calls, bind excluded
+        if (g_xd_blit_count != st_blits) { st_rs = nullptr; st_pso = nullptr; st_topo = -1; st_vp_valid = false; st_blits = g_xd_blit_count; }   // a blit set its own state
+        if (rs != st_rs || !bindcache) { g_cmd->SetGraphicsRootSignature(rs); st_rs = rs; }
+        if (pso != st_pso || !bindcache) { g_cmd->SetPipelineState(pso); st_pso = pso; }
         g_cmd->SetGraphicsRootConstantBufferView(0, up + r.cb_fetch_off);
         g_cmd->SetGraphicsRootConstantBufferView(1, up + r.cb_vsf_off);
         g_cmd->SetGraphicsRootConstantBufferView(2, up + r.cb_psf_off);
@@ -1127,8 +1218,76 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         UINT param = 6;
         const uint32_t* fetch_all = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
         static int notex = -1; if (notex < 0) { const char* e = getenv("LSWTCS_GPUDRAW_NOTEX"); notex = (e && e[0] == '1') ? 1 : 0; }
-        auto tex_table = [&](uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
+        // Texture table as view specs; a table identical to one already written this replay reuses its
+        // descriptors (hub: ~2500 texture binds/frame, far fewer distinct tables) instead of creating SRVs.
+        auto tex_table_cached = [&](int stage, uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
+            if (xd_tex_same(tl[stage], fetch_all, count, dims, fetches)) { g_cmd->SetGraphicsRootDescriptorTable(param++, tl[stage].g); return; }
+            tl[stage].valid = false;
+            if (count > 32) count = 32;
+            XdSrvSpec sp[32];
+            for (uint32_t t = 0; t < count; ++t) {
+                const uint32_t* f6 = fetch_all + (fetches[t] & 31) * 6;
+                XdSrvSpec& s = sp[t]; s = XdSrvSpec{};
+                if (gpurt && !notex && dims[t] <= 1) {
+                    uint32_t tb, tf, tsw, tw, th, tdim;
+                    bool tinfo = lsw_gpu_texture_info(f6, &tb, &tf, &tsw, &tw, &th, &tdim) != 0;
+                    XdTexSrc src{};
+                    if (tinfo && xd_texture_source(tb, tf, tw, th, src)) {
+                        const D3D12_RESOURCE_STATES srv_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                        if (*src.state != srv_state) { barrier(src.res, *src.state, srv_state); *src.state = srv_state; }
+                        bool single = src.fmt == DXGI_FORMAT_R8_UNORM || src.fmt == DXGI_FORMAT_R32_FLOAT;
+                        { static int k8 = -1; if (k8 < 0) { const char* e = getenv("LSWTCS_K8RGBA"); k8 = (e && e[0] == '0') ? 0 : 1; }
+                          if (k8 && tf == 2 && !single) tsw = 0x688; }   // experiment: sample RGBA as-is
+                        uint32_t map = 0;
+                        for (int c = 0; c < 4; ++c) {
+                            uint32_t sw = (tsw >> (3 * c)) & 7;
+                            if (sw < 4 && single) sw = 0; else if (sw > 5) sw = 4;
+                            map |= sw << (3 * c);
+                        }
+                        s.res = src.res; s.fmt = src.fmt; s.map = map | (1u << 12);
+                        s.dim = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; s.mips = 1; s.layers = 1;
+                        ++res_tex_binds;
+                        continue;
+                    }
+                }
+                const XdTex* tx = notex ? nullptr : xd_get_texture(f6);
+                bool cube = dims[t] == 3;
+                if (tx && (cube != (tx->dim == 2 && tx->layers == 6))) tx = nullptr;   // dimension mismatch
+                if (dims[t] == 2) tx = nullptr;                                          // 3D: not decoded yet
+                s.res = tx ? tx->res : nullptr;
+                s.fmt = tx ? tx->dxgi : DXGI_FORMAT_R8G8B8A8_UNORM;
+                s.map = tx ? tx->mapping : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                switch (dims[t]) {
+                    case 2: s.dim = D3D12_SRV_DIMENSION_TEXTURE3D; s.mips = 1; break;
+                    case 3: s.dim = D3D12_SRV_DIMENSION_TEXTURECUBE; s.mips = tx ? tx->mips : 1; break;
+                    default: s.dim = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; s.mips = tx ? tx->mips : 1; s.layers = tx ? tx->layers : 1; break;
+                }
+            }
+            const uint64_t h = lsw_hash_bytes(reinterpret_cast<const uint8_t*>(sp), uint32_t(sizeof(XdSrvSpec) * count)) ^ count;
+            UINT first = ~0u;
+            auto it = g_xd_srv_tables.find(h);
+            if (it != g_xd_srv_tables.end() && it->second.count == count &&
+                memcmp(&g_xd_srv_specs[it->second.first - g_xd_desc_base], sp, sizeof(XdSrvSpec) * count) == 0)
+                first = it->second.first;
+            if (first == ~0u) {
+                if (g_xd_desc_used + count > kXdDescPerFrame) { ++param; return; }
+                GpScope gps(GP_RP_SRV);
+                first = g_xd_desc_base + g_xd_desc_used;
+                for (uint32_t t = 0; t < count; ++t) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE hc = g_xd_srv_heap->GetCPUDescriptorHandleForHeapStart(); hc.ptr += SIZE_T(first + t) * g_xd_srv_inc;
+                    xd_srv_create(sp[t], hc);
+                    g_xd_srv_specs[g_xd_desc_used + t] = sp[t];
+                }
+                g_xd_desc_used += count;
+                g_xd_srv_tables[h] = XdSrvTable{first, count};
+            }
+            D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_srv_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_srv_inc;
+            g_cmd->SetGraphicsRootDescriptorTable(param++, g);
+            xd_tex_remember(tl[stage], fetch_all, count, dims, fetches, g);
+        };
+        auto tex_table = [&](int stage, uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
             if (!count) return;
+            if (bindcache) { tex_table_cached(stage, count, dims, fetches); return; }
             if (g_xd_desc_used + count > kXdDescPerFrame) { ++param; return; }
             UINT first = g_xd_desc_base + g_xd_desc_used;
             for (uint32_t t = 0; t < count; ++t) {
@@ -1179,10 +1338,15 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             g_cmd->SetGraphicsRootDescriptorTable(param++, g);
             g_xd_desc_used += count;
         };
-        auto smp_table = [&](uint32_t count, const LswGpuSamplerBinding* bind) {
+        auto smp_table = [&](int stage, uint32_t count, const LswGpuSamplerBinding* bind) {
             if (!count) return;
-            D3D12_SAMPLER_DESC sds[LSW_GPU_MAX_TEX] = {};
             if (count > LSW_GPU_MAX_TEX) count = LSW_GPU_MAX_TEX;
+            if (bindcache) {
+                if (xd_smp_same(sl[stage], fetch_all, count, bind)) { g_cmd->SetGraphicsRootDescriptorTable(param++, sl[stage].g); return; }
+                sl[stage].valid = false;
+            }
+            GpScope gps(GP_RP_SMP);
+            D3D12_SAMPLER_DESC sds[LSW_GPU_MAX_TEX] = {};
             for (uint32_t t = 0; t < count; ++t) {
                 LswGpuSamplerDesc sdsc;
                 lsw_gpu_sampler(fetch_all + (bind[t].fetch_constant & 31) * 6, &bind[t], &sdsc);
@@ -1195,6 +1359,30 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                 sd.MaxLOD = D3D12_FLOAT32_MAX;
                 { static int bo = -1; if (bo < 0) { const char* e = getenv("LSWTCS_BORDER"); bo = (e && e[0] == '0') ? 0 : 1; }
                   if (bo) for (int c = 0; c < 4; ++c) sd.BorderColor[c] = sdsc.border[c]; }
+            }
+            if (bindcache) {   // hash + compare against the stored descs: no per-draw string allocation
+                const uint64_t h = lsw_hash_bytes(reinterpret_cast<const uint8_t*>(sds), uint32_t(sizeof(D3D12_SAMPLER_DESC) * count)) ^ count;
+                UINT first = ~0u;
+                auto it = g_xd_smp_hcache.find(h);
+                if (it != g_xd_smp_hcache.end() && it->second.count == count &&
+                    memcmp(&g_xd_smp_descs[it->second.first], sds, sizeof(D3D12_SAMPLER_DESC) * count) == 0)
+                    first = it->second.first;
+                if (first == ~0u) {
+                    if (g_xd_smp_next + count > kXdSmpPerFrame * kFrameCount) { ++smp_overflow; ++param; return; }
+                    first = g_xd_smp_next; g_xd_smp_next += count;
+                    for (uint32_t t = 0; t < count; ++t) {
+                        D3D12_CPU_DESCRIPTOR_HANDLE hc = g_xd_smp_heap->GetCPUDescriptorHandleForHeapStart(); hc.ptr += SIZE_T(first + t) * g_xd_smp_inc;
+                        g_device->CreateSampler(&sds[t], hc);
+                        g_xd_smp_descs[first + t] = sds[t];
+                    }
+                    g_xd_smp_hcache[h] = XdSrvTable{first, count};
+                    static uint32_t ntab = 0;
+                    if (++ntab <= 8 || (ntab % 64) == 0) { printf("[SMPCACHE] %u tables, %u/%u samplers used\n", ntab, g_xd_smp_next, kXdSmpPerFrame * kFrameCount); fflush(stdout); }
+                }
+                D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_smp_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_smp_inc;
+                g_cmd->SetGraphicsRootDescriptorTable(param++, g);
+                xd_smp_remember(sl[stage], fetch_all, count, bind, g);
+                return;
             }
             std::string key(reinterpret_cast<const char*>(sds), sizeof(D3D12_SAMPLER_DESC) * count);
             UINT first;
@@ -1213,19 +1401,24 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_smp_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_smp_inc;
             g_cmd->SetGraphicsRootDescriptorTable(param++, g);
         };
+        g_gpuprof[GP_RP_DRAW] += gp_now() - t_draw;
         { GpScope gp(GP_RP_BIND);
-          tex_table(r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch);
-          smp_table(r.ps_smp_count, r.ps_smp);
-          tex_table(r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
-          smp_table(r.vs_smp_count, r.vs_smp); }
+          tex_table(0, r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch);
+          smp_table(0, r.ps_smp_count, r.ps_smp);
+          tex_table(1, r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
+          smp_table(1, r.vs_smp_count, r.vs_smp); }
+        t_draw = gp_now();
         // 3. Fixed function + draw.
         D3D12_VIEWPORT vp = { r.viewport[0] * msx, r.viewport[1] * msy, r.viewport[2] * msx, r.viewport[3] * msy, r.viewport[4], r.viewport[5] };
         if (vp.Width <= 0 || vp.Height <= 0) { vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)rt_w; vp.Height = (float)rt_h; }
         D3D12_RECT sc = { LONG(r.scissor[0] * msx), LONG(r.scissor[1] * msy), LONG((r.scissor[0] + r.scissor[2]) * msx), LONG((r.scissor[1] + r.scissor[3]) * msy) };
         if (r.scissor[2] == 0 || r.scissor[3] == 0) sc = { 0, 0, LONG(rt_w), LONG(rt_h) };
-        g_cmd->RSSetViewports(1, &vp); g_cmd->RSSetScissorRects(1, &sc);
+        if (!bindcache || !st_vp_valid || memcmp(&vp, &st_vp, sizeof vp) != 0 || memcmp(&sc, &st_sc, sizeof sc) != 0) {
+            g_cmd->RSSetViewports(1, &vp); g_cmd->RSSetScissorRects(1, &sc);
+            st_vp = vp; st_sc = sc; st_vp_valid = true;
+        }
         if (gpurt && xd_stencil() && (r.depthcontrol & 1)) g_cmd->OMSetStencilRef(r.stencil_ref & 0xFF);
-        g_cmd->IASetPrimitiveTopology((D3D_PRIMITIVE_TOPOLOGY)r.topology);
+        if (int(r.topology) != st_topo || !bindcache) { g_cmd->IASetPrimitiveTopology((D3D_PRIMITIVE_TOPOLOGY)r.topology); st_topo = int(r.topology); }
         if (r.ib_count) {
             D3D12_INDEX_BUFFER_VIEW ibv = { up + r.ib_off, r.ib_count * (r.ib_32bit ? 4u : 2u),
                                             r.ib_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
@@ -1234,6 +1427,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         } else {
             g_cmd->DrawInstanced(r.vertex_count, 1, 0, 0);
         }
+        g_gpuprof[GP_RP_DRAW] += gp_now() - t_draw;
         ++drawn;
     }
     if (gpurt) {

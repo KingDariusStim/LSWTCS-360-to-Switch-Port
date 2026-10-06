@@ -4805,8 +4805,9 @@ PPC_FUNC(__imp__VdSwap) {
             double wall = gp_t_last ? (t - gp_t_last) / 1e6 / 60.0 : 0; gp_t_last = t;
             auto ms = [](uint64_t ns) { return ns / 1e6 / 60.0; };
             dbg_ram("[GPUPROF] guest wait for render thread=%.2fms\n", ms(gp[GP_RTWAIT]));
-            dbg_ram("[GPUPROF] guest ISR inside walk=%.2fms | replay: arena->upload=%.2f diag=%.2f prepass=%.2f pso=%.2f bind=%.2f\n",
-                    ms(gp[GP_IRQ]), ms(gp[GP_RP_ARENA]), ms(gp[GP_RP_DIAG]), ms(gp[GP_RP_PREPASS]), ms(gp[GP_RP_PSO]), ms(gp[GP_RP_BIND]));
+            dbg_ram("[GPUPROF] guest ISR inside walk=%.2fms | replay: arena->upload=%.2f diag=%.2f prepass=%.2f pso=%.2f bind=%.2f (texsrc=%.2f srv=%.2f smp=%.2f) rt=%.2f draw=%.2f\n",
+                    ms(gp[GP_IRQ]), ms(gp[GP_RP_ARENA]), ms(gp[GP_RP_DIAG]), ms(gp[GP_RP_PREPASS]), ms(gp[GP_RP_PSO]), ms(gp[GP_RP_BIND]),
+                    ms(gp[GP_RP_TEXSRC]), ms(gp[GP_RP_SRV]), ms(gp[GP_RP_SMP]), ms(gp[GP_RP_RT]), ms(gp[GP_RP_DRAW]));
             dbg_ram("[GPUPROF] per frame: wall=%.2fms busy=%.2f (limiter idle=%.2f) walk=%.2f record=%.2f (prepare=%.2f vhash+copy=%.2f) replay=%.2f "
                     "present=%.2f (fencewait=%.2f submit=%.2f) fbfill=%.2f | draws=%.0f vbytes=%.0fKB\n",
                     wall, wall - ms(gp[GP_LIMIT]), ms(gp[GP_LIMIT]), ms(gp[GP_WALK] - gp[GP_RECORD]), ms(gp[GP_RECORD]), ms(gp[GP_PREPARE]), ms(gp[GP_VCOPY]),
