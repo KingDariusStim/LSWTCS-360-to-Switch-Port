@@ -27,6 +27,9 @@
 #include <vector>
 #include <direct.h>   // _mkdir (harvest dir)
 #include <unordered_map>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "renderdoc_app.h"   // RenderDoc in-app capture API (LSWTCS_RDOC)
 extern "C" void lswtcs_gil_blocking(void (*fn)(void*), void* arg);   // kernel_stubs.cpp
 
@@ -549,6 +552,8 @@ static void gpu_init_geom_pipeline() {
 // Record the collected quads into the open command list (RT already bound + cleared).
 static void gpu_geom_replay() {
     if (!g_geom_enabled) return;
+    extern std::mutex g_geom_present_mtx;
+    std::lock_guard<std::mutex> lk(g_geom_present_mtx);
     uint32_t nverts = g_geom_vert_ready;
     if (nverts == 0) return;
     if ((UINT64)nverts * 28u > g_geom_vb_cap) nverts = g_geom_vb_cap / 28u;
@@ -768,9 +773,10 @@ void gpu_d3d12_init() {
 }
 
 // ─────────────────────────────────────────��────────────────────────────────────
-void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
-                       uint32_t row_pitch, uint32_t width, uint32_t height) {
+static void gpu_d3d12_present_impl(uint8_t* base, uint32_t phys_addr,
+                                   uint32_t row_pitch, uint32_t width, uint32_t height) {
     if (!g_ready) return;
+    gpu_frame_take();
     struct GpPresent { uint64_t t0 = gp_now(); ~GpPresent() { g_gpuprof[GP_PRESENT] += gp_now() - t0; } } gp_present;
 
     // ── Window message pump ───────────────────────────────────────────────���
@@ -780,6 +786,10 @@ void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
         DispatchMessage(&msg);
         if (msg.message == WM_QUIT) ExitProcess(0);
     }
+    // DIAG (LSWTCS_NOREPLAY=1): skip the replay + submit entirely (window freezes). Frame time in this
+    // mode = the upper bound of what an asynchronous render thread can save.
+    { static int noreplay = -1; if (noreplay < 0) { const char* e = getenv("LSWTCS_NOREPLAY"); noreplay = (e && e[0] == '1') ? 1 : 0; }
+      if (noreplay) return; }
 
     // ── Wait for frame N-1 to finish ────────────────────��─────────────────
     if (g_fence->GetCompletedValue() < g_fence_for[g_frame_idx]) {
@@ -1063,4 +1073,54 @@ bool gpu_d3d12_poll() {
         if (msg.message == WM_QUIT) return false;
     }
     return true;
+}
+
+// ── Render thread (LSWTCS_RENDERTHREAD, default on) ─────────────────────────────────────────────
+// gpu_d3d12_present is called by the guest thread that runs VdSwap. The replay of the recorded frame
+// (D3D12 command building), submit and present run on this dedicated host thread instead, in parallel
+// with the guest's next frame: one frame in flight. The guest waits (off the cooperative scheduler)
+// only when the previous frame's replay has not finished yet. Everything D3D12 / xd_* is touched only
+// by this thread after init. LSWTCS_RENDERTHREAD=0: replay synchronously on the guest thread (old).
+// Switch: this thread takes one of the three application cores.
+struct GpuRenderJob { uint8_t* base; uint32_t phys, pitch, w, h; };
+static std::mutex g_rt_mtx;
+static std::condition_variable g_rt_cv;
+static GpuRenderJob g_rt_job;
+static bool g_rt_pending = false, g_rt_busy = false;
+static void gpu_render_thread_main() {
+    for (;;) {
+        GpuRenderJob job;
+        { std::unique_lock<std::mutex> lk(g_rt_mtx);
+          g_rt_cv.wait(lk, [] { return g_rt_pending; });
+          job = g_rt_job; g_rt_pending = false; g_rt_busy = true; }
+        gpu_d3d12_present_impl(job.base, job.phys, job.pitch, job.w, job.h);
+        { std::lock_guard<std::mutex> lk(g_rt_mtx); g_rt_busy = false; }
+        g_rt_cv.notify_all();
+    }
+}
+void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr, uint32_t row_pitch, uint32_t width, uint32_t height) {
+    static int on = -1; if (on < 0) { const char* e = getenv("LSWTCS_RENDERTHREAD"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on) { gpu_d3d12_present_impl(base, phys_addr, row_pitch, width, height); return; }
+    static bool started = false;
+    if (!started) {
+        started = true;
+        std::thread(gpu_render_thread_main).detach();
+        printf("[RENDERTHREAD] replay + present run on a dedicated thread (LSWTCS_RENDERTHREAD=0 disables)\n"); fflush(stdout);
+    }
+    uint64_t t0 = gp_now();
+    {   // wait for the previous frame's replay to finish (one frame in flight), off the guest scheduler
+        std::unique_lock<std::mutex> lk(g_rt_mtx);
+        if (g_rt_pending || g_rt_busy) {
+            lk.unlock();
+            lswtcs_gil_blocking([](void*) {
+                std::unique_lock<std::mutex> l2(g_rt_mtx);
+                g_rt_cv.wait(l2, [] { return !g_rt_pending && !g_rt_busy; });
+            }, nullptr);
+            lk.lock();
+        }
+        g_rt_job = GpuRenderJob{base, phys_addr, row_pitch, width, height};
+        g_rt_pending = true;
+    }
+    g_rt_cv.notify_all();
+    g_gpuprof[GP_RTWAIT] += gp_now() - t0;
 }

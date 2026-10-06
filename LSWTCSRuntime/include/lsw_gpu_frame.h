@@ -74,8 +74,7 @@ struct LswGpuFrame {
   // residency tracking assumed them done, so they are issued before this frame's draws.
   std::vector<LswGpuRange> prelude;
   uint32_t swap_fb = 0;   // frontbuffer address in the PM4_XE_SWAP packet that ended this frame
-  bool replayed = false;  // its shared-memory uploads were issued by the replay
-  void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); replayed = false; }
+  void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); }
   // Zero-filled (constant buffers: padding and short blocks must read as 0).
   uint32_t alloc(uint32_t size, uint32_t align = 256) {
     size_t old = arena.size();
@@ -113,7 +112,7 @@ static inline uint64_t lsw_hash_bytes(const uint8_t* p, uint32_t n) {
 // GPUPROF stage accumulators (nanoseconds / counts), defined in kernel_stubs.cpp.
 enum { GP_WALK, GP_RECORD, GP_PREPARE, GP_VCOPY, GP_REPLAY, GP_SHMHASH, GP_PRESENT, GP_FENCEWAIT, GP_SUBMIT,
        GP_FBFILL, GP_DRAWS, GP_VBYTES, GP_IRQ,
-       GP_RP_ARENA, GP_RP_PREPASS, GP_RP_PSO, GP_RP_BIND, GP_RP_DIAG, GP_COUNT };
+       GP_RP_ARENA, GP_RP_PREPASS, GP_RP_PSO, GP_RP_BIND, GP_RP_DIAG, GP_LIMIT, GP_RTWAIT, GP_COUNT };
 extern "C" uint64_t g_gpuprof[GP_COUNT];
 static inline uint64_t gp_now() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -124,6 +123,18 @@ struct GpScope {   // adds the enclosing scope's duration to g_gpuprof[k]
   ~GpScope() { g_gpuprof[k] += gp_now() - t0; }
 };
 
-// Building (PM4 thread) and published (present) frames; swapped at the guest swap marker.
-extern LswGpuFrame g_gpu_frame_build, g_gpu_frame_present;
-extern bool g_gpu_frame_ready;
+// Three slots: build (recorded by the PM4 walker on a guest thread), present (published at the guest
+// swap marker, waiting for the renderer) and render (taken by the render thread, replayed there).
+// g_gpu_frame_mtx guards present + g_gpu_frame_ready; build is walker-only, render is renderer-only.
+// A published frame replaced before the renderer took it hands its shared-memory uploads on.
+#include <mutex>
+extern LswGpuFrame g_gpu_frame_build, g_gpu_frame_present, g_gpu_frame_render;
+extern bool g_gpu_frame_ready;   // present holds a frame the renderer has not taken yet
+extern std::mutex g_gpu_frame_mtx;
+// Renderer side: move the latest published frame into g_gpu_frame_render (no-op if none is new).
+static inline void gpu_frame_take() {
+  std::lock_guard<std::mutex> lk(g_gpu_frame_mtx);
+  if (!g_gpu_frame_ready) return;
+  std::swap(g_gpu_frame_present, g_gpu_frame_render);
+  g_gpu_frame_ready = false;
+}

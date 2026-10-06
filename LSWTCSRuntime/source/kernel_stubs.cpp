@@ -2603,7 +2603,9 @@ static void geom_set_dctl(uint32_t dctl) {
     if (g_geom_batch_count < GEOM_MAX_BATCHES) g_geom_batches[g_geom_batch_count++] = { g_geom_vert_count, dctl };
 }
 static void geom_reset_build() { g_geom_vert_count = 0; g_geom_batch_count = 0; }
+std::mutex g_geom_present_mtx;   // published GEOM batches: written here, drawn by the render thread
 static void geom_publish() {
+    std::lock_guard<std::mutex> lk(g_geom_present_mtx);
     memcpy(g_geom_present_batches, g_geom_batches, g_geom_batch_count * sizeof(GeomBatch));
     g_geom_present_batch_count = g_geom_batch_count;
     g_geom_present_depth_clear = g_xe_regs[0x231D];
@@ -2711,7 +2713,8 @@ static void geom_swap_packet(uint32_t swap_fb) {
       g_gpu_offscreen_drops = 0; }
     if (gpudraw_on() && !g_gpu_frame_build.draws.empty()) {
         g_gpu_frame_build.swap_fb = swap_fb;
-        if (g_gpu_frame_ready && !g_gpu_frame_present.replayed) gpu_shm_carry_uploads(g_gpu_frame_present, g_gpu_frame_build);
+        std::lock_guard<std::mutex> lk(g_gpu_frame_mtx);   // the render thread takes present under it
+        if (g_gpu_frame_ready) gpu_shm_carry_uploads(g_gpu_frame_present, g_gpu_frame_build);
         std::swap(g_gpu_frame_build, g_gpu_frame_present); g_gpu_frame_build.clear(); g_gpu_frame_ready = true; }
     if (g_geom_vert_count == 0) return;   // duplicate swap marker with nothing drawn: keep last frame
     geom_publish();
@@ -3019,7 +3022,8 @@ static void xvs_draw(uint32_t draw_initiator, uint32_t dma_base, uint32_t dma_si
 // draw reads is snapshotted into g_gpu_frame_build (lsw_gpu_frame.h), published at the swap.
 #include "lsw_gpu_bridge.h"
 #include "lsw_gpu_frame.h"
-LswGpuFrame g_gpu_frame_build, g_gpu_frame_present;
+LswGpuFrame g_gpu_frame_build, g_gpu_frame_present, g_gpu_frame_render;
+std::mutex g_gpu_frame_mtx;
 // GPUPROF: host cost of each frame-pipeline stage in QPC ticks (GP_* indices), averaged per
 // presented frame in the [PROF] line. Shared with gpu_d3d12.cpp (replay / present).
 extern "C" { uint64_t g_gpuprof[GP_COUNT]; }
@@ -4800,11 +4804,12 @@ PPC_FUNC(__imp__VdSwap) {
             for (int i = 0; i < GP_COUNT; ++i) { gp[i] = g_gpuprof[i] - gp_last[i]; gp_last[i] = g_gpuprof[i]; }
             double wall = gp_t_last ? (t - gp_t_last) / 1e6 / 60.0 : 0; gp_t_last = t;
             auto ms = [](uint64_t ns) { return ns / 1e6 / 60.0; };
+            dbg_ram("[GPUPROF] guest wait for render thread=%.2fms\n", ms(gp[GP_RTWAIT]));
             dbg_ram("[GPUPROF] guest ISR inside walk=%.2fms | replay: arena->upload=%.2f diag=%.2f prepass=%.2f pso=%.2f bind=%.2f\n",
                     ms(gp[GP_IRQ]), ms(gp[GP_RP_ARENA]), ms(gp[GP_RP_DIAG]), ms(gp[GP_RP_PREPASS]), ms(gp[GP_RP_PSO]), ms(gp[GP_RP_BIND]));
-            dbg_ram("[GPUPROF] per frame: wall=%.2fms walk=%.2f record=%.2f (prepare=%.2f vhash+copy=%.2f) replay=%.2f "
+            dbg_ram("[GPUPROF] per frame: wall=%.2fms busy=%.2f (limiter idle=%.2f) walk=%.2f record=%.2f (prepare=%.2f vhash+copy=%.2f) replay=%.2f "
                     "present=%.2f (fencewait=%.2f submit=%.2f) fbfill=%.2f | draws=%.0f vbytes=%.0fKB\n",
-                    wall, ms(gp[GP_WALK] - gp[GP_RECORD]), ms(gp[GP_RECORD]), ms(gp[GP_PREPARE]), ms(gp[GP_VCOPY]),
+                    wall, wall - ms(gp[GP_LIMIT]), ms(gp[GP_LIMIT]), ms(gp[GP_WALK] - gp[GP_RECORD]), ms(gp[GP_RECORD]), ms(gp[GP_PREPARE]), ms(gp[GP_VCOPY]),
                     ms(gp[GP_REPLAY]), ms(gp[GP_PRESENT]), ms(gp[GP_FENCEWAIT]), ms(gp[GP_SUBMIT]),
                     ms(gp[GP_FBFILL]), gp[GP_DRAWS] / 60.0, gp[GP_VBYTES] / 1024.0 / 60.0);
         }
@@ -4835,6 +4840,7 @@ PPC_FUNC(__imp__VdSwap) {
                    s_target_fps, s_target_fps > 0 ? "locked" : "uncapped");
         }
         if (s_target_fps > 0.0) {
+            GpScope gp_limit(GP_LIMIT);   // GPUPROF: idle time the limiter adds (busy = wall - limit)
             auto period = std::chrono::duration_cast<clock::duration>(
                               std::chrono::duration<double>(1.0 / s_target_fps));
             s_deadline += period;

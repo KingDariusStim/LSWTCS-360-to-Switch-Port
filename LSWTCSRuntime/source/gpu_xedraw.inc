@@ -212,8 +212,9 @@ static std::unordered_map<uint64_t, XdTex> g_xd_tex;
 static std::vector<ID3D12Resource*> g_xd_tex_garbage[kFrameCount];   // upload buffers to free
 static uint32_t g_xd_tex_created = 0;
 // Per-replay memo: fetch constant -> texture. lsw_gpu_texture_key probes ~64 scattered cache lines
-// of the texture; guest memory cannot change while a replay runs (it holds the guest turn), so each
-// distinct fetch constant is resolved once per replay instead of once per draw that binds it.
+// of the texture, so each distinct fetch constant is resolved once per replay instead of once per draw
+// that binds it. (On the render thread guest threads keep running, so a texture written during a
+// replay is seen as of its first bind in that replay, like a real GPU reading memory asynchronously.)
 struct XdFetchKey {
     uint32_t w[6];
     bool operator==(const XdFetchKey& o) const { return memcmp(w, o.w, sizeof w) == 0; }
@@ -892,10 +893,9 @@ static bool xd_texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t
 static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t fb_phys);
 static void gpu_xedraw_replay(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t fb_phys) { gpu_xedraw_replay_impl(bb_rtv, fb_phys); }
 static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t fb_phys) {
-    if (!g_gpu_frame_ready) return;
     if (!g_xd_inited) xd_init();
     if (!g_xd_ok) return;
-    LswGpuFrame& f = g_gpu_frame_present;
+    LswGpuFrame& f = g_gpu_frame_render;   // taken by gpu_frame_take(); replayed again if no newer frame
     if (f.draws.empty()) return;
     uint64_t need = f.arena.size() + 256;
     UINT fi = g_frame_idx;
@@ -955,7 +955,6 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         ++copies;
     };
     for (const LswGpuRange& rg : f.prelude) upload(rg);   // uploads of frames replaced before replay
-    f.replayed = true;
     g_xd_fstate_prev.swap(g_xd_fstate); g_xd_fstate.clear();
     xd_fstate("frame %llu:", (unsigned long long)g_xd_frame_no);
     GpScope* gp_diag = new GpScope(GP_RP_DIAG);
