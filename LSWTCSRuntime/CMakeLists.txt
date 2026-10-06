@@ -147,6 +147,8 @@ target_link_libraries(LSWTCSRuntime PRIVATE
 )
 
 target_compile_options(LSWTCSRuntime PRIVATE -O2 -march=native -fno-strict-aliasing -g -w)
+# xxHash (header-only, vendored by xenia-canary): XXH3 for vertex-page residency hashing.
+target_include_directories(LSWTCSRuntime PRIVATE "${XENIA_ROOT}/third_party/xxhash")
 
 target_link_options(LSWTCSRuntime PRIVATE
     -fuse-ld=lld

@@ -703,8 +703,58 @@ static int sched_next_locked(int from) {
     }
     return (from >= 0 && g_sched_alive[from] && g_sched_runnable[from]) ? from : -1;
 }
+// ── SAMPLEPROF (LSWTCS_SAMPLEPROF=1, diagnostic): every ~1 ms a host thread suspends whichever guest
+// thread holds the scheduler turn, reads its RIP and resumes it (nothing is allocated while it is
+// suspended: it may hold the heap lock). Every 20 s writes sampleprof.txt: "<sched id> <rip hex> <count>"
+// sorted by count; build/sampleprof.py maps RIPs to functions with nm.
+static HANDLE g_sp_thread[LSW_SCHED_MAX] = {};
+static void sampleprof_loop() {
+    std::unordered_map<uint64_t, uint32_t> hist; uint64_t samples = 0, idle = 0, t_dump = GetTickCount64();
+    for (;;) {
+        Sleep(1);
+        if (((samples + idle) & 1023) == 0 && GetFileAttributesA("sampleprof_reset") != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA("sampleprof_reset"); hist.clear(); samples = idle = 0; t_dump = GetTickCount64();   // e.g. once the hub is up
+        }
+        int id = g_sched_turn;   // racy read: a sample may land just after a handoff
+        HANDLE h = (id >= 0 && id < LSW_SCHED_MAX) ? g_sp_thread[id] : nullptr;
+        if (!h) { ++idle; continue; }
+        if (SuspendThread(h) == (DWORD)-1) continue;
+        CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+        BOOL ok = GetThreadContext(h, &c);
+        ResumeThread(h);
+        if (!ok) continue;
+        ++hist[(c.Rip & 0xFFFFFFFFFFFFull) | (uint64_t(id) << 48)]; ++samples;
+        if (GetTickCount64() - t_dump > 20000) {
+            t_dump = GetTickCount64();
+            std::vector<std::pair<uint32_t, uint64_t>> v; v.reserve(hist.size());
+            for (auto& kv : hist) v.push_back({kv.second, kv.first});
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            if (FILE* fp = fopen("sampleprof.txt", "w")) {
+                fprintf(fp, "# samples=%llu idle=%llu distinct=%zu\n", (unsigned long long)samples, (unsigned long long)idle, v.size());
+                // Exe RIPs rebased to the preferred image base (ASLR) so nm addresses match; others as module+offset.
+                const uint64_t exe = uint64_t(reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)));
+                for (auto& e : v) {
+                    uint64_t rip = e.second & 0xFFFFFFFFFFFFull;
+                    HMODULE m = nullptr; char name[MAX_PATH] = "?";
+                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(rip), &m);
+                    if (uint64_t(reinterpret_cast<uintptr_t>(m)) == exe)
+                        fprintf(fp, "%u %llx %u\n", unsigned(e.second >> 48), (unsigned long long)(rip - exe + 0x140000000ull), e.first);
+                    else {
+                        if (m) { GetModuleFileNameA(m, name, sizeof name); const char* s = strrchr(name, '\\'); if (s) memmove(name, s + 1, strlen(s)); }
+                        fprintf(fp, "%u %s+%llx %u\n", unsigned(e.second >> 48), name, (unsigned long long)(rip - uint64_t(reinterpret_cast<uintptr_t>(m))), e.first);
+                    }
+                }
+                fclose(fp);
+            }
+        }
+    }
+}
 static void sched_register(int id) {
     if (!gil_on() || id < 0) return;
+    { static int sp = -1; if (sp < 0) { const char* e = getenv("LSWTCS_SAMPLEPROF"); sp = (e && e[0] == '1') ? 1 : 0;
+                                         if (sp) std::thread(sampleprof_loop).detach(); }
+      if (sp && id < LSW_SCHED_MAX && !g_sp_thread[id])
+          g_sp_thread[id] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId()); }
     std::unique_lock<std::mutex> lk(g_sched_mtx);
     if (id >= g_sched_count) g_sched_count = id + 1;
     g_sched_alive[id] = true; g_sched_runnable[id] = true;
@@ -2157,6 +2207,11 @@ PPC_FUNC(__imp__XMsgCancelIORequest)        { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG
 // Env flag read once per call site (the PM4 walker tests diagnostics flags per packet / per draw;
 // a raw getenv there cost real time every frame).
 #define LSW_ENV_SET(name) ([] { static const bool v = getenv(name) != nullptr; return v; }())
+// Trigger-file polls: at most one per 250 ms per call site. GetFileAttributesA is a filesystem query
+// (~10-20 us) and the old count-based limits (every 16 / 256 / 1024 calls) still fired several times a
+// frame on the walker and input paths (the sampling profile's ZwQueryAttributesFile).
+#define LSW_TRIGGER_DUE() ([] { static uint64_t next = 0; uint64_t now = GetTickCount64(); \
+                                if (now < next) return false; next = now + 250; return true; }())
 
 // ── PM4 ring buffer parser ─────────────────────────────────────────────────────
 // Reads big-endian dword at ring-buffer dword index (wraps).
@@ -2428,8 +2483,7 @@ static uint32_t g_vs_addr = 0, g_vs_size = 0, g_ps_addr = 0, g_ps_size = 0;
 static int g_imlog_left = 0;
 static int g_imlog_left_fwd() { return g_imlog_left; }
 static void imlog_poll() {
-    static uint32_t n = 0;
-    if ((++n & 1023) == 0 && GetFileAttributesA("imlog_now") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("imlog_now"); g_imlog_left = 400; }
+    if (LSW_TRIGGER_DUE() && GetFileAttributesA("imlog_now") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("imlog_now"); g_imlog_left = 400; }
 }
 // DIAG LSWTCS_UCWATCH=1: write-watch on vertex-shader microcode. Every VS IM_LOAD range gets its host
 // pages (physical views 0x80/0xA0/0xC0) made read-only; a vectored handler lets each write through via
@@ -2541,8 +2595,7 @@ static const UcfSig kUcfSigs[] = {
     {"VS_quad2d", 24, {0x30052003u, 0x00001200u, 0xC2000000u, 0x00001005u, 0x00001200u, 0xC4000000u, 0x00001006u, 0x00002200u, 0x00000000u, 0x1DF81000u, 0x00393A88u, 0x00000006u, 0x05F80000u, 0x4006060Au, 0x00000306u, 0xC80F803Eu, 0x00000000u, 0xC2010100u, 0xC90F8000u, 0x00000000u, 0x81002800u, 0x00000000u, 0x00000000u, 0x00000000u}},
 };
 static void ucfind_poll() {
-    static uint32_t c = 0;
-    if ((++c & 1023) != 0 || GetFileAttributesA("ucfind_now") == INVALID_FILE_ATTRIBUTES) return;
+    if (!LSW_TRIGGER_DUE() || GetFileAttributesA("ucfind_now") == INVALID_FILE_ATTRIBUTES) return;
     DeleteFileA("ucfind_now");
     for (const UcfSig& s : kUcfSigs) {
         int hits = 0;
@@ -2613,7 +2666,10 @@ static void geom_publish() {
     memcpy(g_geom_present_verts, g_geom_verts, (size_t)g_geom_vert_count * 7u * sizeof(float));
 }
 #include "lsw_gpu_frame.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 static bool gpudraw_on();
+static uint32_t g_shm_frame = 1;   // bumps per published frame (GPUPROF vertex re-hash counter)
 // ── FRAMEMAP (LSWTCS_FRAMEMAP=1, diagnostic): structure of one guest frame every 600 swaps (max 8).
 // Run-length list of draws by (EDRAM mode, RB_SURFACE_INFO, RB_COLOR_INFO, RB_DEPTH_INFO, which
 // earlier resolve destinations any type-2 texture fetch constant points at); every resolve (mode 6)
@@ -2715,7 +2771,7 @@ static void geom_swap_packet(uint32_t swap_fb) {
         g_gpu_frame_build.swap_fb = swap_fb;
         std::lock_guard<std::mutex> lk(g_gpu_frame_mtx);   // the render thread takes present under it
         if (g_gpu_frame_ready) gpu_shm_carry_uploads(g_gpu_frame_present, g_gpu_frame_build);
-        std::swap(g_gpu_frame_build, g_gpu_frame_present); g_gpu_frame_build.clear(); g_gpu_frame_ready = true; }
+        std::swap(g_gpu_frame_build, g_gpu_frame_present); g_gpu_frame_build.clear(); g_gpu_frame_ready = true; ++g_shm_frame; }
     if (g_geom_vert_count == 0) return;   // duplicate swap marker with nothing drawn: keep last frame
     geom_publish();
     geom_reset_build();
@@ -3125,10 +3181,13 @@ static void gpu_record_resolve() {
 // A published frame that is replaced before it was replayed hands its uploads to the next frame
 // (gpu_shm_carry_uploads). DIAG LSWTCS_SHMALWAYS=1: upload every page of every range every draw.
 static constexpr uint32_t kShmPageShift = 12, kShmPageSize = 1u << kShmPageShift, kShmPages = 0x20000000u >> kShmPageShift;
-struct GpuShmPage { uint64_t hash; uint32_t epoch; uint32_t valid; };
+struct GpuShmPage { uint64_t hash; uint32_t epoch; uint32_t valid; uint32_t frame; };
 static std::vector<GpuShmPage> g_shm_pages;
 static uint32_t g_shm_epoch = 1;
-static inline void gpu_shm_new_epoch() { ++g_shm_epoch; }
+// Epoch sources (GPUPROF attribution of mid-frame page changes): 0 = walk start, 1 = after a guest
+// interrupt callback, 2 = after a tile-drain yield.
+static int g_shm_epoch_src = 0;
+static inline void gpu_shm_new_epoch(int src) { ++g_shm_epoch; ++g_gpuprof[GP_N_EPOCH]; if (src == 1) ++g_gpuprof[GP_N_EPOCH_ISR]; g_shm_epoch_src = src; }
 static void gpu_shm_invalidate(uint32_t phys) {   // a CP write landed here: rehash before trusting the page
     if (!g_shm_pages.empty() && phys < 0x20000000u) g_shm_pages[phys >> kShmPageShift].epoch = 0;
 }
@@ -3136,7 +3195,7 @@ static void gpu_shm_reset() { for (GpuShmPage& p : g_shm_pages) p.valid = 0; }
 // Appends upload runs for the guest physical range [a, a + sz) to f.ranges.
 static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
     static int always = -1; if (always < 0) { const char* e = getenv("LSWTCS_SHMALWAYS"); always = (e && e[0] == '1') ? 1 : 0; }
-    if (g_shm_pages.empty()) g_shm_pages.assign(kShmPages, GpuShmPage{0, 0, 0});
+    if (g_shm_pages.empty()) g_shm_pages.assign(kShmPages, GpuShmPage{0, 0, 0, 0});
     const uint8_t* phys = g_base + 0x80000000ull;
     uint32_t p0 = a >> kShmPageShift, p1 = (a + sz - 1) >> kShmPageShift, run = UINT32_MAX;
     auto flush = [&](uint32_t pend) {
@@ -3151,7 +3210,13 @@ static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
         GpuShmPage& pg = g_shm_pages[p];
         bool dirty = always != 0;
         if (pg.epoch != g_shm_epoch) {
-            uint64_t h = lsw_hash_bytes(phys + (size_t(p) << kShmPageShift), kShmPageSize);
+            // XXH3 (SIMD: AVX2 here, NEON on Switch); LSWTCS_XXH3=0 = the scalar lsw_hash_bytes (A/B).
+            static int xxh = -1; if (xxh < 0) { const char* e = getenv("LSWTCS_XXH3"); xxh = (e && e[0] == '0') ? 0 : 1; }
+            const uint8_t* src = phys + (size_t(p) << kShmPageShift);
+            uint64_t h = xxh ? XXH3_64bits(src, kShmPageSize) : lsw_hash_bytes(src, kShmPageSize);
+            ++g_gpuprof[GP_N_PAGEHASH];
+            if (pg.frame == g_shm_frame) { ++g_gpuprof[GP_N_REHASH]; if (pg.valid && pg.hash != h) { ++g_gpuprof[GP_N_MIDCHANGE]; ++g_gpuprof[GP_N_MID_WALK + g_shm_epoch_src]; } }
+            pg.frame = g_shm_frame;
             if (!pg.valid || pg.hash != h) dirty = true;
             pg.hash = h; pg.valid = 1; pg.epoch = g_shm_epoch;
         }
@@ -3195,8 +3260,7 @@ static bool gpu_record_draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_
     g_gpuprof[GP_RECORD] += gp_now() - gp0; g_gpuprof[GP_DRAWS] += rec;
     // Window: from a D3D clear (rect list, depth mode) to the next quad list. Printed only when that quad
     // list has 40 vertices (the title's "Press START" text); armed by file "pktwin_now".
-    { static uint32_t pc = 0;
-      if ((++pc & 255) == 0 && GetFileAttributesA("pktwin_now") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("pktwin_now"); g_pktwin_arm = 3; } }
+    if (LSW_TRIGGER_DUE() && GetFileAttributesA("pktwin_now") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("pktwin_now"); g_pktwin_arm = 3; }
     if (g_pktwin_arm > 0 && (initiator & 0x3F) == 8 && edram_mode == 5) { g_pktwin = 600; g_pktwin_buf.clear(); }
     else if ((initiator & 0x3F) == 13 && g_pktwin > 0) {
         if ((initiator >> 16) == 40) {
@@ -3274,8 +3338,7 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     // 3 = wrap within the VS's 256 (c[256+k] = c[k]). DIAG: file "cbpad" in the working dir cycles
     // 1 -> 2 -> 3 -> 0 live (checked every 4096 draws), logged as [CBPAD].
     static int cbpad = -1; if (cbpad < 0) { const char* e = getenv("LSWTCS_CBPAD"); cbpad = e ? atoi(e) : 2; }
-    { static uint32_t ncheck = 0;
-      if ((++ncheck & 4095) == 0 && GetFileAttributesA("cbpad") != INVALID_FILE_ATTRIBUTES) {
+    { if (LSW_TRIGGER_DUE() && GetFileAttributesA("cbpad") != INVALID_FILE_ATTRIBUTES) {
           DeleteFileA("cbpad"); cbpad = (cbpad + 1) & 3;
           static const char* const kNames[4] = {"OFF (no padding)", "PS constants", "zeros (Xenia)", "wrap mod 256"};
           printf("[CBPAD] mode %d: %s\n", cbpad, kNames[cbpad]); fflush(stdout);
@@ -3747,9 +3810,10 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                       stype ? "PS" : "VS", gaddr, start, ssize, g_xe_regs[0x2180], g_xe_regs[0x21F7], g_xe_regs[0x21F6]); fflush(stdout); } }
                 if (stype == 0) { g_vs_addr = gaddr; g_vs_size = ssize; imlog_vs("IM_LOAD", gaddr, ssize); ucw_add(gaddr, ssize); }
                 else            { g_ps_addr = gaddr; g_ps_size = ssize; if (g_imlog_left > 0) { printf("[IMLOG] IM_LOAD PS addr=0x%08X size=%u\n", gaddr, ssize); fflush(stdout); } }
-                // DIAG (always on, rate-limited): the same VS address loaded with different microcode
+                // DIAG (LSWTCS_UCODELOG=1; was always on, and its byte-wise hash of every VS load was the
+                // hottest line of the walk): the same VS address loaded with different microcode
                 // (runtime shader patching, e.g. vfetch stride) -> [UCODE] line.
-                if (stype == 0 && gaddr >= 0x80000000u && gaddr < 0xA0000000u && ssize && ssize < 0x4000) {
+                if (LSW_ENV_SET("LSWTCS_UCODELOG") && stype == 0 && gaddr >= 0x80000000u && gaddr < 0xA0000000u && ssize && ssize < 0x4000) {
                     static std::unordered_map<uint32_t, uint64_t> seen; static uint32_t nlog = 0;
                     const uint8_t* p = g_base + gaddr; uint64_t h = 1469598103934665603ull;
                     for (uint32_t i = 0; i < ssize * 4; ++i) h = (h ^ p[i]) * 1099511628211ull;
@@ -4046,7 +4110,7 @@ static void pm4_fire_interrupt(uint32_t cpu_mask) {
         uint64_t gp0 = gp_now();
         fn(icb, g_base);
         g_gpuprof[GP_IRQ] += gp_now() - gp0;
-        gpu_shm_new_epoch();
+        gpu_shm_new_epoch(1);
         if (pcr >= 0x80000000u) PPC_STORE_U8(pcr + 268, saved);
     }
     if (g_gfx_interrupt_data) {
@@ -4297,7 +4361,7 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
       if (wm) {
         uint8_t* base = g_base;
         uint64_t gp_walk0 = gp_now();   // GPUPROF: drain-round yields (other threads' time) are excluded
-        gpu_shm_new_epoch();
+        gpu_shm_new_epoch(0);
         g_pm4_walking = true;
         uint32_t w = PPC_LOAD_U32(0x7FC80714u) % rbd;
         uint32_t pos = g_rb_rptr_dwords % rbd, steps = 0, ibs = 0, ints = 0;
@@ -4312,7 +4376,7 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
             g_gpuprof[GP_WALK] += gp_now() - gp_walk0;
             while (pm4_tile_backlog() && spins < 20000) { sched_yield_turn(); ++spins; }
             gp_walk0 = gp_now();
-            gpu_shm_new_epoch();
+            gpu_shm_new_epoch(2);
             g_pm4_walking = true;
             pos = g_rb_rptr_dwords % rbd;   // the worker may have walked the ring itself (ring-space waits)
             static uint64_t nd = 0; if (++nd <= 12 || (nd % 1000) == 0 || pm4_tile_backlog())
@@ -4757,9 +4821,12 @@ PPC_FUNC(__imp__VdSwap) {
     // with RB_COLOR_CLEAR so the window shows the game's actual cleared screen.
     // (Writing the framebuffer is safe — the game never branches on its contents.)
     // Guest k_8_8_8_8 is [B,G,R,A]; RB_COLOR_CLEAR is packed 0xAARRGGBB.
+    // With GPU draw (default) the window shows the replayed frame and nothing reads these guest bytes:
+    // skipped (it wrote 3.7 MB of guest memory per frame). LSWTCS_FBFILL=1 restores it.
     uint32_t cc = g_xe_regs[XE_RB_COLOR_CLEAR];                        // 0xAARRGGBB
     uint64_t gp_fill0 = gp_now();
-    if (cc != 0 && frontbuffer_phys >= 0x02000000u) {
+    const bool fbfill = !gpudraw_on() || LSW_ENV_SET("LSWTCS_FBFILL");
+    if (fbfill && cc != 0 && frontbuffer_phys >= 0x02000000u) {
         uint32_t destg = frontbuffer_phys + ((frontbuffer_phys < 0x80000000u) ? 0x80000000u : 0u);
         uint8_t  cb = cc & 0xFF, cg = (cc >> 8) & 0xFF, cr = (cc >> 16) & 0xFF, ca = (cc >> 24) & 0xFF;
         uint32_t bgra = ((uint32_t)ca << 24) | ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | cb;
@@ -4805,7 +4872,9 @@ PPC_FUNC(__imp__VdSwap) {
             for (int i = 0; i < GP_COUNT; ++i) { gp[i] = g_gpuprof[i] - gp_last[i]; gp_last[i] = g_gpuprof[i]; }
             double wall = gp_t_last ? (t - gp_t_last) / 1e6 / 60.0 : 0; gp_t_last = t;
             auto ms = [](uint64_t ns) { return ns / 1e6 / 60.0; };
-            dbg_ram("[GPUPROF] guest wait for render thread=%.2fms\n", ms(gp[GP_RTWAIT]));
+            dbg_ram("[GPUPROF] guest wait for render thread=%.2fms | vertex pages hashed=%.0f (re-hashed in same frame=%.0f, changed mid-frame=%.2f) epochs=%.1f (isr %.1f) per frame | mid-frame changes this window: walk=%llu isr=%llu drain=%llu\n",
+                    ms(gp[GP_RTWAIT]), gp[GP_N_PAGEHASH] / 60.0, gp[GP_N_REHASH] / 60.0, gp[GP_N_MIDCHANGE] / 60.0, gp[GP_N_EPOCH] / 60.0,
+                    gp[GP_N_EPOCH_ISR] / 60.0, (unsigned long long)gp[GP_N_MID_WALK], (unsigned long long)gp[GP_N_MID_ISR], (unsigned long long)gp[GP_N_MID_DRAIN]);
             dbg_ram("[GPUPROF] guest ISR inside walk=%.2fms | replay: arena->upload=%.2f diag=%.2f prepass=%.2f pso=%.2f bind=%.2f (texsrc=%.2f srv=%.2f smp=%.2f) rt=%.2f draw=%.2f\n",
                     ms(gp[GP_IRQ]), ms(gp[GP_RP_ARENA]), ms(gp[GP_RP_DIAG]), ms(gp[GP_RP_PREPASS]), ms(gp[GP_RP_PSO]), ms(gp[GP_RP_BIND]),
                     ms(gp[GP_RP_TEXSRC]), ms(gp[GP_RP_SRV]), ms(gp[GP_RP_SMP]), ms(gp[GP_RP_RT]), ms(gp[GP_RP_DRAW]));
@@ -5648,8 +5717,18 @@ static bool lsw_host_pad(LswPad& out) {
         if (m) xigs = (PFN_XIGS)GetProcAddress(m, "XInputGetState"); }
     if (!xigs) return false;
     struct { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } st{};
+    // Poll the connected slot only; empty slots are re-probed once a second (XInputGetState on a
+    // disconnected slot is a slow driver call: four of them per input poll showed in the profile).
+    static int slot = -1; static uint64_t next_probe = 0;
+    if (slot >= 0) {
+        if (xigs(DWORD(slot), &st) == 0) { out = {st.buttons, st.lt, st.rt, st.lx, st.ly, st.rx, st.ry}; return true; }
+        slot = -1;
+    }
+    uint64_t now = GetTickCount64();
+    if (now < next_probe) return false;
+    next_probe = now + 1000;
     for (DWORD i = 0; i < 4; ++i)
-        if (xigs(i, &st) == 0) { out = {st.buttons, st.lt, st.rt, st.lx, st.ly, st.rx, st.ry}; return true; }
+        if (xigs(i, &st) == 0) { slot = int(i); out = {st.buttons, st.lt, st.rt, st.lx, st.ly, st.rx, st.ry}; return true; }
     return false;
 }
 static void lsw_keyboard_pad(LswPad& p) {
@@ -5681,7 +5760,7 @@ PPC_FUNC(__imp__XamInputGetState) {
       if (at > 0 && n >= (uint32_t)at && n < (uint32_t)at + 6) pad.buttons |= 0x0010; }   // one Start press
     {   // DIAG: press_now script
         static std::vector<uint16_t> q; static uint32_t qpos = 0, qtick = 0, qpoll = 0;
-        if ((++qpoll & 15) == 0 && q.empty() && GetFileAttributesA("press_now") != INVALID_FILE_ATTRIBUTES) {
+        if (q.empty() && LSW_TRIGGER_DUE() && GetFileAttributesA("press_now") != INVALID_FILE_ATTRIBUTES) {
             FILE* f = fopen("press_now", "rb"); char w[32];
             static const struct { const char* name; uint16_t bit; } kB[] = {
                 {"up",0x0001},{"down",0x0002},{"left",0x0004},{"right",0x0008},{"start",0x0010},{"back",0x0020},

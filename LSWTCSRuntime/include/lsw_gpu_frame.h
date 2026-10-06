@@ -132,7 +132,10 @@ static inline uint64_t lsw_hash_bytes(const uint8_t* p, uint32_t n) {
 enum { GP_WALK, GP_RECORD, GP_PREPARE, GP_VCOPY, GP_REPLAY, GP_SHMHASH, GP_PRESENT, GP_FENCEWAIT, GP_SUBMIT,
        GP_FBFILL, GP_DRAWS, GP_VBYTES, GP_IRQ,
        GP_RP_ARENA, GP_RP_PREPASS, GP_RP_PSO, GP_RP_BIND, GP_RP_DIAG, GP_LIMIT, GP_RTWAIT,
-       GP_RP_TEXSRC, GP_RP_SRV, GP_RP_SMP, GP_RP_RT, GP_RP_DRAW, GP_COUNT };
+       GP_RP_TEXSRC, GP_RP_SRV, GP_RP_SMP, GP_RP_RT, GP_RP_DRAW,
+       GP_N_PAGEHASH, GP_N_EPOCH, GP_N_REHASH, GP_N_MIDCHANGE, GP_N_EPOCH_ISR,
+       GP_N_MID_WALK, GP_N_MID_ISR, GP_N_MID_DRAIN,   // mid-frame page changes by epoch source (same order as src 0/1/2)
+       GP_COUNT };   // GP_N_*: counts, not ns
 extern "C" uint64_t g_gpuprof[GP_COUNT];
 static inline uint64_t gp_now() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());

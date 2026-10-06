@@ -154,7 +154,32 @@ Replay sub-stages last measured: bind ~3 ms, arena→upload ~0.3, prepass ~0.4, 
 - Longer term the D3D12 backend becomes NVN or Vulkan on Switch. Keep the replay's per-draw logic
   backend-agnostic where you touch it.
 
-### 5.2 Guest-side GIL work (5.3 ms here)
+### 5.2 UPDATE (session 2): GIL work 5.65 → 4.9 ms (back-to-back A/B, on AC power)
+Found with the new **sampling profiler** (`LSWTCS_SAMPLEPROF=1`: samples the RIP of whichever guest thread
+holds the turn every ~1 ms; touch `sampleprof_reset` once the hub is up; `sampleprof.txt` every 20 s;
+`python build/sampleprof.py` maps it with nm; `llvm-addr2line` for lines; DLL offsets via
+`cdb -z C:\Windows\System32\ntdll.dll -y srv*<cache>*https://msdl.microsoft.com/download/symbols -c "ln ntdll+0x..."`).
+Fixes: always-on `[UCODE]` byte-wise FNV of every VS IM_LOAD (hottest walk line) → `LSWTCS_UCODELOG=1`;
+VdSwap frontbuffer CPU fill skipped under GPU draw (`LSWTCS_FBFILL=1` restores; nothing reads it);
+vertex pages hashed with XXH3 (xenia-canary's vendored xxhash, AVX2/NEON; `LSWTCS_XXH3=0` = old);
+`get_shader` memo by ucode pointer + memcmp (`LSWTCS_UCODEMEMO=0`); `pack_floats` without vector insert;
+XInput polls only the connected slot (empty slots re-probed 1/s: DeviceIoControl per empty slot per poll);
+trigger files (`press_now`, `pktwin_now`, `cbpad`, `imlog_now`, `ucfind_now`) polled ≤ 4/s via
+`LSW_TRIGGER_DUE()` (GetFileAttributesA ≈ 10–20 µs). A/B: walk 0.72 → 0.55, record 1.40 → 1.13 ms
+(vhash 0.56 → 0.40), fbfill 0.15 → 0. The XInput/trigger changes were verified by sample counts (laptop
+was on battery: absolute numbers from that run are throttled, ~59 % idle vs ~70 %).
+**Vertex hashing facts:** ~1,850 page hashes/frame but only ~925 distinct pages; the rest are re-checks
+because the PM4 walker runs **~73 times per frame** (each walk = new epoch; ISR epochs only ~2/frame).
+Real mid-frame page changes do occur (~1 per few seconds, all caught at walk-start epochs), so the
+per-walk re-check is needed unless writes are tracked (page protection, cf. the existing UCW code).
+**Still in the profile:** timer reads (`RtlQueryPerformanceCounter`, GPUPROF/SCHEDPROF), waits taken while
+holding the turn (`ZwWaitForSingleObject`/`NtWaitForMultipleObjects` ~170 samples), C-runtime copies in
+record, PM4 per-register side effects (`kernel_stubs.cpp` register-write loop), and the main thread's
+game code spread thin across many `sub_*` (top one ~3 %).
+Scripts: `build/boot_to_hub.sh` (sourced by hubprof.sh / playtest.sh) polls for title/hub instead of
+fixed sleeps (title ~15–25 s, hub ~15 s after A).
+
+### 5.2 Guest-side GIL work (5.3 ms here, before the update above)
 walk ~0.6 + record ~1.4 (prepare ~0.5, vertex page hashing ~0.5) + guest code ~3. The big lever is removing
 the GIL so the game's ~9 threads use all 3 cores (memory `switch_multithreading_constraint.md`). It's a large
 project: guest locks must really serialize host threads. Smaller wins first: `lsw_gpu_prepare` still

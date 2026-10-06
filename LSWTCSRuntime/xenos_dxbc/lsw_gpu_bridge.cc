@@ -59,16 +59,35 @@ uint64_t hash_ucode(const uint32_t* p, uint32_t n) {
   return h ^ n;
 }
 
+// Last shader seen per (ucode pointer, size, type) with a copy of its guest bytes: a draw reusing the
+// shader at the same address is verified with one memcmp instead of re-hashing the whole ucode with a
+// serial FNV chain (VS + PS on every draw was most of lsw_gpu_prepare). LSWTCS_UCODEMEMO=0 disables.
+struct UcodeMemo { std::vector<uint32_t> be; DxbcShader* shader; };
+std::unordered_map<uint64_t, UcodeMemo>& ucode_memo() { static auto* m = new std::unordered_map<uint64_t, UcodeMemo>(); return *m; }
+
 DxbcShader* get_shader(xenos::ShaderType type, const uint32_t* ucode_be, uint32_t dwords) {
   BridgeState& b = bridge();
+  static int memo_on = -1; if (memo_on < 0) { const char* e = getenv("LSWTCS_UCODEMEMO"); memo_on = (e && e[0] == '0') ? 0 : 1; }
+  const uint64_t mkey = uint64_t(reinterpret_cast<uintptr_t>(ucode_be)) ^ (uint64_t(dwords) << 40) ^
+                        (type == xenos::ShaderType::kPixel ? 0x8000000000000000ull : 0);
+  UcodeMemo* memo = nullptr;
+  if (memo_on) {
+    memo = &ucode_memo()[mkey];
+    if (memo->shader && memo->be.size() == dwords && std::memcmp(memo->be.data(), ucode_be, dwords * 4u) == 0) return memo->shader;
+  }
   uint64_t key = hash_ucode(ucode_be, dwords) ^ (type == xenos::ShaderType::kPixel ? 0x8000000000000000ull : 0);
+  DxbcShader* raw;
   auto it = b.shaders.find(key);
-  if (it != b.shaders.end()) return it->second.get();
-  // The Shader constructor byte-swaps from guest (big-endian) order.
-  auto sh = std::make_unique<DxbcShader>(type, key, ucode_be, dwords);
-  sh->AnalyzeUcode(b.disasm_buffer);
-  DxbcShader* raw = sh.get();
-  b.shaders.emplace(key, std::move(sh));
+  if (it != b.shaders.end()) {
+    raw = it->second.get();
+  } else {
+    // The Shader constructor byte-swaps from guest (big-endian) order.
+    auto sh = std::make_unique<DxbcShader>(type, key, ucode_be, dwords);
+    sh->AnalyzeUcode(b.disasm_buffer);
+    raw = sh.get();
+    b.shaders.emplace(key, std::move(sh));
+  }
+  if (memo) { memo->be.assign(ucode_be, ucode_be + dwords); memo->shader = raw; }
   return raw;
 }
 
@@ -80,17 +99,22 @@ DxbcShader::Translation* translate(DxbcShader& shader, uint64_t modification) {
 
 void pack_floats(const RegisterFile& regs, const Shader::ConstantRegisterMap& map,
                  uint32_t base_reg, std::vector<float>& out) {
-  out.clear();
+  // Sized once, then one 16-byte copy per used register (a vector insert per register showed up in
+  // the record profile).
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < 4; ++i) n += xe::bit_count(map.float_bitmap[i]);
+  if (!n) { out.assign(4, 0.0f); return; }   // a valid (non-empty) binding is still required
+  out.resize(size_t(n) * 4);
+  float* dst = out.data();
   for (uint32_t i = 0; i < 4; ++i) {
     uint64_t bits = map.float_bitmap[i];
     uint32_t idx;
     while (xe::bit_scan_forward(bits, &idx)) {
       bits = xe::clear_lowest_bit(bits);
-      const float* src = reinterpret_cast<const float*>(&regs[base_reg + (i << 8) + (idx << 2)]);
-      out.insert(out.end(), src, src + 4);
+      std::memcpy(dst, &regs[base_reg + (i << 8) + (idx << 2)], 4 * sizeof(float));
+      dst += 4;
     }
   }
-  if (out.empty()) out.assign(4, 0.0f);   // a valid (non-empty) binding is still required
 }
 
 }  // namespace
