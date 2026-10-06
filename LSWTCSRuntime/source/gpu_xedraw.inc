@@ -27,20 +27,8 @@ static UINT g_xd_srv_inc = 0, g_xd_smp_inc = 0;
 static const UINT kXdDescPerFrame = 32768, kXdSmpPerFrame = 1024;
 static std::unordered_map<uint32_t, ID3D12RootSignature*> g_xd_rootsigs;
 static std::unordered_map<uint64_t, ID3D12PipelineState*> g_xd_psos;
-// Shared-memory residency: range start -> (size, content hash). A range is skipped only when the same
-// start/size/hash is resident AND no other upload has overlapped it since: every copy evicts all
-// overlapping entries. (Keyed by start alone, an overlapping upload of other data left stale bytes
-// behind a range that still "matched" -> misaligned per-frame UP vertex data, title glitches.)
-struct XdResident { uint32_t size; uint64_t hash; };
-static std::map<uint32_t, XdResident> g_xd_resident;
-static uint32_t g_xd_resident_maxsize = 0;
-static void xd_resident_evict_overlaps(uint32_t start, uint32_t size) {
-    uint32_t end = start + size;
-    uint32_t lo = start > g_xd_resident_maxsize ? start - g_xd_resident_maxsize : 0;
-    for (auto it = g_xd_resident.lower_bound(lo); it != g_xd_resident.end() && it->first < end; ) {
-        if (it->first + it->second.size > start) it = g_xd_resident.erase(it); else ++it;
-    }
-}
+// Shared-memory residency (which vertex ranges need uploading) is decided at record time:
+// kernel_stubs.cpp gpu_shm_upload_needed. Ranges marked kLswRangeResident carry no bytes.
 
 static void xd_init() {
     g_xd_inited = true;
@@ -215,13 +203,6 @@ static ID3D12PipelineState* xd_pso(const LswGpuDrawRec& r, ID3D12RootSignature* 
     return pso;
 }
 
-static uint64_t xd_hash(const uint8_t* p, uint32_t n) {
-    uint64_t h = 1469598103934665603ull;
-    uint32_t i = 0;
-    for (; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); h = (h ^ v) * 1099511628211ull; }
-    for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
-    return h ^ n;
-}
 
 
 // ── Texture cache: guest fetch constant -> decoded D3D12 texture (base level only for now) ──
@@ -230,7 +211,33 @@ struct XdTex { ID3D12Resource* res; uint32_t dxgi, dim, layers, mapping, mips; }
 static std::unordered_map<uint64_t, XdTex> g_xd_tex;
 static std::vector<ID3D12Resource*> g_xd_tex_garbage[kFrameCount];   // upload buffers to free
 static uint32_t g_xd_tex_created = 0;
+// Per-replay memo: fetch constant -> texture. lsw_gpu_texture_key probes ~64 scattered cache lines
+// of the texture; guest memory cannot change while a replay runs (it holds the guest turn), so each
+// distinct fetch constant is resolved once per replay instead of once per draw that binds it.
+struct XdFetchKey {
+    uint32_t w[6];
+    bool operator==(const XdFetchKey& o) const { return memcmp(w, o.w, sizeof w) == 0; }
+};
+struct XdFetchKeyHash {
+    size_t operator()(const XdFetchKey& k) const {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t v : k.w) h = (h ^ v) * 1099511628211ull;
+        return size_t(h);
+    }
+};
+static std::unordered_map<XdFetchKey, const struct XdTex*, XdFetchKeyHash> g_xd_tex_memo;
+static uint64_t g_xd_replay_seq = 0, g_xd_tex_memo_seq = ~0ull;
+static const XdTex* xd_get_texture_uncached(const uint32_t* fetch6);
 static const XdTex* xd_get_texture(const uint32_t* fetch6) {
+    if (g_xd_tex_memo_seq != g_xd_replay_seq) { g_xd_tex_memo.clear(); g_xd_tex_memo_seq = g_xd_replay_seq; }
+    XdFetchKey k; memcpy(k.w, fetch6, sizeof k.w);
+    auto it = g_xd_tex_memo.find(k);
+    if (it != g_xd_tex_memo.end()) return it->second;
+    const XdTex* t = xd_get_texture_uncached(fetch6);
+    g_xd_tex_memo.emplace(k, t);
+    return t;
+}
+static const XdTex* xd_get_texture_uncached(const uint32_t* fetch6) {
     uint8_t* phys = g_base + 0x80000000ull;
     uint64_t key = lsw_gpu_texture_key(fetch6, phys);
     auto it = g_xd_tex.find(key);
@@ -536,6 +543,7 @@ static ID3D12PipelineState* xd_blit_pso(DXGI_FORMAT fmt) {
 }
 // Draws src (SRV format srv_fmt) into dst_rtv over dst rect [x,y,w,h]; texel = dst pixel + off,
 // mode 0 = 1:1, 1 = average 2x2 samples (4x MSAA), 2 = average 1x2 (2x MSAA), 3 = one sample (scale sx,sy).
+static uint64_t g_xd_blit_count = 0;   // bumps whenever a blit rebinds the output merger
 static void xd_blit(ID3D12Resource* src, DXGI_FORMAT srv_fmt, D3D12_CPU_DESCRIPTOR_HANDLE dst_rtv, DXGI_FORMAT dst_fmt,
                     int32_t x, int32_t y, int32_t w, int32_t h, int32_t offx, int32_t offy, int32_t mode, int32_t sx, int32_t sy) {
     if (w <= 0 || h <= 0 || !xd_blit_init()) return;
@@ -547,6 +555,7 @@ static void xd_blit(ID3D12Resource* src, DXGI_FORMAT srv_fmt, D3D12_CPU_DESCRIPT
     D3D12_CPU_DESCRIPTOR_HANDLE hc = g_xd_srv_heap->GetCPUDescriptorHandleForHeapStart(); hc.ptr += SIZE_T(slot) * g_xd_srv_inc;
     g_device->CreateShaderResourceView(src, &sv, hc);
     D3D12_GPU_DESCRIPTOR_HANDLE hg = g_xd_srv_heap->GetGPUDescriptorHandleForHeapStart(); hg.ptr += UINT64(slot) * g_xd_srv_inc;
+    ++g_xd_blit_count;
     g_cmd->OMSetRenderTargets(1, &dst_rtv, FALSE, nullptr);
     g_cmd->SetGraphicsRootSignature(g_xd_blit_rs);
     g_cmd->SetPipelineState(pso);
@@ -901,12 +910,12 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         D3D12_RANGE none = {}; g_xd_up[fi]->Map(0, &none, (void**)&g_xd_up_ptr[fi]);
         g_xd_up_cap[fi] = cap;
     }
-    memcpy(g_xd_up_ptr[fi], f.arena.data(), f.arena.size());
+    { GpScope gp(GP_RP_ARENA); memcpy(g_xd_up_ptr[fi], f.arena.data(), f.arena.size()); }
     for (ID3D12Resource* g : g_xd_tex_garbage[fi]) g->Release();   // slot fi's previous GPU work is complete
     g_xd_tex_garbage[fi].clear();
     for (ID3D12Resource* g : g_xd_rt_garbage[fi]) g->Release();
     g_xd_rt_garbage[fi].clear();
-    ++g_xd_frame_no;
+    ++g_xd_frame_no; ++g_xd_replay_seq;
     const bool gpurt = xd_gpurt();
     g_xd_pso_dsv = (gpurt && xd_stencil()) ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
     D3D12_GPU_VIRTUAL_ADDRESS up = g_xd_up[fi]->GetGPUVirtualAddress();
@@ -939,8 +948,17 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         if (g_xd_shm_state != s) { barrier(g_xd_shm, g_xd_shm_state, s); g_xd_shm_state = s; } };
     const D3D12_RESOURCE_STATES kShmRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     uint32_t drawn = 0, skipped = 0, copies = 0;
+    auto upload = [&](const LswGpuRange& rg) {
+        if (rg.arena_off == kLswRangeResident) return;
+        shm_to(D3D12_RESOURCE_STATE_COPY_DEST);
+        g_cmd->CopyBufferRegion(g_xd_shm, rg.phys, g_xd_up[fi], rg.arena_off, rg.size);
+        ++copies;
+    };
+    for (const LswGpuRange& rg : f.prelude) upload(rg);   // uploads of frames replaced before replay
+    f.replayed = true;
     g_xd_fstate_prev.swap(g_xd_fstate); g_xd_fstate.clear();
     xd_fstate("frame %llu:", (unsigned long long)g_xd_frame_no);
+    GpScope* gp_diag = new GpScope(GP_RP_DIAG);
     // DIAG (always on, rate-limited): frame-structure fingerprint = draw count + every resolve
     // (dest, rect, size) + distinct viewports; logged to stdout whenever it differs from the previous
     // frame, to catch the periodic broken frames.
@@ -973,6 +991,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         }
         prev_sig = sig; prev_desc.swap(desc);
     }
+    delete gp_diag;
     for (const LswGpuDrawRec& r : f.draws) {
         if (r.kind == 1) {   // EDRAM resolve
             if (xdlog) printf("[XDLOG] #%u RESOLVE src=%u rect=%d,%d..%d,%d pitch=%u -> 0x%08X %ux%u tfmt=%u clr c%u d%u\n", draw_i, r.rs_src,
@@ -982,8 +1001,13 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             xd_fstate(" R%u:%X[%d..%d]", r.rs_src, r.rs_dest, r.rs_rect[1], r.rs_rect[3]);
             continue;
         }
+        // 1. Vertex data into shared memory: the ranges record time found not resident. Issued for
+        // EVERY recorded draw, before any skip below, since the residency tracking assumed them.
+        for (uint32_t k = 0; k < r.range_count; ++k) upload(f.ranges[r.first_range + k]);
         // Texture pre-pass: build composed / sized resolve-target copies now (they are blits).
         if (gpurt) {
+            GpScope gp(GP_RP_PREPASS);
+            const uint64_t blits_before = g_xd_blit_count;
             const uint32_t* fa = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
             auto prep = [&](uint32_t count, const uint8_t* dims, const uint8_t* fetches) {
                 for (uint32_t t = 0; t < count && t < 32; ++t) {
@@ -995,7 +1019,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             };
             prep(r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch);
             prep(r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
-            bound_key = ~0ull;   // blits rebound the output merger: force the RT rebind below
+            if (g_xd_blit_count != blits_before) bound_key = ~0ull;   // a blit rebound the output merger: force the RT rebind below
         }
         // Render targets of this draw (sample space for MSAA surfaces).
         UINT msx = 1, msy = 1;
@@ -1046,21 +1070,6 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             }
             ++rt_draws;
         }
-        // 1. Vertex data into shared memory (skip ranges whose content is already resident).
-        // DIAG LSWTCS_SHMALWAYS=1: never skip (rules out stale bytes left by overlapping ranges).
-        static int shm_always = -1; if (shm_always < 0) { const char* e = getenv("LSWTCS_SHMALWAYS"); shm_always = (e && e[0] == '1') ? 1 : 0; }
-        for (uint32_t k = 0; k < r.range_count; ++k) {
-            const LswGpuRange& rg = f.ranges[r.first_range + k];
-            uint64_t h = xd_hash(f.arena.data() + rg.arena_off, rg.size) ^ rg.size;
-            auto it = g_xd_resident.find(rg.phys);
-            if (!shm_always && it != g_xd_resident.end() && it->second.size == rg.size && it->second.hash == h) continue;
-            xd_resident_evict_overlaps(rg.phys, rg.size);
-            g_xd_resident[rg.phys] = XdResident{rg.size, h};
-            if (rg.size > g_xd_resident_maxsize) g_xd_resident_maxsize = rg.size;
-            shm_to(D3D12_RESOURCE_STATE_COPY_DEST);
-            g_cmd->CopyBufferRegion(g_xd_shm, rg.phys, g_xd_up[fi], rg.arena_off, rg.size);
-            ++copies;
-        }
         shm_to(kShmRead);
         if (dt_mode && (r.surf_info & 0x3FFF) == 640 && r.ps_tex_count >= 6) {
             const uint32_t* fa0 = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
@@ -1105,7 +1114,8 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         }
         ++draw_i;
         if (!gpurt) { rt_fmts[0] = rtv_fmt; nrt = 1; }
-        ID3D12PipelineState* pso = rs ? xd_pso(r, rs, rt_fmts, nrt) : nullptr;
+        ID3D12PipelineState* pso;
+        { GpScope gp(GP_RP_PSO); pso = rs ? xd_pso(r, rs, rt_fmts, nrt) : nullptr; }
         if (!pso) { ++skipped; continue; }
         g_cmd->SetGraphicsRootSignature(rs);
         g_cmd->SetPipelineState(pso);
@@ -1204,10 +1214,11 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
             D3D12_GPU_DESCRIPTOR_HANDLE g = g_xd_smp_heap->GetGPUDescriptorHandleForHeapStart(); g.ptr += UINT64(first) * g_xd_smp_inc;
             g_cmd->SetGraphicsRootDescriptorTable(param++, g);
         };
-        tex_table(r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch);
-        smp_table(r.ps_smp_count, r.ps_smp);
-        tex_table(r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
-        smp_table(r.vs_smp_count, r.vs_smp);
+        { GpScope gp(GP_RP_BIND);
+          tex_table(r.ps_tex_count, r.ps_tex_dim, r.ps_tex_fetch);
+          smp_table(r.ps_smp_count, r.ps_smp);
+          tex_table(r.vs_tex_count, r.vs_tex_dim, r.vs_tex_fetch);
+          smp_table(r.vs_smp_count, r.vs_smp); }
         // 3. Fixed function + draw.
         D3D12_VIEWPORT vp = { r.viewport[0] * msx, r.viewport[1] * msy, r.viewport[2] * msx, r.viewport[3] * msy, r.viewport[4], r.viewport[5] };
         if (vp.Width <= 0 || vp.Height <= 0) { vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)rt_w; vp.Height = (float)rt_h; }

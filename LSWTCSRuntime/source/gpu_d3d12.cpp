@@ -28,6 +28,7 @@
 #include <direct.h>   // _mkdir (harvest dir)
 #include <unordered_map>
 #include "renderdoc_app.h"   // RenderDoc in-app capture API (LSWTCS_RDOC)
+extern "C" void lswtcs_gil_blocking(void (*fn)(void*), void* arg);   // kernel_stubs.cpp
 
 // ── RenderDoc in-app capture: programmatic full-GPU-state capture (.rdc). ──
 // Loads renderdoc.dll (must be BEFORE D3D12 device creation so RenderDoc hooks it),
@@ -770,6 +771,7 @@ void gpu_d3d12_init() {
 void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
                        uint32_t row_pitch, uint32_t width, uint32_t height) {
     if (!g_ready) return;
+    struct GpPresent { uint64_t t0 = gp_now(); ~GpPresent() { g_gpuprof[GP_PRESENT] += gp_now() - t0; } } gp_present;
 
     // ── Window message pump ───────────────────────────────────────────────���
     MSG msg;
@@ -781,8 +783,12 @@ void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
 
     // ── Wait for frame N-1 to finish ────────────────────��─────────────────
     if (g_fence->GetCompletedValue() < g_fence_for[g_frame_idx]) {
+        uint64_t gp0 = gp_now();
         g_fence->SetEventOnCompletion(g_fence_for[g_frame_idx], g_fence_ev);
-        WaitForSingleObject(g_fence_ev, INFINITE);
+        // Block off the guest scheduler: holding the turn here (up to a whole refresh interval
+        // under flip-model pacing) starved every other guest thread.
+        lswtcs_gil_blocking([](void*) { WaitForSingleObject(g_fence_ev, INFINITE); }, nullptr);
+        g_gpuprof[GP_FENCEWAIT] += gp_now() - gp0;
     }
 
     // ── Reset command recording ─────────────────────────────────��──────────
@@ -825,7 +831,9 @@ void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
         D3D12_RECT scr = {0,0,(LONG)kSwapW,(LONG)kSwapH};
         g_cmd->RSSetViewports(1,&vp); g_cmd->RSSetScissorRects(1,&scr);
         if (gpudraw) {
+            uint64_t gp0 = gp_now();
             gpu_xedraw_replay(rtv, phys_addr);
+            g_gpuprof[GP_REPLAY] += gp_now() - gp0;
             // Replay binds EDRAM render targets / blit targets: restore the backbuffer for the rest.
             if (use_depth) { D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_geom_dsv_heap->GetCPUDescriptorHandleForHeapStart();
                              g_cmd->OMSetRenderTargets(1, &rtv, FALSE, &dsv); }
@@ -968,6 +976,7 @@ void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
     pres_ctr++;
 
     // ── Execute + present ──────────────────────────────────────────────────
+    uint64_t gp_sub0 = gp_now();
     g_cmd->Close();
     ID3D12CommandList* lists[] = {g_cmd};
     g_queue->ExecuteCommandLists(1, lists);
@@ -976,6 +985,7 @@ void gpu_d3d12_present(uint8_t* base, uint32_t phys_addr,
     // VdSwap) is the sole timing authority, locking to a fixed target (Switch
     // Lite 60 Hz) regardless of the host monitor's refresh rate.
     g_swapchain->Present(0, 0);
+    g_gpuprof[GP_SUBMIT] += gp_now() - gp_sub0;
 
     if (rdoc_cap && g_rdoc) {
         g_rdoc->EndFrameCapture(nullptr, nullptr);

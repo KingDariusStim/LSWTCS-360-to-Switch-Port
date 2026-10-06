@@ -13,6 +13,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <deque>
 #include <algorithm>
@@ -760,6 +761,14 @@ struct GilYield {
         g_sched_cv.wait(lk, [this]{ return g_sched_turn == id; });
     }
 };
+// Host-side blocking call from another TU (gpu_d3d12.cpp GPU fence waits): runs fn off the
+// cooperative rotation so guest threads keep running while the host blocks.
+// LSWTCS_PRESENTYIELD=0 keeps the turn (old behaviour, for A/B).
+extern "C" void lswtcs_gil_blocking(void (*fn)(void*), void* arg) {
+    static int on = -1; if (on < 0) { const char* e = getenv("LSWTCS_PRESENTYIELD"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on) { fn(arg); return; }
+    GilYield y; fn(arg);
+}
 // ⭐ LAYOUT-LOTTERY FIX (2026-06-16): GIL-cooperative std::mutex guard. A guest-callable host
 // function that serializes with a raw std::mutex (e.g. VdSwap's g_vdswap_mutex) DEADLOCKS under the
 // cooperative GIL: the holder can yield the turn (quantum) while locked, and a second thread blocks on
@@ -2145,6 +2154,10 @@ PPC_FUNC(__imp__XMsgStartIORequest) {
 }
 PPC_FUNC(__imp__XMsgCancelIORequest)        { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 
+// Env flag read once per call site (the PM4 walker tests diagnostics flags per packet / per draw;
+// a raw getenv there cost real time every frame).
+#define LSW_ENV_SET(name) ([] { static const bool v = getenv(name) != nullptr; return v; }())
+
 // ── PM4 ring buffer parser ─────────────────────────────────────────────────────
 // Reads big-endian dword at ring-buffer dword index (wraps).
 static inline uint32_t rb_read(uint32_t dw_idx) {
@@ -2154,7 +2167,9 @@ static inline uint32_t rb_read(uint32_t dw_idx) {
 }
 
 // Write a 32-bit value to a guest address (EOS fence completion).
+static void gpu_shm_invalidate(uint32_t phys);
 static inline void pm4_store32(uint32_t ga, uint32_t val) {
+    gpu_shm_invalidate(ga & 0x1FFFFFFFu);
     *(volatile uint32_t*)(g_base + ga) = __builtin_bswap32(val);
 }
 // GPU memory write as Xenia's command processor does it (EVENT_WRITE_SHD / MEM_WRITE): the low 2
@@ -2177,6 +2192,7 @@ static void pm4_gpu_write(uint32_t addr_endian, uint32_t value) {
         dst = g_base + 0x7F000000ull + off;
     } else {
         dst = g_base + 0x80000000ull + addr;
+        gpu_shm_invalidate(addr);
     }
     memcpy(dst, &v, 4);   // host little-endian store of the swapped value (xe::store)
 }
@@ -2681,6 +2697,7 @@ static void bufwatch_swap() {
     }
 }
 uint64_t g_geom_swaps_pub = 0;   // swap packets seen (all walkers)
+static void gpu_shm_carry_uploads(const LswGpuFrame& from, LswGpuFrame& to);
 static void geom_swap_packet(uint32_t swap_fb) {
     ++g_geom_swaps_pub;
     framemap_swap(swap_fb);
@@ -2694,6 +2711,7 @@ static void geom_swap_packet(uint32_t swap_fb) {
       g_gpu_offscreen_drops = 0; }
     if (gpudraw_on() && !g_gpu_frame_build.draws.empty()) {
         g_gpu_frame_build.swap_fb = swap_fb;
+        if (g_gpu_frame_ready && !g_gpu_frame_present.replayed) gpu_shm_carry_uploads(g_gpu_frame_present, g_gpu_frame_build);
         std::swap(g_gpu_frame_build, g_gpu_frame_present); g_gpu_frame_build.clear(); g_gpu_frame_ready = true; }
     if (g_geom_vert_count == 0) return;   // duplicate swap marker with nothing drawn: keep last frame
     geom_publish();
@@ -3002,6 +3020,9 @@ static void xvs_draw(uint32_t draw_initiator, uint32_t dma_base, uint32_t dma_si
 #include "lsw_gpu_bridge.h"
 #include "lsw_gpu_frame.h"
 LswGpuFrame g_gpu_frame_build, g_gpu_frame_present;
+// GPUPROF: host cost of each frame-pipeline stage in QPC ticks (GP_* indices), averaged per
+// presented frame in the [PROF] line. Shared with gpu_d3d12.cpp (replay / present).
+extern "C" { uint64_t g_gpuprof[GP_COUNT]; }
 uint32_t g_gpu_offscreen_drops = 0, g_gpu_offscreen_pitch = 0;
 bool g_gpu_frame_ready = false;
 static int g_gpudraw_on = -1;
@@ -3088,6 +3109,76 @@ static void gpu_record_resolve() {
                 n, r.rs_src, r.rs_sample, r.rs_copy_cmd, x0, y0, x1, y1, r.surf_info, r.color_info, r.depth_info,
                 r.rs_dest, r.rs_dest_pitch, r.rs_dest_height, r.rs_dest_fmt, r.rs_clear_color, r.rs_clear_depth, vf0, vf1);
 }
+// ── Shared-memory residency, tracked at record time (4 KB pages) ─────────────────────────────
+// GPU shared memory mirrors guest physical memory 1:1, so residency is tracked per page: the content
+// hash last uploaded. A draw's vertex ranges are split into pages; changed pages are uploaded in
+// coalesced runs, unchanged ones not at all. Deciding here, from guest memory, means unchanged vertex
+// data is never copied into the frame arena nor hashed at replay. Pages are hashed once per walk
+// epoch (guest memory cannot change inside one walk except through the hooks that bump the epoch:
+// guest interrupt callbacks, tile-drain yields, CP memory writes). Earlier model (exact ranges keyed
+// by start, overlap eviction) re-uploaded ~8 MB per hub frame: draws using overlapping slices of one
+// buffer evicted each other every frame.
+// A published frame that is replaced before it was replayed hands its uploads to the next frame
+// (gpu_shm_carry_uploads). DIAG LSWTCS_SHMALWAYS=1: upload every page of every range every draw.
+static constexpr uint32_t kShmPageShift = 12, kShmPageSize = 1u << kShmPageShift, kShmPages = 0x20000000u >> kShmPageShift;
+struct GpuShmPage { uint64_t hash; uint32_t epoch; uint32_t valid; };
+static std::vector<GpuShmPage> g_shm_pages;
+static uint32_t g_shm_epoch = 1;
+static inline void gpu_shm_new_epoch() { ++g_shm_epoch; }
+static void gpu_shm_invalidate(uint32_t phys) {   // a CP write landed here: rehash before trusting the page
+    if (!g_shm_pages.empty() && phys < 0x20000000u) g_shm_pages[phys >> kShmPageShift].epoch = 0;
+}
+static void gpu_shm_reset() { for (GpuShmPage& p : g_shm_pages) p.valid = 0; }
+// Appends upload runs for the guest physical range [a, a + sz) to f.ranges.
+static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
+    static int always = -1; if (always < 0) { const char* e = getenv("LSWTCS_SHMALWAYS"); always = (e && e[0] == '1') ? 1 : 0; }
+    if (g_shm_pages.empty()) g_shm_pages.assign(kShmPages, GpuShmPage{0, 0, 0});
+    const uint8_t* phys = g_base + 0x80000000ull;
+    uint32_t p0 = a >> kShmPageShift, p1 = (a + sz - 1) >> kShmPageShift, run = UINT32_MAX;
+    auto flush = [&](uint32_t pend) {
+        uint32_t start = run << kShmPageShift, bytes = (pend - run) << kShmPageShift;
+        LswGpuRange rg{start, bytes, f.alloc_uninit(bytes, 16)};
+        memcpy(f.arena.data() + rg.arena_off, phys + start, bytes);
+        f.ranges.push_back(rg);
+        g_gpuprof[GP_VBYTES] += bytes;
+        run = UINT32_MAX;
+    };
+    for (uint32_t p = p0; p <= p1; ++p) {
+        GpuShmPage& pg = g_shm_pages[p];
+        bool dirty = always != 0;
+        if (pg.epoch != g_shm_epoch) {
+            uint64_t h = lsw_hash_bytes(phys + (size_t(p) << kShmPageShift), kShmPageSize);
+            if (!pg.valid || pg.hash != h) dirty = true;
+            pg.hash = h; pg.valid = 1; pg.epoch = g_shm_epoch;
+        }
+        if (dirty) { if (run == UINT32_MAX) run = p; }
+        else if (run != UINT32_MAX) flush(p);
+    }
+    if (run != UINT32_MAX) flush(p1 + 1);
+}
+static void gpu_shm_carry_uploads(const LswGpuFrame& from, LswGpuFrame& to) {
+    std::vector<LswGpuRange> carried;
+    uint64_t bytes = 0;
+    for (const LswGpuRange& rg : from.prelude) bytes += rg.size;
+    if (bytes > (256u << 20)) {   // replay is not running at all: stop carrying, start over
+        dbg_ram("[SHMRES] %llu MB of unreplayed uploads: residency reset\n", (unsigned long long)(bytes >> 20));
+        gpu_shm_reset();
+        return;
+    }
+    auto carry = [&](const LswGpuRange& rg) {
+        if (rg.arena_off == kLswRangeResident) return;
+        LswGpuRange c = rg;
+        c.arena_off = to.alloc_uninit(rg.size, 16);
+        memcpy(to.arena.data() + c.arena_off, from.arena.data() + rg.arena_off, rg.size);
+        carried.push_back(c);
+    };
+    for (const LswGpuRange& rg : from.prelude) carry(rg);
+    for (const LswGpuRange& rg : from.ranges) carry(rg);
+    carried.insert(carried.end(), to.prelude.begin(), to.prelude.end());
+    to.prelude.swap(carried);
+    static uint64_t n = 0; if (++n <= 10 || (n % 1000) == 0)
+        dbg_ram("[SHMRES] published frame replaced before replay (#%llu): %zu uploads carried over\n", (unsigned long long)n, to.prelude.size());
+}
 // Returns true if the draw was recorded (caller then skips the CPU XVS path).
 static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t dma_size,
                                  const uint8_t* inline_idx, uint32_t inline_words, uint32_t edram_mode);
@@ -3095,7 +3186,9 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
 // ([DRAWIN] prim, count, VS/PS address, mode) and whether it was recorded (rec=0 -> dropped/CPU path).
 static bool gpu_record_draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size,
                             const uint8_t* inline_idx, uint32_t inline_words, uint32_t edram_mode = 4) {
+    uint64_t gp0 = gp_now();
     bool rec = gpu_record_draw_impl(initiator, dma_base, dma_size, inline_idx, inline_words, edram_mode);
+    g_gpuprof[GP_RECORD] += gp_now() - gp0; g_gpuprof[GP_DRAWS] += rec;
     // Window: from a D3D clear (rect list, depth mode) to the next quad list. Printed only when that quad
     // list has 40 vertices (the title's "Press START" text); armed by file "pktwin_now".
     { static uint32_t pc = 0;
@@ -3143,9 +3236,12 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     if (src == 1) endian = idx32 ? 2u : 1u;
     bool ps_ok = g_ps_addr >= 0x80000000u && g_ps_addr < 0xA0000000u && g_ps_size && g_ps_size < 0x4000;
     LswGpuDraw d;
-    if (!lsw_gpu_prepare(g_xe_regs, reinterpret_cast<const uint32_t*>(g_base + g_vs_addr), g_vs_size,
-                         ps_ok ? reinterpret_cast<const uint32_t*>(g_base + g_ps_addr) : nullptr,
-                         ps_ok ? g_ps_size : 0, endian, 1280, 720, &d)) {
+    uint64_t gp0 = gp_now();
+    int prepared = lsw_gpu_prepare(g_xe_regs, reinterpret_cast<const uint32_t*>(g_base + g_vs_addr), g_vs_size,
+                                   ps_ok ? reinterpret_cast<const uint32_t*>(g_base + g_ps_addr) : nullptr,
+                                   ps_ok ? g_ps_size : 0, endian, 1280, 720, &d);
+    g_gpuprof[GP_PREPARE] += gp_now() - gp0;
+    if (!prepared) {
         static int nfail = 0; if (++nfail <= 10) dbg_ram("[GPUDRAW] prepare failed VS=0x%08X/%u PS=0x%08X/%u\n", g_vs_addr, g_vs_size, g_ps_addr, g_ps_size);
         return false;
     }
@@ -3191,14 +3287,13 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     put(d.fetch, 192 * 4, r.cb_fetch_off);
     // Vertex data snapshot (guest physical ranges -> shared memory at replay).
     r.first_range = uint32_t(f.ranges.size());
+    gp0 = gp_now();
     for (uint32_t i = 0; i < d.vfetch_count; ++i) {
         uint32_t a = d.vfetch_addr[i] & 0x1FFFFFFFu, sz = d.vfetch_size[i];
         if (!sz || sz > 0x1000000u || a + sz > 0x20000000u) continue;
-        LswGpuRange rg{a, sz, 0};
-        rg.arena_off = f.alloc(sz, 16);
-        memcpy(f.arena.data() + rg.arena_off, g_base + 0x80000000u + a, sz);
-        f.ranges.push_back(rg);
+        gpu_shm_track(f, a, sz);
     }
+    g_gpuprof[GP_VCOPY] += gp_now() - gp0;
     r.range_count = uint32_t(f.ranges.size()) - r.first_range;
     // DIAG: quad-list draws inside the imlog_now window -> vertex ranges and first guest dwords at record time.
     if (g_imlog_left > 0 && (initiator & 0x3F) == 13) {
@@ -3461,7 +3556,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 uint32_t r = one_reg ? reg : reg + i;
                 if (r < 0x6000) { uint32_t v = ib_read(guest_base, pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); }
             }
-            if (reg < 0x4800 && reg + cnt > 0x4000 && getenv("LSWTCS_XVS")) {
+            if (reg < 0x4800 && reg + cnt > 0x4000 && LSW_ENV_SET("LSWTCS_XVS")) {
                 static int m = 0;
                 if (++m <= 12) dbg_ram("[T0-ALU] hdr=%08X oneReg=%u reg=0x%04X cnt=%u first=%08X %08X %08X %08X\n", hdr, (hdr >> 15) & 1u, reg, cnt,
                                        ib_read(guest_base, pos + 1), ib_read(guest_base, pos + 2), ib_read(guest_base, pos + 3), ib_read(guest_base, pos + 4));
@@ -3616,14 +3711,14 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                         }
                     }
                     // XVS diag: every load that covers VS c0..c3 (dwords 0..15) — the matrix.
-                    if (ctype == 0 && index < 16 && getenv("LSWTCS_XVS")) {
+                    if (ctype == 0 && index < 16 && LSW_ENV_SET("LSWTCS_XVS")) {
                         static int m = 0;
                         if (++m <= 10 && src >= 0x80000000u && src < 0xA0000000u)
                             dbg_ram("[LOADALU-C0] index=%u size=%u src=0x%08X words=%08X %08X %08X %08X %08X %08X %08X %08X\n", index, size, src,
                                     ib_read(src,0), ib_read(src,1), ib_read(src,2), ib_read(src,3), ib_read(src,4), ib_read(src,5), ib_read(src,6), ib_read(src,7));
                     }
                     static int n = 0;
-                    if (getenv("LSWTCS_OPHIST") && ++n <= 12)
+                    if (LSW_ENV_SET("LSWTCS_OPHIST") && ++n <= 12)
                         dbg_ram("[LOADALU#%d] type=%u index=%u size=%u src=0x%08X first=%08X\n", n, ctype, index, size, src,
                                 (src >= 0x80000000u && src < 0xA0000000u && size) ? ib_read(src, 0) : 0);
                 }
@@ -3696,7 +3791,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // DIAG (2026-06-16): unconditionally log the first 16 DRAW packets so we can tell
                 // whether these are REAL draws (sane prim/num_indices/VS addr) or misparsed dwords,
                 // and at what IB depth they sit.
-                if (getenv("LSWTCS_DRAWLOG")) {
+                if (LSW_ENV_SET("LSWTCS_DRAWLOG")) {
                     static int s_drawlog = 0;
                     if (s_drawlog < 16) { s_drawlog++;
                         uint32_t di = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
@@ -3711,7 +3806,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // the raw packet body (DRAW_INDX 0x22: [0]viz [1]initiator [2]index base [3]index
                 // size/type; DRAW_INDX_2 0x36: [0]initiator then inline indices) plus the first
                 // vertex fetch constant, to design general indexed-draw support (Phase 3).
-                if (getenv("LSWTCS_DRAWLOG2") && g_vs_size > 40 && mode == 4) {
+                if (LSW_ENV_SET("LSWTCS_DRAWLOG2") && g_vs_size > 40 && mode == 4) {
                     static int s_d2 = 0;
                     if (s_d2 < 24) { s_d2++;
                         uint32_t w[6]; for (int i = 0; i < 6; ++i) w[i] = (uint32_t)i < body ? ib_read(guest_base, pos + 1 + i) : 0;
@@ -3755,7 +3850,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     // DIAG: log each DISTINCT (VS first-dword,size) menu shader once, with its PS
                     // and bound texture fetch const (0x4900 = SET_CONSTANT type2). Identifies what
                     // the menu draws are (match VS bytes to xenia/shdump) + whether textures bind.
-                    if (getenv("LSWTCS_SHADERID")) {
+                    if (LSW_ENV_SET("LSWTCS_SHADERID")) {
                         static uint32_t seen[32]; static int nseen=0;
                         uint32_t vd0 = (g_vs_addr>=0x82000000u&&g_vs_addr<0xA0000000u)?ib_read(g_vs_addr,0):0;
                         uint32_t key = vd0 ^ (g_vs_size<<24);
@@ -3943,7 +4038,10 @@ static void pm4_fire_interrupt(uint32_t cpu_mask) {
         uint32_t pcr = icb.r13.u32;
         uint8_t saved = (pcr >= 0x80000000u) ? PPC_LOAD_U8(pcr + 268) : 0;
         if (pcr >= 0x80000000u) PPC_STORE_U8(pcr + 268, (uint8_t)n);
+        uint64_t gp0 = gp_now();
         fn(icb, g_base);
+        g_gpuprof[GP_IRQ] += gp_now() - gp0;
+        gpu_shm_new_epoch();
         if (pcr >= 0x80000000u) PPC_STORE_U8(pcr + 268, saved);
     }
     if (g_gfx_interrupt_data) {
@@ -4193,6 +4291,8 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
     { static int wm = -1; if (wm < 0) { const char* e = getenv("LSWTCS_RINGWPTR"); wm = (e && e[0] == '0') ? 0 : 1; }   // default ON (=0: old NOP-frontier walker)
       if (wm) {
         uint8_t* base = g_base;
+        uint64_t gp_walk0 = gp_now();   // GPUPROF: drain-round yields (other threads' time) are excluded
+        gpu_shm_new_epoch();
         g_pm4_walking = true;
         uint32_t w = PPC_LOAD_U32(0x7FC80714u) % rbd;
         uint32_t pos = g_rb_rptr_dwords % rbd, steps = 0, ibs = 0, ints = 0;
@@ -4204,7 +4304,10 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
             g_tile_drain_pending = false;
             g_pm4_walking = false;
             int spins = 0;
+            g_gpuprof[GP_WALK] += gp_now() - gp_walk0;
             while (pm4_tile_backlog() && spins < 20000) { sched_yield_turn(); ++spins; }
+            gp_walk0 = gp_now();
+            gpu_shm_new_epoch();
             g_pm4_walking = true;
             pos = g_rb_rptr_dwords % rbd;   // the worker may have walked the ring itself (ring-space waits)
             static uint64_t nd = 0; if (++nd <= 12 || (nd % 1000) == 0 || pm4_tile_backlog())
@@ -4245,6 +4348,7 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
         }   // pass
         g_rb_rptr_dwords = pos;
         g_pm4_walking = false;
+        g_gpuprof[GP_WALK] += gp_now() - gp_walk0;
         static uint64_t calls = 0, tot_ibs = 0; ++calls; tot_ibs += ibs;
         if (calls <= 5 || (calls % 600) == 0)
             dbg_ram("[RINGW] #%llu wptr=%u rptr=%u steps=%u ibs=%u ints=%u avgibs=%.2f\n",
@@ -4649,6 +4753,7 @@ PPC_FUNC(__imp__VdSwap) {
     // (Writing the framebuffer is safe — the game never branches on its contents.)
     // Guest k_8_8_8_8 is [B,G,R,A]; RB_COLOR_CLEAR is packed 0xAARRGGBB.
     uint32_t cc = g_xe_regs[XE_RB_COLOR_CLEAR];                        // 0xAARRGGBB
+    uint64_t gp_fill0 = gp_now();
     if (cc != 0 && frontbuffer_phys >= 0x02000000u) {
         uint32_t destg = frontbuffer_phys + ((frontbuffer_phys < 0x80000000u) ? 0x80000000u : 0u);
         uint8_t  cb = cc & 0xFF, cg = (cc >> 8) & 0xFF, cr = (cc >> 16) & 0xFF, ca = (cc >> 24) & 0xFF;
@@ -4662,6 +4767,8 @@ PPC_FUNC(__imp__VdSwap) {
                                   destg, width, height, cc, bgra, g_resolve_total); _rl++; }
         }
     }
+
+    g_gpuprof[GP_FBFILL] += gp_now() - gp_fill0;
 
     // Simulate GPU read-pointer writeback (Xenia: RPTR = read_ptr_dwords >> block_log2).
     // Write the end of our written region so the game sees the ring buffer as consumed.
@@ -4687,6 +4794,19 @@ PPC_FUNC(__imp__VdSwap) {
             dbg_ram("[PROF] avg per frame: pm4_ring=%.2fms present=%.2fms (runtime-side total=%.2fms) over %d frames\n",
                    s_pm4/1000.0/s_n, s_present/1000.0/s_n, (s_pm4+s_present)/1000.0/s_n, s_n);
  s_pm4=0; s_present=0; s_n=0;
+            // GPUPROF: every pipeline stage (walk excludes the draw recording nested in it).
+            static uint64_t gp_last[GP_COUNT], gp_t_last = 0;
+            uint64_t gp[GP_COUNT], t = gp_now();
+            for (int i = 0; i < GP_COUNT; ++i) { gp[i] = g_gpuprof[i] - gp_last[i]; gp_last[i] = g_gpuprof[i]; }
+            double wall = gp_t_last ? (t - gp_t_last) / 1e6 / 60.0 : 0; gp_t_last = t;
+            auto ms = [](uint64_t ns) { return ns / 1e6 / 60.0; };
+            dbg_ram("[GPUPROF] guest ISR inside walk=%.2fms | replay: arena->upload=%.2f diag=%.2f prepass=%.2f pso=%.2f bind=%.2f\n",
+                    ms(gp[GP_IRQ]), ms(gp[GP_RP_ARENA]), ms(gp[GP_RP_DIAG]), ms(gp[GP_RP_PREPASS]), ms(gp[GP_RP_PSO]), ms(gp[GP_RP_BIND]));
+            dbg_ram("[GPUPROF] per frame: wall=%.2fms walk=%.2f record=%.2f (prepare=%.2f vhash+copy=%.2f) replay=%.2f "
+                    "present=%.2f (fencewait=%.2f submit=%.2f) fbfill=%.2f | draws=%.0f vbytes=%.0fKB\n",
+                    wall, ms(gp[GP_WALK] - gp[GP_RECORD]), ms(gp[GP_RECORD]), ms(gp[GP_PREPARE]), ms(gp[GP_VCOPY]),
+                    ms(gp[GP_REPLAY]), ms(gp[GP_PRESENT]), ms(gp[GP_FENCEWAIT]), ms(gp[GP_SUBMIT]),
+                    ms(gp[GP_FBFILL]), gp[GP_DRAWS] / 60.0, gp[GP_VBYTES] / 1024.0 / 60.0);
         }
     }
 

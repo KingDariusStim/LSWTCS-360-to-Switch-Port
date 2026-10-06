@@ -2,7 +2,12 @@
 // translated-shader path (gpu_d3d12.cpp). All data a draw needs is snapshotted into a byte arena
 // at record time, because guest memory (vertex/index buffers, constants) changes before present.
 #pragma once
+#include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <utility>
 #include <vector>
 #include "lsw_gpu_bridge.h"
 
@@ -49,17 +54,74 @@ struct LswGpuDrawRec {
   LswGpuSamplerBinding ps_smp[32], vs_smp[32];
 };
 
+// Vector allocator that leaves new elements uninitialised (resize() would zero-fill every byte of
+// the multi-MB arena right before it is overwritten).
+template <class T> struct LswDefaultInitAlloc : std::allocator<T> {
+  template <class U> struct rebind { using other = LswDefaultInitAlloc<U>; };
+  using std::allocator<T>::allocator;
+  template <class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+  template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+};
+
+// LswGpuRange::arena_off for a range whose content is already resident in GPU shared memory.
+enum : uint32_t { kLswRangeResident = 0xFFFFFFFFu };
+
 struct LswGpuFrame {
-  std::vector<uint8_t> arena;
+  std::vector<uint8_t, LswDefaultInitAlloc<uint8_t>> arena;
   std::vector<LswGpuRange> ranges;
   std::vector<LswGpuDrawRec> draws;
+  // Shared-memory uploads of earlier published frames that were never replayed: the record-time
+  // residency tracking assumed them done, so they are issued before this frame's draws.
+  std::vector<LswGpuRange> prelude;
   uint32_t swap_fb = 0;   // frontbuffer address in the PM4_XE_SWAP packet that ended this frame
-  void clear() { arena.clear(); ranges.clear(); draws.clear(); }
+  bool replayed = false;  // its shared-memory uploads were issued by the replay
+  void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); replayed = false; }
+  // Zero-filled (constant buffers: padding and short blocks must read as 0).
   uint32_t alloc(uint32_t size, uint32_t align = 256) {
+    size_t old = arena.size();
+    uint32_t off = alloc_uninit(size, align);
+    std::memset(arena.data() + old, 0, arena.size() - old);
+    return off;
+  }
+  // Uninitialised: for vertex / index data that is copied in right away.
+  uint32_t alloc_uninit(uint32_t size, uint32_t align = 256) {
     uint32_t off = uint32_t((arena.size() + (align - 1)) & ~size_t(align - 1));
     arena.resize(off + size);
     return off;
   }
+};
+
+// 64-bit content hash for vertex ranges: four independent lanes (xxHash64 round) so it runs near
+// memory bandwidth instead of one serial multiply chain per 8 bytes.
+static inline uint64_t lsw_hash_bytes(const uint8_t* p, uint32_t n) {
+  const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
+  auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+  auto round = [&](uint64_t acc, uint64_t in) { return rotl(acc + in * P2, 31) * P1; };
+  uint64_t a = P1 + P2, b = P2, c = 0, d = 0 - P1;
+  uint32_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    uint64_t w[4]; std::memcpy(w, p + i, 32);
+    a = round(a, w[0]); b = round(b, w[1]); c = round(c, w[2]); d = round(d, w[3]);
+  }
+  uint64_t h = rotl(a, 1) + rotl(b, 7) + rotl(c, 12) + rotl(d, 18);
+  for (; i + 8 <= n; i += 8) { uint64_t v; std::memcpy(&v, p + i, 8); h = rotl(h ^ round(0, v), 27) * P1; }
+  for (; i < n; ++i) h = (h ^ p[i]) * P1;
+  h ^= h >> 33; h *= P2; h ^= h >> 29;
+  return h ^ n;
+}
+
+// GPUPROF stage accumulators (nanoseconds / counts), defined in kernel_stubs.cpp.
+enum { GP_WALK, GP_RECORD, GP_PREPARE, GP_VCOPY, GP_REPLAY, GP_SHMHASH, GP_PRESENT, GP_FENCEWAIT, GP_SUBMIT,
+       GP_FBFILL, GP_DRAWS, GP_VBYTES, GP_IRQ,
+       GP_RP_ARENA, GP_RP_PREPASS, GP_RP_PSO, GP_RP_BIND, GP_RP_DIAG, GP_COUNT };
+extern "C" uint64_t g_gpuprof[GP_COUNT];
+static inline uint64_t gp_now() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+struct GpScope {   // adds the enclosing scope's duration to g_gpuprof[k]
+  int k; uint64_t t0;
+  explicit GpScope(int stage) : k(stage), t0(gp_now()) {}
+  ~GpScope() { g_gpuprof[k] += gp_now() - t0; }
 };
 
 // Building (PM4 thread) and published (present) frames; swapped at the guest swap marker.

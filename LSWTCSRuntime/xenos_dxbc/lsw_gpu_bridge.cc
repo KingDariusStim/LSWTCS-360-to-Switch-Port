@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <type_traits>
 #include <cstdio>
 #include <direct.h>
 extern "C" void dbg_ram(const char* fmt, ...);
@@ -30,7 +31,6 @@ using namespace xe::gpu;
 namespace {
 
 struct BridgeState {
-  RegisterFile regs;
   std::unique_ptr<DxbcShaderTranslator> translator;
   std::unordered_map<uint64_t, std::unique_ptr<DxbcShader>> shaders;
   StringBuffer disasm_buffer;
@@ -105,8 +105,11 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
                                uint32_t rt_height, LswGpuDraw* out) {
   if (!regs_in || !vs_ucode_be || !vs_dwords || !out) return 0;
   BridgeState& b = bridge();
-  RegisterFile& regs = b.regs;
-  std::memcpy(regs.values, regs_in, sizeof(regs.values));
+  // The caller's register array (>= kRegisterCount dwords, read-only here) viewed in place: copying
+  // the 80 KB file per draw was ~2 ms per frame at hub draw counts.
+  static_assert(std::is_standard_layout_v<RegisterFile> && sizeof(RegisterFile) == sizeof(uint32_t) * RegisterFile::kRegisterCount,
+                "RegisterFile must be a plain register array");
+  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(regs_in);
   std::memset(out, 0, sizeof(*out));
 
   DxbcShader* vs = get_shader(xenos::ShaderType::kVertex, vs_ucode_be, vs_dwords);
