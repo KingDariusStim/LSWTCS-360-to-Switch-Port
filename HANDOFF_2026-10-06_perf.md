@@ -196,6 +196,38 @@ textures, snapshot texture bytes at record time (or hash/dirty-track texture pag
 - `fbfill` in VdSwap still CPU-fills the guest frontbuffer with the clear colour every frame (~0.1 ms); likely
   obsolete with GPU render targets, but verify before removing.
 
+## 5.5 Session 2 (evening): saves, texture animation, allocator, time — all verified in game
+- **Saves (XamContent*)**: Xenia-equivalent content system in `kernel_stubs.cpp`. `XamContentCreateEx`
+  mounts `root:` on `<LSWTCS_SAVEDIR, default saves/>/<type 8 hex>/<package>/` (+ `<package>.xcd` =
+  guest XCONTENT_DATA for enumeration); real enumeration, close/flush/delete/creator/thumbnails;
+  NT create dispositions + directories for content paths only; `NtWriteFile` honours ByteOffset and
+  invalidates the read-ahead cache; `NtSetInformationFile` class 20 (EOF). The game saves at level end
+  (`sub_824E4B28` → `sub_8249AE18`, CREATE_ALWAYS, checksum `+0x5C0999`) and re-reads it. `[SAVE]` log
+  lines cover every mount/open/read/write on save handles. Verified: save after a level, restart, Load
+  Game lists it.
+- **Load Game date/time**: the preview line under "Game 1" is the save's date + time (not stats).
+  `RtlTimeToTimeFields`/`RtlTimeFieldsToTime` implemented (were empty → stack garbage 65535/33575/…);
+  file queries return real file times; XConfig user settings 1-7 = host time zone; VCLOCK
+  `KeQuerySystemTime` epoch = real launch time (`LSWTCS_FIXEDEPOCH=1` = old 2012 base).
+- **Texture animation / studs**: XenonRecomp split `sub_822DE7F8` (TexAnim compiler label-fixup pass) at
+  its jump-table targets; the generated switch just returned, so jumps kept label IDs and F7B48GUARD
+  killed every looping texanim. Hand translation in `ppc_recomp.350.cpp` (see
+  `patches/recomp_output_edits.patch`). Studs spin in levels; cantina screens animate; guard never fires.
+- **Mid-level hang**: `g_phys_alloc` was a bump allocator with a no-op `MmFreePhysicalMemory`; in levels
+  the game churns 8 KB blocks every frame, the pointer wrapped to 0xA0000000 (phys 0) and walked into
+  the executable image (phys 0x02000000 = 0xA2000000), overwriting its constants (a 0.0 sentinel became
+  NaN → `sub_82310238` infinite loop). Now: exact-size free lists (zeroed on reuse) + the image range is
+  never handed out. `[PHYS]` logs frees/live blocks/bump.
+- **mftb**: recomp emitted `__rdtsc()` (host TSC, ~40x the 360's 49.875 MHz); routed through
+  `lsw_guest_timebase()` (QPC scaled to 49.875 MHz) at all 19 sites.
+- Tools: `build/explore.sh <label> <press steps…>` (screens after each step), `press_now` stick tokens
+  (`n s e w ne nw se sw`, `name:N` = hold N polls), `skipdraw` file (hide record indices),
+  `[XDLOG]` now dumps small VS constant blocks + vertex range hashes, `build/symstacks.py` (symbolize a
+  cdb `~*k` log; cdb `-pv` attaches non-invasively, `.dump /ma` for full dumps).
+- Open: horizontal colour-shift line across the screen in levels (RenderDoc captures
+  `build/rdoc/cap_frame20439.rdc`, `cap_frame20534.rdc`); audio music stall; pause-menu HUD studs
+  not re-checked since the texanim fix (in-level studs spin).
+
 ## 6. Pitfalls hit this session
 
 - **Uncapped + anything that removes the per-frame pause starves boot** (GIL never released → loaders never

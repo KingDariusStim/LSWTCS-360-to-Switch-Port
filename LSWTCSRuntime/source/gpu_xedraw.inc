@@ -1089,6 +1089,19 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
         // 1. Vertex data into shared memory: the ranges record time found not resident. Issued for
         // EVERY recorded draw, before any skip below, since the residency tracking assumed them.
         for (uint32_t k = 0; k < r.range_count; ++k) upload(f.ranges[r.first_range + k]);
+        // DIAG: file "skipdraw" = record indices (as in [XDLOG] #N) not drawn, to identify a draw on
+        // screen; an empty file clears the list. Re-read every 30 replays while present.
+        {
+            static std::vector<uint32_t> skipdraw;
+            if (draw_i == 0 && (g_xd_frame_no % 30) == 0) {
+                if (FILE* fp = fopen("skipdraw", "r")) {
+                    skipdraw.clear(); unsigned v; while (fscanf(fp, "%u", &v) == 1) skipdraw.push_back(v); fclose(fp);
+                    DeleteFileA("skipdraw");
+                    printf("[SKIPDRAW] %zu draws skipped\n", skipdraw.size()); fflush(stdout);
+                }
+            }
+            if (!skipdraw.empty() && std::find(skipdraw.begin(), skipdraw.end(), draw_i) != skipdraw.end()) { ++draw_i; ++skipped; continue; }
+        }
         // Texture pre-pass: build composed / sized resolve-target copies now (they are blits). Not
         // needed when both tables repeat the previous draw's (their sources are already built).
         const uint32_t* fa_draw = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
@@ -1191,6 +1204,24 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                    r.vertex_count, r.ib_count, r.topology, r.blendcontrol, r.color_mask, r.depthcontrol,
                    r.viewport[0], r.viewport[1], r.viewport[2], r.viewport[3], r.viewport[4], r.viewport[5], r.ps_dxbc ? "y" : "n", r.ps_tex_count);
             printf("[XDLOG]      vs=%016llX ps=%016llX\n", (unsigned long long)r.vs_key, (unsigned long long)r.ps_key);
+            {   // VS float constants: hash + the first 4 registers (world matrix rows on most draws)
+                const float* vf = reinterpret_cast<const float*>(f.arena.data() + r.cb_vsf_off);
+                uint64_t vh = lsw_hash_bytes(reinterpret_cast<const uint8_t*>(vf), r.cb_vsf_size);
+                printf("[XDLOG]      vsf %u regs hash=%016llX c0=%.3f %.3f %.3f %.3f c1=%.3f %.3f %.3f %.3f c2=%.3f %.3f %.3f %.3f c3=%.3f %.3f %.3f %.3f\n",
+                       r.cb_vsf_size / 16, (unsigned long long)vh, vf[0], vf[1], vf[2], vf[3], vf[4], vf[5], vf[6], vf[7],
+                       vf[8], vf[9], vf[10], vf[11], vf[12], vf[13], vf[14], vf[15]);
+                for (uint32_t k = 0; k < r.range_count && k < 4; ++k) {   // vertex pages uploaded for this draw (all of them with LSWTCS_SHMALWAYS=1)
+                    const LswGpuRange& rg = f.ranges[r.first_range + k];
+                    if (rg.arena_off == kLswRangeResident) continue;
+                    printf("[XDLOG]      vtx range 0x%08X +%u hash=%016llX\n", rg.phys, rg.size,
+                           (unsigned long long)lsw_hash_bytes(f.arena.data() + rg.arena_off, rg.size));
+                }
+                if (r.cb_vsf_size <= 32 * 16)   // small blocks (HUD / UI): every register, raw bits too
+                    for (uint32_t k = 4; k < r.cb_vsf_size / 16; ++k) {
+                        uint32_t u[4]; memcpy(u, vf + k * 4, 16);
+                        printf("[XDLOG]        c%u = %.4f %.4f %.4f %.4f  (%08X %08X %08X %08X)\n", k, vf[k * 4], vf[k * 4 + 1], vf[k * 4 + 2], vf[k * 4 + 3], u[0], u[1], u[2], u[3]);
+                    }
+            }
             const uint32_t* fa = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
             for (uint32_t t = 0; t < r.ps_tex_count; ++t) {
                 uint32_t tb = 0, tf = 0, tsw = 0, tw = 0, th = 0, tdim = 0;

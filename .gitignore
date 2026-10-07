@@ -32,3 +32,11 @@
 
 *.bak
 build/
+
+# Eden (Nintendo Switch emulator, local testing only) and anything tied to the user's own console:
+# key files and cartridge/title dumps must never be committed, wherever they end up.
+/Eden/
+*.keys
+*.xci
+*.nsp
+*.nca

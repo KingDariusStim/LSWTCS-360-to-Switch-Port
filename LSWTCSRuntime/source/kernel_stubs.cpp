@@ -13,6 +13,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
 #include <deque>
@@ -343,6 +344,18 @@ static inline void vclock_advance_quantum() {
     // LSWTCS_VCLOCK_RATE = ms advanced per quantum boundary (default 1). ~1ms / 1024 fn-entries.
     static int rate = -1; if (rate < 0) { const char* e = getenv("LSWTCS_VCLOCK_RATE"); rate = (e ? atoi(e) : 1); if (rate < 1) rate = 1; }
     g_vclock_ms.fetch_add((uint64_t)rate, std::memory_order_relaxed);
+}
+
+// Guest timebase (mftb): the 360 timebase runs at 49.875 MHz (= KeQueryPerformanceFrequency). The
+// recompiler emitted mftb as __rdtsc(), i.e. host TSC ticks (~2 GHz+ here), so guest code that
+// converts timebase deltas with the 360 frequency ran ~40x fast (the HUD studs' spin angle advanced
+// ~a whole number of turns per frame and looked frozen). Real time, scaled to the 360 rate.
+extern "C" uint64_t lsw_guest_timebase(void) {
+    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+    static LARGE_INTEGER t0 = [] { LARGE_INTEGER x; QueryPerformanceCounter(&x); return x; }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    uint64_t d = uint64_t(t.QuadPart - t0.QuadPart), q = uint64_t(f.QuadPart);
+    return (d / q) * 49875000ull + ((d % q) * 49875000ull) / q;
 }
 
 // Called from sub_822AE698's spin loop so the KPRCB tick counter advances in
@@ -1098,12 +1111,28 @@ PPC_FUNC(__imp__NtQueryVirtualMemory) {
 // (0x88001000 + 0x17201000 = 0x9F202000), then 16 MB command buffer that ends at
 // ~0xA0214000, plus additional pool/thread buffers. 0xC0000000 is safe (896 MB space).
 // Returns 0 for allocations too large to fit — callers handle 0 gracefully.
+static const uint32_t PPC_IMAGE_SIZE_RT = 0x1460000u;   // image.bin at VA 0x82000000 (= main.cpp PPC_IMAGE_SIZE)
 static uint32_t   g_phys_bump = 0x88000000u;
 static std::mutex g_phys_mutex;
+// Freed blocks are recycled by exact size (MmFreePhysicalMemory used to be a no-op: the game's
+// per-frame 8 KB allocate/free churn leaked ~4 blocks a frame until the bump pointer, after wrapping
+// to 0xA0000000 = phys 0, walked into the executable image's physical pages and overwrote its
+// constants -> a 0.0 loop sentinel read as NaN -> main-thread infinite loop mid-level, 2026-10-06).
+static std::unordered_map<uint32_t, uint32_t> g_phys_sizes;               // live block -> size
+static std::unordered_map<uint32_t, std::vector<uint32_t>> g_phys_free;   // size -> freed blocks
 static uint32_t g_phys_alloc(uint32_t raw_size) {
     if (raw_size == 0) return 0;
     std::lock_guard<std::mutex> lk(g_phys_mutex);
     uint32_t size = (raw_size + 0xFFFu) & ~0xFFFu;
+    {
+        auto fl = g_phys_free.find(size);
+        if (fl != g_phys_free.end() && !fl->second.empty()) {
+            uint32_t a = fl->second.back(); fl->second.pop_back();
+            memset(g_base + a, 0, size);   // fresh physical pages read as zero
+            g_phys_sizes[a] = size;
+            return a;
+        }
+    }
     // Physical address = va & 0x1FFFFFFF (0x80/0xA0/0xC0000000 are aliased views of one 512 MB).
     // A block must not straddle VA 0xA0000000: its physical range would wrap 0x1FFFFFFF -> 0 and
     // the D3D runtime computes negative segment lengths (end_phys < start_phys) -> every frame's
@@ -1111,10 +1140,30 @@ static uint32_t g_phys_alloc(uint32_t raw_size) {
     // Cap at 0xA8000000: beyond that, phys >= 0x08000000 aliases our own 0x88000000 start.
     uint32_t addr = g_phys_bump;
     if (addr < 0xA0000000u && addr + size > 0xA0000000u) addr = 0xA0000000u;
-    if (addr + size > 0xA8000000u) return 0;
+    // The executable image (VA 0x82000000, phys 0x02000000) is the same physical memory as
+    // 0xA2000000: never hand those pages out.
+    const uint32_t img_lo = 0xA2000000u, img_hi = 0xA2000000u + ((PPC_IMAGE_SIZE_RT + 0xFFFFu) & ~0xFFFFu);
+    if (addr < img_hi && addr + size > img_lo) addr = img_hi;
+    if (addr + size > 0xA8000000u) {
+        static int n = 0; if (n++ < 8) dbg_ram("[PHYS] OUT OF MEMORY: 0x%X bytes requested, bump=0x%08X\n", size, g_phys_bump);
+        return 0;
+    }
     g_phys_bump = addr;
     g_phys_bump += size;
+    g_phys_sizes[addr] = size;
     return addr;
+}
+static void g_phys_free_block(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(g_phys_mutex);
+    auto it = g_phys_sizes.find(addr);
+    if (it == g_phys_sizes.end()) {
+        static int n = 0; if (n++ < 8) dbg_ram("[PHYS] free of unknown block 0x%08X ignored\n", addr);
+        return;
+    }
+    g_phys_free[it->second].push_back(addr);
+    g_phys_sizes.erase(it);
+    static uint64_t nf = 0;
+    if (++nf <= 20 || (nf % 2000) == 0) dbg_ram("[PHYS] %llu frees, %zu live blocks, bump=0x%08X\n", (unsigned long long)nf, g_phys_sizes.size(), g_phys_bump);
 }
 // LSWTCS D070PROG (host-side so the LOGIC can be iterated without reshaping the 468.cpp recomp layout that
 // triggers the pre-menu lottery). Called from sub_8271D070's call site (468.cpp) after sub_827144B8 returns
@@ -1160,11 +1209,12 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemory) {
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx) {
     PPC_FUNC_PROLOGUE();
     uint32_t addr = g_phys_alloc(ctx.r4.u32);
-    dbg_ram("[MmAllocatePhysicalMemoryEx] size=0x%X -> 0x%08X\n", ctx.r4.u32, addr);
+    { static uint64_t n = 0; if (++n <= 200 || (n % 2000) == 0) dbg_ram("[MmAllocatePhysicalMemoryEx] #%llu size=0x%X -> 0x%08X\n", (unsigned long long)n, ctx.r4.u32, addr); }
 
     ctx.r3.u32 = addr;
 }
-PPC_FUNC(__imp__MmFreePhysicalMemory)       { PPC_FUNC_PROLOGUE(); }
+// MmFreePhysicalMemory(type r3, base_address r4) [Xenia xboxkrnl_memory.cc]
+PPC_FUNC(__imp__MmFreePhysicalMemory)       { PPC_FUNC_PROLOGUE(); g_phys_free_block(ctx.r4.u32); }
 PPC_FUNC(__imp__MmQueryAddressProtect)      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__ExAllocatePool)             { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__ExAllocatePoolTypeWithTag)  { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
@@ -1224,7 +1274,32 @@ static std::string fileio_read_path(uint32_t obj_attr_addr) {
     return s;
 }
 
+// ── Content roots (saved games) ───────────────────────────────────────────────────────────────
+// XamContentCreateEx mounts a content package under a root name ("save" -> "save:\..."); files the
+// game opens under that root live in a host folder: <LSWTCS_SAVEDIR, default "saves/">/<content type
+// 8 hex>/<package file name>/, with the package's XCONTENT_DATA (guest layout, 0x134 bytes) in
+// <package file name>.xcd beside it for enumeration. (Switch: point the save dir at the save FS.)
+static std::mutex g_content_mtx;
+static std::unordered_map<std::string, std::string> g_content_mounts;   // lower-case root -> host dir ending in '/'
+static std::unordered_set<uint32_t> g_content_handles;                   // file handles opened under a content root ([SAVE] read/write log)
+static std::string content_lower(std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; }
+// "<root>:\rest" with a mounted root (2+ chars; single letters are drive letters) -> host path.
+static bool content_translate(const std::string& xbox, std::string& host) {
+    size_t c = xbox.find(':');
+    if (c == std::string::npos || c < 2) return false;
+    std::string root = content_lower(xbox.substr(0, c));
+    std::lock_guard<std::mutex> lk(g_content_mtx);
+    auto it = g_content_mounts.find(root);
+    if (it == g_content_mounts.end()) return false;
+    std::string rest = xbox.substr(c + 1);
+    while (!rest.empty() && (rest[0] == '\\' || rest[0] == '/')) rest.erase(0, 1);
+    for (char& ch : rest) if (ch == '\\') ch = '/';
+    host = it->second + rest;
+    return true;
+}
+
 static std::string fileio_translate(const std::string& xbox) {
+    { std::string h; if (content_translate(xbox, h)) return h; }
     static const char* prefixes[] = {
         "\\Device\\Harddisk0\\Partition1\\",
         "\\Device\\Harddisk0\\Partition0\\",
@@ -1324,6 +1399,50 @@ PPC_FUNC(__imp__NtCreateFile) {
     ctx.r3.u32 = 0xC000000Fu;
     if (host.empty()) return;
 
+    // Save-content paths: real NT create semantics (dispositions, truncation, directories). Game data
+    // keeps the open-only behaviour below, so no disposition can ever truncate a disc file.
+    { std::string hc;
+      if (content_translate(xbox, hc)) {
+        uint32_t disp = ctx.r10.u32, opts = PPC_LOAD_U32(ctx.r1.u32 + 0x54);   // CreateOptions: 9th argument
+        auto finish = [&](uint32_t status, uint32_t info, uint32_t handle) {
+            ctx.r3.u32 = status;
+            if (iosb) { PPC_STORE_U32(iosb, status); PPC_STORE_U32(iosb + 4, info); }
+            if (hptr && handle) PPC_STORE_U32(hptr, handle);
+            dbg_ram("[SAVE] NtCreateFile '%s' disp=%u opts=0x%X -> status=0x%08X info=%u handle=0x%X\n", xbox.c_str(), disp, opts, status, info, handle);
+            if (handle) { std::lock_guard<std::mutex> lk(g_content_mtx); g_content_handles.insert(handle); }
+        };
+        DWORD attr = GetFileAttributesA(hc.c_str());
+        bool exists = attr != INVALID_FILE_ATTRIBUTES;
+        if (opts & 1) {   // FILE_DIRECTORY_FILE
+            bool made = false;
+            if (!exists) {
+                if (disp == 1 || disp == 4) { finish(0xC0000034u, 0, 0); return; }   // OBJECT_NAME_NOT_FOUND
+                if (!CreateDirectoryA(hc.c_str(), nullptr)) { finish(0xC000003Au, 0, 0); return; }   // OBJECT_PATH_NOT_FOUND
+                made = true;
+            } else if (disp == 2) { finish(0xC0000035u, 0, 0); return; }   // OBJECT_NAME_COLLISION
+            HANDLE h = CreateFileA(hc.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (h == INVALID_HANDLE_VALUE) { finish(0xC0000022u, 0, 0); return; }   // ACCESS_DENIED
+            finish(0, made ? 2u : 1u, kobj_new(h));
+            return;
+        }
+        // NT dispositions: 0 SUPERSEDE, 1 OPEN, 2 CREATE, 3 OPEN_IF, 4 OVERWRITE, 5 OVERWRITE_IF.
+        static const DWORD kWinDisp[6] = {CREATE_ALWAYS, OPEN_EXISTING, CREATE_NEW, OPEN_ALWAYS, TRUNCATE_EXISTING, CREATE_ALWAYS};
+        if (disp > 5) { finish(0xC000000Du, 0, 0); return; }   // INVALID_PARAMETER
+        if (!exists && (disp == 1 || disp == 4)) { finish(0xC0000034u, 0, 0); return; }
+        if (exists && disp == 2) { finish(0xC0000035u, 0, 0); return; }
+        HANDLE h = CreateFileA(hc.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, kWinDisp[disp], FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            h = CreateFileA(hc.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);   // read-only file
+        if (h == INVALID_HANDLE_VALUE) { finish(GetLastError() == ERROR_PATH_NOT_FOUND ? 0xC000003Au : 0xC0000022u, 0, 0); return; }
+        // IO_STATUS_BLOCK.Information: FILE_SUPERSEDED 0, FILE_OPENED 1, FILE_CREATED 2, FILE_OVERWRITTEN 3.
+        uint32_t info = !exists ? 2u : (disp == 0 ? 0u : (disp == 4 || disp == 5) ? 3u : 1u);
+        finish(0, info, kobj_new(h));
+        return;
+      } }
+
     bool create = (ctx.r10.u32 == 2 || ctx.r10.u32 == 3 || ctx.r10.u32 == 5);
     uint32_t gh  = fileio_open(host.c_str(), create);
     if (!gh) {
@@ -1409,6 +1528,10 @@ PPC_FUNC(__imp__NtReadFile) {
     // Read through the per-handle read-ahead cache (64 KB refills) so the game's
     // 1-byte fgetc-style reads don't each hit a syscall.
     uint32_t bytes_read = host_file_read(handle, base + buf_ptr, length, offset, has_off);
+    { bool content; { std::lock_guard<std::mutex> lk(g_content_mtx); content = g_content_handles.count(handle) != 0; }
+      if (content) dbg_ram("[SAVE] NtReadFile handle=0x%X off=%s0x%llX len=0x%X -> read 0x%X into 0x%08X (first dwords %08X %08X %08X %08X)\n",
+                           handle, has_off ? "" : "cur+", (unsigned long long)offset, length, bytes_read, buf_ptr,
+                           PPC_LOAD_U32(buf_ptr), PPC_LOAD_U32(buf_ptr + 4), PPC_LOAD_U32(buf_ptr + 8), PPC_LOAD_U32(buf_ptr + 12)); }
 
     ctx.r3.u32 = (bytes_read > 0) ? 0u : 0xC0000011u;  // 0 or STATUS_END_OF_FILE
     if (iosb) { PPC_STORE_U32(iosb, ctx.r3.u32); PPC_STORE_U32(iosb + 4, bytes_read); }
@@ -1420,12 +1543,28 @@ PPC_FUNC(__imp__NtWriteFile) {
     uint32_t iosb    = ctx.r7.u32;
     uint32_t buf_ptr = ctx.r8.u32;
     uint32_t length  = ctx.r9.u32;
+    uint32_t off_ptr = ctx.r10.u32;
     HANDLE h = kobj_get(handle);
     if (!h || !buf_ptr || !length) { ctx.r3.u32 = 0xC0000008u; return; }
-    DWORD written = 0;
-    WriteFile(h, base + buf_ptr, length, &written, nullptr);
-    ctx.r3.u32 = 0;
-    if (iosb) { PPC_STORE_U32(iosb, 0); PPC_STORE_U32(iosb + 4, written); }
+    // Write at ByteOffset (r10; null or -1/-2 = the current position) and keep the read-ahead cache
+    // honest: the tracked position advances and cached bytes are dropped (saves are read back on load).
+    // The old version ignored the offset and left a stale read cache.
+    bool has_off = off_ptr >= 0x80000000u && off_ptr < 0x94000000u;
+    uint64_t pos = has_off ? (((uint64_t)PPC_LOAD_U32(off_ptr) << 32) | PPC_LOAD_U32(off_ptr + 4)) : 0;
+    if (pos >= 0xFFFFFFFFFFFFFFFEull) has_off = false;
+    DWORD written = 0; BOOL ok;
+    {
+        std::lock_guard<std::mutex> lk(g_rah_mutex);
+        FileRAH& r = g_rah[handle];
+        if (!has_off) pos = r.cur;
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)pos;
+        ok = SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && WriteFile(h, base + buf_ptr, length, &written, nullptr);
+        r.cur = pos + written; r.cache_len = 0;
+    }
+    ctx.r3.u32 = ok ? 0u : 0xC0000185u;   // STATUS_IO_DEVICE_ERROR
+    if (iosb) { PPC_STORE_U32(iosb, ctx.r3.u32); PPC_STORE_U32(iosb + 4, written); }
+    { bool content; { std::lock_guard<std::mutex> lk(g_content_mtx); content = g_content_handles.count(handle) != 0; }
+      if (content) dbg_ram("[SAVE] NtWriteFile handle=0x%X off=0x%llX len=0x%X -> wrote 0x%X ok=%d\n", handle, (unsigned long long)pos, length, written, ok ? 1 : 0); }
 }
 
 PPC_FUNC(__imp__NtQueryInformationFile) {
@@ -1444,6 +1583,15 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
       if (c<=30) dbg_ram("[NtQueryInfoFile] call#%u handle=0x%08X class=%u valid=%d\n", c, handle, info_class, h?1:0); }
     if (!h) return;
 
+    // Creation / last access / last write / change times (FILETIME, same 1601 epoch on Xbox) at
+    // info_ptr + 0/8/16/24 as big-endian 64-bit: classes 4 and 34 start with them. They were zeros,
+    // so a save's timestamp (shown on the Load Game screen) came out as a 1601 date.
+    auto put_times = [&](uint32_t p) {
+        FILETIME c{}, a{}, w{};
+        GetFileTime(h, &c, &a, &w);
+        const FILETIME t4[4] = {c, a, w, w};
+        for (int i = 0; i < 4; ++i) PPC_STORE_U64(p + i * 8, (uint64_t(t4[i].dwHighDateTime) << 32) | t4[i].dwLowDateTime);
+    };
     if (info_class == 5 && info_ptr && info_len >= 22) {
         // FileStandardInformation: AllocationSize(8)+EndOfFile(8)+Links(4)+Del(1)+Dir(1)
         LARGE_INTEGER fsz = {}; GetFileSizeEx(h, &fsz);
@@ -1459,8 +1607,10 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
         ctx.r3.u32 = 0;
         if (iosb) { PPC_STORE_U32(iosb, 0); PPC_STORE_U32(iosb + 4, 22); }
     } else if (info_class == 4 && info_ptr && info_len >= 40) {
-        // FileBasicInformation (timestamps) — return zeros
+        // FileBasicInformation: 4 timestamps + FileAttributes (+32)
         memset(base + info_ptr, 0, 40);
+        put_times(info_ptr);
+        PPC_STORE_U32(info_ptr + 32, 0x80);   // FILE_ATTRIBUTE_NORMAL
         ctx.r3.u32 = 0;
         if (iosb) { PPC_STORE_U32(iosb, 0); PPC_STORE_U32(iosb + 4, 40); }
     } else if ((info_class == 14 || info_class == 11) && info_ptr && info_len >= 8) {
@@ -1478,7 +1628,7 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
         // erroring out here was why GAME.DAT etc. opened but were never read.
         LARGE_INTEGER fsz = {}; GetFileSizeEx(h, &fsz);
         uint64_t sz = (uint64_t)fsz.QuadPart;
-        for (int i = 0; i < 32; i += 4) PPC_STORE_U32(info_ptr + i, 0);   // 4 timestamps = 0
+        put_times(info_ptr);                                               // 4 timestamps
         PPC_STORE_U32(info_ptr + 32, (uint32_t)(sz >> 32));               // AllocationSize
         PPC_STORE_U32(info_ptr + 36, (uint32_t)(sz & 0xFFFFFFFF));
         PPC_STORE_U32(info_ptr + 40, (uint32_t)(sz >> 32));               // EndOfFile (size)
@@ -1512,11 +1662,18 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile) {
     if (host.empty()) return;
     DWORD attr = GetFileAttributesA(host.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) return;
-    // FILE_NETWORK_OPEN_INFORMATION — zero timestamps, fill FileAttributes (+48)
+    // FILE_NETWORK_OPEN_INFORMATION: 4 timestamps, AllocationSize (+32), EndOfFile (+40), FileAttributes (+48)
     if (ctx.r4.u32) {
-        memset(base + ctx.r4.u32, 0, 56);
-        PPC_STORE_U32(ctx.r4.u32 + 48,
-                      (attr & FILE_ATTRIBUTE_DIRECTORY) ? 0x10u : 0x20u);
+        uint32_t p = ctx.r4.u32;
+        memset(base + p, 0, 56);
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExA(host.c_str(), GetFileExInfoStandard, &fa)) {
+            const FILETIME t4[4] = {fa.ftCreationTime, fa.ftLastAccessTime, fa.ftLastWriteTime, fa.ftLastWriteTime};
+            for (int i = 0; i < 4; ++i) PPC_STORE_U64(p + i * 8, (uint64_t(t4[i].dwHighDateTime) << 32) | t4[i].dwLowDateTime);
+            uint64_t sz = (uint64_t(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+            PPC_STORE_U64(p + 32, sz); PPC_STORE_U64(p + 40, sz);
+        }
+        PPC_STORE_U32(p + 48, (attr & FILE_ATTRIBUTE_DIRECTORY) ? 0x10u : 0x20u);
     }
     ctx.r3.u32 = 0;
 }
@@ -1895,9 +2052,17 @@ PPC_FUNC(__imp__KeQuerySystemTime) {
     // Write current system time as 100-ns intervals since Jan 1 1601 (FILETIME format)
     uint64_t t;
     if (vclock_on()) {
-        // Deterministic: fixed epoch + virtual ms (×10000 = 100-ns units). Constant base so the
-        // value depends only on guest progress, not real time.
-        t = 130000000000000000ULL + lswtcs_now_ms() * 10000ULL;
+        // Virtual ms (×10000 = 100-ns units) on top of a base: the real date/time at launch, so the
+        // guest calendar is right (it picks standard vs daylight time from it for the Load Game save
+        // timestamps; the old fixed 2012-12 base meant standard time all year). Still advances with
+        // guest progress only within a run. LSWTCS_FIXEDEPOCH=1: the old constant base.
+        static const uint64_t epoch = [] {
+            const char* e = getenv("LSWTCS_FIXEDEPOCH");
+            if (e && e[0] == '1') return 130000000000000000ULL;
+            FILETIME ft; GetSystemTimeAsFileTime(&ft);
+            return (((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - lswtcs_now_ms() * 10000ULL;
+        }();
+        t = epoch + lswtcs_now_ms() * 10000ULL;
     } else {
         FILETIME ft;
         GetSystemTimeAsFileTime(&ft);
@@ -2040,7 +2205,21 @@ PPC_FUNC(__imp__RtlInitAnsiString) {
     PPC_STORE_U32(str_ptr + 4, src_ptr);
 }
 PPC_FUNC(__imp__RtlNtStatusToDosError)      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__RtlTimeToTimeFields)        { PPC_FUNC_PROLOGUE(); }
+// RtlTimeToTimeFields(PLARGE_INTEGER time r3, PTIME_FIELDS out r4). Xbox FILETIME = 100 ns since
+// 1601 like Windows. TIME_FIELDS = u16 Year, Month, Day, Hour, Minute, Second, Milliseconds, Weekday
+// (big-endian). The empty stub left the caller's stack garbage in place: the Load Game preview showed
+// the save's date as 65535/33575/65535 and its time as 27328:00.
+PPC_FUNC(__imp__RtlTimeToTimeFields) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t tp = ctx.r3.u32, out = ctx.r4.u32;
+    if (tp < 0x80000000u || tp >= 0xC0000000u || out < 0x80000000u || out >= 0xC0000000u) return;
+    uint64_t t = PPC_LOAD_U64(tp);
+    FILETIME ft; ft.dwLowDateTime = uint32_t(t); ft.dwHighDateTime = uint32_t(t >> 32);
+    SYSTEMTIME st{};
+    if (!FileTimeToSystemTime(&ft, &st)) st = SYSTEMTIME{1601, 1, 1, 1, 0, 0, 0, 0};   // wYear, wMonth, wDayOfWeek, wDay, ...
+    const uint16_t f[8] = {st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, st.wDayOfWeek};
+    for (int i = 0; i < 8; ++i) PPC_STORE_U16(out + i * 2, f[i]);
+}
 PPC_FUNC(__imp__RtlUnicodeToMultiByteN)     { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__RtlUnwind)                  { PPC_FUNC_PROLOGUE(); }
 PPC_FUNC(__imp__RtlMultiByteToUnicodeN)     { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
@@ -3294,7 +3473,14 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
         case 6: topo = 5; break;                // triangle strip
         case 8: topo = 4; gs_type = 2; break;   // rectangle list: triangles in, GS emits quads
         case 13: topo = 10; gs_type = 3; break; // quad list: LINELIST_ADJ in, GS emits quads
-        default: return false;                  // line loops / polygons / patches: CPU path
+        default: {                              // line loops / polygons / patches: not drawn
+            static uint32_t seen = 0; static uint64_t n = 0; ++n;
+            if (!(seen & (1u << (prim & 31))) || (n % 6000) == 0) {
+                seen |= 1u << (prim & 31);
+                dbg_ram("[GPUDRAW] dropped prim type %u (n=%u, %llu dropped so far)\n", prim, initiator >> 16, (unsigned long long)n);
+            }
+            return false;
+        }
     }
     { static int gsoff = -1; if (gsoff < 0) { const char* e = getenv("LSWTCS_GPUDRAW_NOGS"); gsoff = (e && e[0] == '1') ? 1 : 0; }
       if (gsoff && (gs_type || fan)) return false; }
@@ -5021,6 +5207,30 @@ PPC_FUNC(__imp__ExGetXConfigSetting) {
     if (nlog < 64) { ++nlog; printf("[XCONFIG] cat=0x%X setting=0x%X buf=0x%08X size=%u lr=0x%08X\n", cat, set, buf, size, (uint32_t)ctx.lr); fflush(stdout); }
     if (!on) { ctx.r3.u32 = 0; return; }
     uint32_t need = 0, v = 0;
+    // XCONFIG_USER time zone (settings 1-7) from the host's zone: the Load Game screen converts the
+    // save's UTC timestamp with it (zeros showed the save time in UTC). Dates are XCONFIG_TIMEZONE_DATE
+    // {Month, Day (week of month), DayOfWeek, Hour}; biases are minutes (UTC = local + bias).
+    if (cat == 0x03 && set >= 0x01 && set <= 0x07) {
+        TIME_ZONE_INFORMATION tz{}; GetTimeZoneInformation(&tz);
+        need = 4;
+        if (buf && size >= 4) {
+            auto name4 = [&](const wchar_t* w) { for (int i = 0; i < 4; ++i) PPC_STORE_U8(buf + i, uint8_t(i < 3 && w[i] ? w[i] : 0)); };
+            auto date4 = [&](const SYSTEMTIME& d) { PPC_STORE_U8(buf, uint8_t(d.wMonth)); PPC_STORE_U8(buf + 1, uint8_t(d.wDay));
+                                                    PPC_STORE_U8(buf + 2, uint8_t(d.wDayOfWeek)); PPC_STORE_U8(buf + 3, uint8_t(d.wHour)); };
+            switch (set) {
+                case 0x01: PPC_STORE_U32(buf, uint32_t(int32_t(tz.Bias))); break;
+                case 0x02: name4(tz.StandardName); break;
+                case 0x03: name4(tz.DaylightName); break;
+                case 0x04: date4(tz.StandardDate); break;
+                case 0x05: date4(tz.DaylightDate); break;
+                case 0x06: PPC_STORE_U32(buf, uint32_t(int32_t(tz.StandardBias))); break;
+                case 0x07: PPC_STORE_U32(buf, uint32_t(int32_t(tz.DaylightBias))); break;
+            }
+        }
+        if (req) PPC_STORE_U16(req, uint16_t(need));
+        ctx.r3.u32 = (buf && size < need) ? 0xC0000023u : 0u;
+        return;
+    }
     if (cat == 0x03 && set == 0x09) { need = 4; v = 1; }                 // XCONFIG_USER_LANGUAGE: English
     else if (cat == 0x03 && set == 0x0E) { need = 1; v = 103; }          // XCONFIG_USER_COUNTRY: United States
     else if (cat == 0x02 && set == 0x02) { need = 4; v = 0x00400100u; }  // XCONFIG_SECURED_AV_REGION: NTSC-M
@@ -5444,6 +5654,15 @@ PPC_FUNC(__imp__NtSetInformationFile) {
     if (cls == 14 && info && len >= 8) {
         uint64_t pos = ((uint64_t)PPC_LOAD_U32(info) << 32) | (uint64_t)PPC_LOAD_U32(info + 4);
         uint64_t out = 0; host_xfile_seek(handle, (int64_t)pos, 0u, &out);
+    } else if (cls == 20 && info && len >= 8) {   // FileEndOfFileInformation (save files set their size)
+        uint64_t eof = ((uint64_t)PPC_LOAD_U32(info) << 32) | (uint64_t)PPC_LOAD_U32(info + 4);
+        if (HANDLE h = kobj_get(handle)) {
+            std::lock_guard<std::mutex> lk(g_rah_mutex);
+            LARGE_INTEGER li; li.QuadPart = (LONGLONG)eof;
+            if (SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) SetEndOfFile(h);
+            g_rah[handle].cache_len = 0;
+            dbg_ram("[SAVE] set EOF handle=0x%X -> %llu\n", handle, (unsigned long long)eof);
+        }
     }
     ctx.r3.u32 = 0;
     if (iosb) { PPC_STORE_U32(iosb, 0); PPC_STORE_U32(iosb + 4, len); }
@@ -5501,7 +5720,79 @@ PPC_FUNC(__imp__NtResumeThread) {
     if (gt) { SetEvent(gt->resume_ev); sched_add_slot(gt->sched_id); }
     ctx.r3.u32 = 0;
 }
-PPC_FUNC(__imp__XamContentClose) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// ── Saved-game content (Xenia xam_content.cc semantics; storage layout above content_translate) ──
+static const uint32_t kXContentDataSize = 0x134;   // XCONTENT_DATA: device u32, type u32, display_name u16[128], file_name char[42], pad
+static const uint64_t kLswXuid = 0xB13EBABEBABEBABEull;   // = XamUserGetXUID
+static std::string content_base_dir() {
+    static const std::string d = [] {
+        const char* e = getenv("LSWTCS_SAVEDIR"); std::string r = e ? e : "saves/";
+        if (!r.empty() && r.back() != '/' && r.back() != '\\') r += '/';
+        return r;
+    }();
+    return d;
+}
+// Package file name -> safe host folder name (the name is a short ASCII id chosen by the game).
+static std::string content_name(uint8_t* base, uint32_t data) {
+    std::string s;
+    for (uint32_t i = 0; i < 42; ++i) {
+        char c = (char)PPC_LOAD_U8(data + 0x108 + i);
+        if (!c) break;
+        s += (isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_') ? c : '_';
+    }
+    return s;
+}
+static std::string content_type_dir(uint32_t type) { char t[16]; snprintf(t, sizeof t, "%08X/", type); return content_base_dir() + t; }
+static void content_mkdirs(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); ++i)
+        if (i == path.size() || path[i] == '/' || path[i] == '\\') CreateDirectoryA(path.substr(0, i).c_str(), nullptr);
+}
+static void content_rmtree(const std::string& dir) {   // dir without trailing '/'
+    WIN32_FIND_DATAA fd; HANDLE f = FindFirstFileA((dir + "/*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            std::string n = fd.cFileName; if (n == "." || n == "..") continue;
+            std::string p = dir + "/" + n;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) content_rmtree(p); else DeleteFileA(p.c_str());
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    RemoveDirectoryA(dir.c_str());
+}
+static bool content_exists(const std::string& pkg_dir) {
+    DWORD a = GetFileAttributesA(pkg_dir.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+// Completes an XOVERLAPPED like Xenia CompleteOverlappedImmediateEx: result, length, extended error, event.
+static void xam_ovl_complete(uint8_t* base, uint32_t ovl, uint32_t result, uint32_t length) {
+    if (ovl < 0x80000000u || ovl >= 0x94000000u) return;
+    PPC_STORE_U32(ovl + 0, result);
+    PPC_STORE_U32(ovl + 4, length);
+    PPC_STORE_U32(ovl + 24, result ? (0x80070000u | (result & 0xFFFFu)) : 0u);   // X_HRESULT_FROM_WIN32
+    uint32_t ev = PPC_LOAD_U32(ovl + 12);
+    if (ev) { HANDLE h = kobj_get(ev); if (h) SetEvent(h); }
+}
+// Synchronous result, or IO_PENDING with the result in the overlapped (failures read FUNCTION_FAILED).
+static uint32_t xam_ovl_return(uint8_t* base, uint32_t ovl, uint32_t result, uint32_t length) {
+    if (ovl < 0x80000000u || ovl >= 0x94000000u) return result;
+    xam_ovl_complete(base, ovl, result, length);
+    if (result) PPC_STORE_U32(ovl + 0, 0x0000065Bu);   // X_ERROR_FUNCTION_FAILED; extended error keeps the cause
+    return 0x000003E5u;                                 // X_ERROR_IO_PENDING
+}
+static std::string guest_cstr(uint8_t* base, uint32_t p, uint32_t max = 64) {
+    std::string s; if (p < 0x80000000u || p >= 0x94000000u) return s;
+    for (uint32_t i = 0; i < max; ++i) { char c = (char)PPC_LOAD_U8(p + i); if (!c) break; s += c; }
+    return s;
+}
+// XamContentClose(root_name r3, overlapped r4): unmount.
+PPC_FUNC(__imp__XamContentClose) {
+    PPC_FUNC_PROLOGUE();
+    std::string root = content_lower(guest_cstr(base, ctx.r3.u32));
+    while (!root.empty() && root.back() == ':') root.pop_back();
+    uint32_t result;
+    { std::lock_guard<std::mutex> lk(g_content_mtx); result = g_content_mounts.erase(root) ? 0u : 2u; }   // X_ERROR_FILE_NOT_FOUND
+    dbg_ram("[SAVE] XamContentClose '%s' -> %u\n", root.c_str(), result);
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r4.u32, result, 0);
+}
 PPC_FUNC(__imp__XamContentCreateDeviceEnumerator) {
     PPC_FUNC_PROLOGUE();
     static int n = 0; if (n < 8) { n++;
@@ -5511,29 +5802,114 @@ PPC_FUNC(__imp__XamContentCreateDeviceEnumerator) {
 }
 // XamContentCreateEnumerator(r3 user, r4 device_id, r5 content_type, r6 content_flags,
 //   r7 items_per_enumerate, r8 buffer_size_ptr, r9 handle_out)  [Xenia xam_content.cc]
-// No saved content exists: return a valid enumerator handle and the buffer size the caller must
-// allocate (items * sizeof(XCONTENT_DATA) = 0x134); XamEnumerate then reports no more files.
+// Lists the packages of that type found in the save folder (their .xcd headers); XamEnumerate
+// hands them out items_per_enumerate at a time, then ERROR_NO_MORE_FILES.
+struct XContentEnum { std::vector<std::vector<uint8_t>> items; size_t pos = 0; uint32_t per = 1; };
+static std::unordered_map<uint32_t, XContentEnum> g_content_enums;
 static uint32_t g_content_enum_next = 0xE7E70001u;
 PPC_FUNC(__imp__XamContentCreateEnumerator) {
     PPC_FUNC_PROLOGUE();
-    static int n = 0; if (n < 8) { n++;
-        dbg_ram("[XAM] XamContentCreateEnumerator user=0x%X dev=0x%X type=0x%X flags=0x%X items=%u cb*=0x%08X h*=0x%08X\n",
-                ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32); }
-    uint32_t items = ctx.r7.u32 ? ctx.r7.u32 : 1;
-    if (ctx.r8.u32 >= 0x80000000u && ctx.r8.u32 < 0x94000000u) PPC_STORE_U32(ctx.r8.u32, items * 0x134u);
-    if (ctx.r9.u32 >= 0x80000000u && ctx.r9.u32 < 0x94000000u) PPC_STORE_U32(ctx.r9.u32, g_content_enum_next++);
+    uint32_t dev = ctx.r4.u32, type = ctx.r5.u32, items = ctx.r7.u32 ? ctx.r7.u32 : 1;
+    if (dev != 0 && !(dev == 1 || dev == 2)) {   // unknown device (Xenia: X_E_INVALIDARG)
+        if (ctx.r8.u32 >= 0x80000000u && ctx.r8.u32 < 0x94000000u) PPC_STORE_U32(ctx.r8.u32, 0);
+        ctx.r3.u32 = 0x80070057u; return;
+    }
+    XContentEnum e; e.per = items;
+    if (dev != 2) {   // saves live on the HDD
+        WIN32_FIND_DATAA fd; HANDLE f = FindFirstFileA((content_type_dir(type) + "*.xcd").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                std::string name(fd.cFileName); name.resize(name.size() - 4);
+                if (!content_exists(content_type_dir(type) + name)) continue;   // header without package
+                std::vector<uint8_t> d(kXContentDataSize, 0);
+                FILE* fp = fopen((content_type_dir(type) + fd.cFileName).c_str(), "rb");
+                if (!fp) continue;
+                size_t got = fread(d.data(), 1, d.size(), fp); fclose(fp);
+                if (got != d.size()) continue;
+                d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 1;   // device_id = HDD (big-endian)
+                e.items.push_back(std::move(d));
+            } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
+    }
+    uint32_t h = g_content_enum_next++;
+    dbg_ram("[SAVE] XamContentCreateEnumerator dev=%u type=0x%X items/call=%u -> %zu packages, handle 0x%08X\n", dev, type, items, e.items.size(), h);
+    g_content_enums[h] = std::move(e);
+    if (ctx.r8.u32 >= 0x80000000u && ctx.r8.u32 < 0x94000000u) PPC_STORE_U32(ctx.r8.u32, items * kXContentDataSize);
+    if (ctx.r9.u32 >= 0x80000000u && ctx.r9.u32 < 0x94000000u) PPC_STORE_U32(ctx.r9.u32, h);
     ctx.r3.u32 = 0;
 }
+// XamContentCreateEx(r3 user, r4 root_name, r5 XCONTENT_DATA*, r6 flags, r7 disposition*, r8 license*,
+//   r9 cache_size, r10 content_size, [r1+0x54] overlapped). Mounts root_name: on the package folder.
 PPC_FUNC(__imp__XamContentCreateEx) {
     PPC_FUNC_PROLOGUE();
-    static int n = 0; if (n < 8) { n++;
-        dbg_ram("[XAM] XamContentCreateEx user=0x%X root=0x%08X data=0x%08X flags=0x%X disp*=0x%08X lic*=0x%08X r9=0x%X r10=0x%X\n",
-                ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32); }
-    ctx.r3.u32 = 0;
+    uint32_t data = ctx.r5.u32, flags = ctx.r6.u32, disp_p = ctx.r7.u32, lic_p = ctx.r8.u32;
+    uint32_t ovl = PPC_LOAD_U32(ctx.r1.u32 + 0x54);
+    std::string root = content_lower(guest_cstr(base, ctx.r4.u32));
+    while (!root.empty() && root.back() == ':') root.pop_back();
+    if (data < 0x80000000u || data >= 0x94000000u) { ctx.r3.u32 = 0x57u; return; }
+    uint32_t type = PPC_LOAD_U32(data + 4);
+    std::string name = content_name(base, data);
+    if (root.empty() || name.empty()) { ctx.r3.u32 = 0x7Bu; return; }   // X_ERROR_INVALID_NAME
+    { std::lock_guard<std::mutex> lk(g_content_mtx); if (g_content_mounts.count(root)) { ctx.r3.u32 = 0x57u; return; } }
+    const std::string pkg = content_type_dir(type) + name, hdr = pkg + ".xcd";
+    bool exists = content_exists(pkg);
+    uint32_t result = 0, disposition = 0;   // 1 = created, 2 = opened
+    switch (flags & 0xF) {
+        case 1: if (exists) result = 0xB7u; else disposition = 1; break;                     // CREATE_NEW (ALREADY_EXISTS)
+        case 2: if (exists) content_rmtree(pkg); disposition = 1; break;                       // CREATE_ALWAYS
+        case 3: if (!exists) result = 3u; else disposition = 2; break;                         // OPEN_EXISTING (PATH_NOT_FOUND)
+        case 4: disposition = exists ? 2 : 1; break;                                           // OPEN_ALWAYS
+        case 5: if (!exists) result = 3u; else { content_rmtree(pkg); disposition = 1; } break; // TRUNCATE_EXISTING
+        default: result = 0x57u; break;
+    }
+    if (disposition == 1) {
+        content_mkdirs(pkg);
+        if (FILE* fp = fopen(hdr.c_str(), "wb")) { fwrite(base + data, 1, kXContentDataSize, fp); fclose(fp); }   // guest layout as-is
+        if (!content_exists(pkg)) result = 0x65Bu;
+    }
+    if (!result && disposition) {
+        std::lock_guard<std::mutex> lk(g_content_mtx);
+        g_content_mounts[root] = pkg + "/";
+    }
+    if (disp_p >= 0x80000000u && disp_p < 0x94000000u) PPC_STORE_U32(disp_p, disposition);
+    if (!result && lic_p >= 0x80000000u && lic_p < 0x94000000u) PPC_STORE_U32(lic_p, 0);
+    dbg_ram("[SAVE] XamContentCreateEx root='%s' type=0x%X name='%s' flags=0x%X ovl=0x%08X -> result=0x%X disposition=%u (%s)\n",
+            root.c_str(), type, name.c_str(), flags, ovl, result, disposition, pkg.c_str());
+    ctx.r3.u32 = xam_ovl_return(base, ovl, result, disposition);
 }
-PPC_FUNC(__imp__XamContentDelete) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamContentFlush) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamContentGetCreator) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// XamContentDelete(r3 user, r4 XCONTENT_DATA*, r5 overlapped)
+PPC_FUNC(__imp__XamContentDelete) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t data = ctx.r4.u32, result = 0x57u;
+    if (data >= 0x80000000u && data < 0x94000000u) {
+        std::string pkg = content_type_dir(PPC_LOAD_U32(data + 4)) + content_name(base, data);
+        if (content_exists(pkg)) { content_rmtree(pkg); DeleteFileA((pkg + ".xcd").c_str()); DeleteFileA((pkg + ".png").c_str()); result = 0; }
+        else result = 2u;   // X_ERROR_FILE_NOT_FOUND
+        dbg_ram("[SAVE] XamContentDelete '%s' -> %u\n", pkg.c_str(), result);
+    }
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r5.u32, result, 0);
+}
+// XamContentFlush(r3 root_name, r4 overlapped): writes go straight to host files.
+PPC_FUNC(__imp__XamContentFlush) {
+    PPC_FUNC_PROLOGUE();
+    dbg_ram("[SAVE] XamContentFlush '%s'\n", guest_cstr(base, ctx.r3.u32).c_str());
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r4.u32, 0, 0);
+}
+// XamContentGetCreator(r3 user, r4 XCONTENT_DATA*, r5 is_creator*, r6 creator_xuid*, r7 overlapped)
+PPC_FUNC(__imp__XamContentGetCreator) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t data = ctx.r4.u32, is_p = ctx.r5.u32, xuid_p = ctx.r6.u32, result = 0;
+    if (is_p < 0x80000000u || is_p >= 0x94000000u || data < 0x80000000u || data >= 0x94000000u) { ctx.r3.u32 = 0x57u; return; }
+    uint32_t type = PPC_LOAD_U32(data + 4);
+    if (!content_exists(content_type_dir(type) + content_name(base, data))) result = 3u;   // PATH_NOT_FOUND
+    else {
+        bool save = type == 1;   // saved games are always the user's own
+        PPC_STORE_U32(is_p, save ? 1u : 0u);
+        if (xuid_p >= 0x80000000u && xuid_p < 0x94000000u) PPC_STORE_U64(xuid_p, save ? kLswXuid : 0ull);
+    }
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r7.u32, result, 0);
+}
 // Content devices as in Xenia xam_content_device.cc: id 1 = "Dummy HDD" (20 GB, 10 GB free),
 // id 2 = read-only ODD; anything else is DEVICE_NOT_CONNECTED (0x48F).
 static bool xam_device_known(uint32_t id) { return id == 1 || id == 2; }
@@ -5572,9 +5948,40 @@ PPC_FUNC(__imp__XamContentGetDeviceState) {
     ctx.r3.u32 = result;
 }
 PPC_FUNC(__imp__XamContentGetLicenseMask) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamContentGetThumbnail) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// XamContentGetThumbnail(r3 user, r4 XCONTENT_DATA*, r5 buffer, r6 buffer_size*, r7 overlapped):
+// the image stored by XamContentSetThumbnail (<package>.png), size reported even if the buffer is short.
+PPC_FUNC(__imp__XamContentGetThumbnail) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t data = ctx.r4.u32, buf = ctx.r5.u32, size_p = ctx.r6.u32, result = 0;
+    if (data < 0x80000000u || data >= 0x94000000u || size_p < 0x80000000u || size_p >= 0x94000000u) { ctx.r3.u32 = 0x57u; return; }
+    std::string png = content_type_dir(PPC_LOAD_U32(data + 4)) + content_name(base, data) + ".png";
+    std::vector<uint8_t> img;
+    if (FILE* fp = fopen(png.c_str(), "rb")) {
+        fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (n > 0 && n < (1 << 20)) { img.resize(size_t(n)); if (fread(img.data(), 1, img.size(), fp) != img.size()) img.clear(); }
+        fclose(fp);
+    }
+    if (img.empty()) result = 2u;   // X_ERROR_FILE_NOT_FOUND
+    else {
+        uint32_t cap = PPC_LOAD_U32(size_p);
+        PPC_STORE_U32(size_p, uint32_t(img.size()));
+        if (buf >= 0x80000000u && buf < 0x94000000u && cap >= img.size()) memcpy(base + buf, img.data(), img.size());
+        else if (buf) result = 0x7Au;   // ERROR_INSUFFICIENT_BUFFER
+    }
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r7.u32, result, 0);
+}
 PPC_FUNC(__imp__XamContentInstall) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamContentSetThumbnail) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// XamContentSetThumbnail(r3 user, r4 XCONTENT_DATA*, r5 image, r6 image_size, r7 overlapped)
+PPC_FUNC(__imp__XamContentSetThumbnail) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t data = ctx.r4.u32, img = ctx.r5.u32, n = ctx.r6.u32, result = 0x57u;
+    if (data >= 0x80000000u && data < 0x94000000u && img >= 0x80000000u && img < 0x94000000u && n && n < (1u << 20)) {
+        std::string pkg = content_type_dir(PPC_LOAD_U32(data + 4)) + content_name(base, data);
+        if (!content_exists(pkg)) result = 3u;
+        else if (FILE* fp = fopen((pkg + ".png").c_str(), "wb")) { fwrite(base + img, 1, n, fp); fclose(fp); result = 0; }
+    }
+    ctx.r3.u32 = xam_ovl_return(base, ctx.r7.u32, result, 0);
+}
 PPC_FUNC(__imp__XamParseGamerTileKey) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamReadTileToTexture) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamUserCreateAchievementEnumerator) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
@@ -5675,6 +6082,27 @@ PPC_FUNC(__imp__XamEnumerate) {
         dbg_ram("[XAM] XamEnumerate hEnum=0x%X flags=0x%X buf=0x%08X cb=%u pcItems=0x%08X ovl=0x%08X\n",
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32); }
     { static uint64_t calls = 0; if ((++calls % 600) == 0) dbg_ram("[XAM] XamEnumerate call #%llu hEnum=0x%X\n", (unsigned long long)calls, ctx.r3.u32); }
+    // Content enumerators (XamContentCreateEnumerator): next batch of XCONTENT_DATA records.
+    auto ce = g_content_enums.find(ctx.r3.u32);
+    if (ce != g_content_enums.end()) {
+        XContentEnum& e = ce->second;
+        uint32_t buf = ctx.r5.u32, cb = ctx.r6.u32, n = 0;
+        if (buf >= 0x80000000u && buf < 0x94000000u)
+            while (e.pos < e.items.size() && n < e.per && (n + 1) * kXContentDataSize <= cb) {
+                memcpy(base + buf + n * kXContentDataSize, e.items[e.pos].data(), kXContentDataSize);
+                ++n; ++e.pos;
+            }
+        uint32_t result = n ? 0u : 0x12u;   // ERROR_NO_MORE_FILES
+        dbg_ram("[SAVE] XamEnumerate content handle=0x%08X -> %u items (result %u)\n", ctx.r3.u32, n, result);
+        if (ctx.r7.u32 >= 0x80000000u && ctx.r7.u32 < 0x94000000u) PPC_STORE_U32(ctx.r7.u32, n);
+        if (ctx.r8.u32 >= 0x80000000u && ctx.r8.u32 < 0x94000000u) {
+            xam_ovl_complete(base, ctx.r8.u32, result, n);
+            ctx.r3.u32 = 0x000003E5u;   // IO_PENDING (result in the overlapped, as before)
+            return;
+        }
+        ctx.r3.u32 = result;
+        return;
+    }
     if (ctx.r7.u32 >= 0x80000000u && ctx.r7.u32 < 0x94000000u) PPC_STORE_U32(ctx.r7.u32, 0);
     if (ctx.r8.u32 >= 0x80000000u && ctx.r8.u32 < 0x94000000u) {
         // Async: the result goes in the overlapped (InternalLow), the call returns IO_PENDING.
@@ -5758,20 +6186,31 @@ PPC_FUNC(__imp__XamInputGetState) {
     lsw_keyboard_pad(pad);
     { static int at = -1; if (at < 0) { const char* e = getenv("LSWTCS_AUTOSTART_AT"); at = e ? atoi(e) : 0; }
       if (at > 0 && n >= (uint32_t)at && n < (uint32_t)at + 6) pad.buttons |= 0x0010; }   // one Start press
-    {   // DIAG: press_now script
-        static std::vector<uint16_t> q; static uint32_t qpos = 0, qtick = 0, qpoll = 0;
+    {   // DIAG: press_now script. Tokens: buttons (above) or left-stick directions n s e w ne nw se sw,
+        // each optionally ":N" = held for N input polls (default 8), then released for 8.
+        struct Press { uint16_t buttons; int16_t lx, ly; uint32_t hold; };
+        static std::vector<Press> q; static uint32_t qpos = 0, qtick = 0;
         if (q.empty() && LSW_TRIGGER_DUE() && GetFileAttributesA("press_now") != INVALID_FILE_ATTRIBUTES) {
             FILE* f = fopen("press_now", "rb"); char w[32];
-            static const struct { const char* name; uint16_t bit; } kB[] = {
-                {"up",0x0001},{"down",0x0002},{"left",0x0004},{"right",0x0008},{"start",0x0010},{"back",0x0020},
-                {"lb",0x0100},{"rb",0x0200},{"a",0x1000},{"b",0x2000},{"x",0x4000},{"y",0x8000},{"wait",0}};
-            if (f) { while (fscanf(f, "%31s", w) == 1) for (auto& b : kB) if (!_stricmp(w, b.name)) q.push_back(b.bit); fclose(f); }
+            static const struct { const char* name; uint16_t bit; int16_t lx, ly; } kB[] = {
+                {"up",0x0001,0,0},{"down",0x0002,0,0},{"left",0x0004,0,0},{"right",0x0008,0,0},{"start",0x0010,0,0},{"back",0x0020,0,0},
+                {"lb",0x0100,0,0},{"rb",0x0200,0,0},{"a",0x1000,0,0},{"b",0x2000,0,0},{"x",0x4000,0,0},{"y",0x8000,0,0},{"wait",0,0,0},
+                {"n",0,0,32767},{"s",0,0,-32767},{"e",0,32767,0},{"w",0,-32767,0},
+                {"ne",0,23170,23170},{"nw",0,-23170,23170},{"se",0,23170,-23170},{"sw",0,-23170,-23170}};
+            if (f) {
+                while (fscanf(f, "%31s", w) == 1) {
+                    uint32_t hold = 8; if (char* c = strchr(w, ':')) { *c = 0; hold = (uint32_t)std::max(1, atoi(c + 1)); }
+                    for (auto& b : kB) if (!_stricmp(w, b.name)) q.push_back({b.bit, b.lx, b.ly, hold});
+                }
+                fclose(f);
+            }
             DeleteFileA("press_now"); qpos = 0; qtick = 0;
             dbg_ram("[PRESS] queued %u presses\n", (unsigned)q.size()); printf("[PRESS] queued %u presses\n", (unsigned)q.size()); fflush(stdout);
         }
         if (!q.empty()) {
-            if (qtick < 8) pad.buttons |= q[qpos];
-            if (++qtick >= 16) { qtick = 0; if (++qpos >= q.size()) { q.clear(); qpos = 0; } }
+            const Press& pr = q[qpos];
+            if (qtick < pr.hold) { pad.buttons |= pr.buttons; if (pr.lx || pr.ly) { pad.lx = pr.lx; pad.ly = pr.ly; } }
+            if (++qtick >= pr.hold + 8) { qtick = 0; if (++qpos >= q.size()) { q.clear(); qpos = 0; } }
         }
     }
     static int s_auto = -1; if (s_auto < 0) s_auto = getenv("LSWTCS_AUTOSTART") ? 1 : 0;
@@ -5794,7 +6233,21 @@ PPC_FUNC(__imp__XamInputGetState) {
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__XamInputSetState) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__RtlTimeFieldsToTime) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
+// RtlTimeFieldsToTime(PTIME_FIELDS r3, PLARGE_INTEGER out r4) -> BOOLEAN (inverse of the above).
+PPC_FUNC(__imp__RtlTimeFieldsToTime) {
+    PPC_FUNC_PROLOGUE();
+    uint32_t in = ctx.r3.u32, out = ctx.r4.u32;
+    ctx.r3.u32 = 0;
+    if (in < 0x80000000u || in >= 0xC0000000u || out < 0x80000000u || out >= 0xC0000000u) return;
+    SYSTEMTIME st{};
+    st.wYear = PPC_LOAD_U16(in + 0); st.wMonth = PPC_LOAD_U16(in + 2); st.wDay = PPC_LOAD_U16(in + 4);
+    st.wHour = PPC_LOAD_U16(in + 6); st.wMinute = PPC_LOAD_U16(in + 8); st.wSecond = PPC_LOAD_U16(in + 10);
+    st.wMilliseconds = PPC_LOAD_U16(in + 12);
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return;
+    PPC_STORE_U64(out, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+    ctx.r3.u32 = 1;
+}
 PPC_FUNC(__imp__XamGetExecutionId) {
     PPC_FUNC_PROLOGUE();
     static int n = 0; if (n < 4) { n++; dbg_ram("[XAM] XamGetExecutionId out*=0x%08X (null-filled)\n", ctx.r3.u32); }
