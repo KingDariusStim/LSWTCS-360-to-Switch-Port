@@ -1,4 +1,5 @@
 #include "gpu_ringbuf.h"
+#include "../../Convert 360/LSWTCS/output/ppc_context.h"   // ppc_fold (LSW_ADDR_FOLD)
 #include <cstdio>
 extern "C" void dbg_ram(const char* fmt, ...);
 
@@ -24,11 +25,11 @@ extern "C" void dbg_ram(const char* fmt, ...);
 // entered regardless of target.
 
 static inline uint32_t rb_load(uint8_t* base, uint32_t addr) {
-    return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + addr));
+    return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + ppc_fold(addr)));
 }
 
 static inline void rb_store(uint8_t* base, uint32_t addr, uint32_t val) {
-    *reinterpret_cast<volatile uint32_t*>(base + addr) = __builtin_bswap32(val);
+    *reinterpret_cast<volatile uint32_t*>(base + ppc_fold(addr)) = __builtin_bswap32(val);
 }
 
 void ppc_ringbuf_advance_get(uint8_t* base, uint32_t gpu_obj_addr) {

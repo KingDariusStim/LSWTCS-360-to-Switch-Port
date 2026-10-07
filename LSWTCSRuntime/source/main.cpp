@@ -99,7 +99,7 @@ extern "C" uint32_t lswtcs_pool_alloc(uint32_t size) {
     // free-list blocks carry STALE data from their prior use; the guest's allocator/constructor
     // expects clean memory. Uninitialized container fields are how the emitter's count [obj+112]
     // becomes garbage near 65535 -> assert 3528. Gated on g_base being mapped.
-    if (g_base && (!lswtcs_pool_nozero())) memset(g_base + addr, 0, rsize);
+    if (g_base && (!lswtcs_pool_nozero())) memset(g_base + ppc_fold(addr), 0, rsize);
     return addr;
 }
 // returns 1 if this addr belongs to our pool (freed/handled), 0 if not ours
@@ -160,7 +160,7 @@ void lswtcs_heaptest(PPCContext& ctx, uint8_t* base) {
     // advances (self-referential flink/blink would mean the unlink is a no-op).
     if (dupB > 0 && n > 0) {
         uint32_t blk = set_[0];
-        auto rd = [&](uint32_t a) -> uint32_t { return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + a)); };
+        auto rd = [&](uint32_t a) -> uint32_t { return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + ppc_fold(a))); };
         dbg_ram("[HEAPTEST] dup block 0x%08X hdr: [-8]=%08X [-4]=%08X [+0]=%08X [+4]=%08X [+8]=%08X [+12]=%08X [+16]=%08X\n",
             blk, rd(blk-8), rd(blk-4), rd(blk+0), rd(blk+4), rd(blk+8), rd(blk+12), rd(blk+16));
         // The unlink reads node.flink at [node+12], node.blink at [node+8]; node = block-8 (the LIST_ENTRY).
@@ -177,6 +177,8 @@ void lswtcs_heaptest(PPCContext& ctx, uint8_t* base) {
 static void ppc_noop_stub(PPCContext& ctx, uint8_t* base) { (void)ctx; (void)base; }
 
 uint8_t* g_base = nullptr;
+// Per-512 MB-region host base for PPC_HOST (ppc_context.h); filled right after g_base is mapped.
+extern "C" uint8_t* ppc_view_base[8] = {};
 
 static uint32_t g_call_log[32];
 static int g_call_log_idx = 0;
@@ -361,10 +363,10 @@ extern "C" uint32_t lswtcs_fix_semantics(uint32_t src, uint32_t len, uint32_t* o
     static int en = -1;
     if (en < 0) { const char* e = getenv("LSWTCS_SEMFIX"); en = (e && e[0] != '0') ? 1 : 0; }
     if (!en || !g_base || src < 0x82000000u || src >= 0xF0000000u || len == 0 || len > 0x40000u) return 0;
-    const char* s = (const char*)(g_base + src);
+    const char* s = (const char*)(g_base + ppc_fold(src));
     uint32_t dst = lswtcs_pool_alloc(len + 1024);
     if (!dst) return 0;
-    char* d = (char*)(g_base + dst);
+    char* d = (char*)(g_base + ppc_fold(dst));
     uint32_t di = 0; int inVI = 0, tc = 0;
     for (uint32_t i = 0; i < len && s[i]; ) {
         if (!inVI && i + 18 <= len && memcmp(s + i, "struct VertexInput", 18) == 0) inVI = 1;
@@ -419,7 +421,7 @@ extern "C" uint32_t lswtcs_stub_source(uint32_t* outlen) {
     uint32_t len = (uint32_t)strlen(hlsl);
     uint32_t a = lswtcs_pool_alloc(len + 16);
     if (!a || !g_base) return 0;
-    memcpy(g_base + a, hlsl, len + 1);
+    memcpy(g_base + ppc_fold(a), hlsl, len + 1);
     cached = a; clen = len;
     if (outlen) *outlen = len;
     printf("[STUBSRC] trivial source at 0x%08X len %u\n", a, len); fflush(stdout);
@@ -427,22 +429,22 @@ extern "C" uint32_t lswtcs_stub_source(uint32_t* outlen) {
 }
 // Log compile result to stdout (h.log) so it survives the RAM-trace wrap.
 extern "C" void lswtcs_logresult(uint32_t ret, uint32_t errstr_guest) {
-    const char* e = (g_base && errstr_guest >= 0x82000000u && errstr_guest < 0xF0000000u) ? (const char*)(g_base + errstr_guest) : "";
+    const char* e = (g_base && errstr_guest >= 0x82000000u && errstr_guest < 0xF0000000u) ? (const char*)(g_base + ppc_fold(errstr_guest)) : "";
     printf("[LOGRESULT] compile ret=0x%08X err=\"%.140s\"\n", ret, e);
     fflush(stdout);
 }
 extern "C" void lswtcs_logcmp(uint32_t key, uint32_t ent, uint32_t flags, uint32_t res) {
     static int n = 0;
-    const char* k = (g_base && key >= 0x82000000u && key < 0xF0000000u) ? (const char*)(g_base + key) : "?";
+    const char* k = (g_base && key >= 0x82000000u && key < 0xF0000000u) ? (const char*)(g_base + ppc_fold(key)) : "?";
     if (n >= 40 || k[0] != 'P' || k[1] != 'O') return;   // only the POSITION key lookups
     n++;
-    const char* e = (g_base && ent >= 0x82000000u && ent < 0xF0000000u) ? (const char*)(g_base + ent) : "?";
+    const char* e = (g_base && ent >= 0x82000000u && ent < 0xF0000000u) ? (const char*)(g_base + ppc_fold(ent)) : "?";
     printf("[CMP] key=\"%.10s\" ent=\"%.10s\" flags=0x%08X res=0x%08X\n", k, e, flags, res);
     fflush(stdout);
 }
 extern "C" void lswtcs_logassert(uint32_t key, uint32_t count, uint32_t table) {
-    auto str = [&](uint32_t a) -> const char* { return (g_base && a >= 0x82000000u && a < 0xF0000000u) ? (const char*)(g_base + a) : "?"; };
-    auto ld  = [&](uint32_t a) -> uint32_t { return (g_base && a >= 0x82000000u && a < 0xF0000000u) ? __builtin_bswap32(*(uint32_t*)(g_base + a)) : 0; };
+    auto str = [&](uint32_t a) -> const char* { return (g_base && a >= 0x82000000u && a < 0xF0000000u) ? (const char*)(g_base + ppc_fold(a)) : "?"; };
+    auto ld  = [&](uint32_t a) -> uint32_t { return (g_base && a >= 0x82000000u && a < 0xF0000000u) ? __builtin_bswap32(*(uint32_t*)(g_base + ppc_fold(a))) : 0; };
     printf("[A3524] key r22=0x%08X \"%.24s\" [+0]=0x%08X [+4]=0x%08X | count=%u table=0x%08X\n",
            key, str(key), ld(key), ld(key + 4), count, table);
     for (int e = 0; e < 22 && table; e++) {
@@ -470,7 +472,7 @@ static LONG CALLBACK watch_handler(EXCEPTION_POINTERS* ep) {
         uintptr_t rip  = ep->ContextRecord->Rip;
         uintptr_t imgb = (uintptr_t)GetModuleHandle(NULL);
         uint32_t  wa   = g_watch_addr;
-        uint32_t  val  = g_base ? *(volatile uint32_t*)(g_base + wa) : 0;
+        uint32_t  val  = g_base ? *(volatile uint32_t*)(g_base + ppc_fold(wa)) : 0;
         // LSWTCS_WATCHNAN=1: only log writes that leave a NaN float at the watched address
         // (guest big-endian → swap). Used to find who first poisons the camera matrix.
         static int nanmode = -1; if (nanmode < 0) nanmode = getenv("LSWTCS_WATCHNAN") ? 1 : 0;
@@ -647,7 +649,20 @@ int main() {
     // at 0x80000000+P. So 0x80000000, 0xA0000000 and 0xC0000000 must be the SAME 512 MB:
     // one pagefile section mapped three times. Everything else is private memory.
     // LSWTCS_PHYSALIAS=0 falls back to one flat allocation (views not aliased).
-    {
+    // LSWTCS_SINGLEVIEW=1 (Switch model, needs the LSW_ADDR_FOLD build): only the 0x80000000 view
+    // is real memory; 0xA0000000-0xDFFFFFFF stay reserved NO-ACCESS, so any host access that bypasses
+    // ppc_fold() faults there (the crash handler names it) instead of silently using an alias.
+    if (const char* sv = getenv("LSWTCS_SINGLEVIEW"); sv && sv[0] == '1') {
+        uint8_t* b = (uint8_t*)VirtualAlloc(nullptr, alloc_size, MEM_RESERVE, PAGE_NOACCESS);
+        bool ok = b && VirtualAlloc(b, 0xA0000000ULL, MEM_COMMIT, PAGE_READWRITE)
+                    && VirtualAlloc(b + 0xE0000000ULL, alloc_size - 0xE0000000ULL, MEM_COMMIT, PAGE_READWRITE);
+        if (ok) {
+            g_base = b;
+            printf("[INIT] Guest memory (single view, fold): %p  0xA0000000-0xDFFFFFFF NO-ACCESS, table @0x%llX\n",
+                   (void*)g_base, (unsigned long long)PPC_FUNC_TABLE_BASE);
+        } else if (b) VirtualFree(b, 0, MEM_RELEASE);
+    }
+    if (!g_base) {
         const char* pa = getenv("LSWTCS_PHYSALIAS");
         bool want_alias = !(pa && pa[0] == '0');
         for (int attempt = 0; want_alias && attempt < 8 && !g_base; ++attempt) {
@@ -694,6 +709,14 @@ int main() {
     } else {
         printf("[INIT] Guest memory (4GB): %p, size 0x%zX\n", g_base, alloc_size);
     }
+
+    // PPC_HOST region table: identity for every 512 MB region, except that the 0xA0000000 and
+    // 0xC0000000 physical views fold onto the 0x80000000 copy (LSW_ADDR_FOLD).
+    for (int r = 0; r < 8; ++r) ppc_view_base[r] = g_base;
+#if LSW_ADDR_FOLD
+    ppc_view_base[5] = g_base - 0x20000000ULL;
+    ppc_view_base[6] = g_base - 0x40000000ULL;
+#endif
 
     // [DEBUG] Pause before guest code so a debugger can attach and set a hardware
     // write-breakpoint on the heap free-list sentinel (g_base+0x84000180) to catch

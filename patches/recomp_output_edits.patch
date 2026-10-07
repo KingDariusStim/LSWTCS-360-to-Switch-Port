@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr output_ref/lswtcs_vmx128.h output/lswtcs_vmx128.h
 --- output_ref/lswtcs_vmx128.h	1969-12-31 19:00:00.000000000 -0500
-+++ output/lswtcs_vmx128.h	2026-06-15 16:26:35.830849800 -0400
++++ output/lswtcs_vmx128.h	2026-10-07 12:28:11.278346900 -0400
 @@ -0,0 +1,37 @@
 +#ifndef LSWTCS_VMX128_H
 +#define LSWTCS_VMX128_H
@@ -40,9 +40,9 @@ diff -ruN --strip-trailing-cr output_ref/lswtcs_vmx128.h output/lswtcs_vmx128.h
 +}
 +#endif // LSWTCS_VMX128_H
 diff -ruN --strip-trailing-cr output_ref/ppc_context.h output/ppc_context.h
---- output_ref/ppc_context.h	2026-05-26 07:04:15.717642200 -0400
-+++ output/ppc_context.h	2026-10-04 15:17:43.571806900 -0400
-@@ -32,7 +32,15 @@
+--- output_ref/ppc_context.h	2026-10-07 12:28:06.905036200 -0400
++++ output/ppc_context.h	2026-10-07 12:28:07.781351700 -0400
+@@ -32,22 +32,58 @@
  #define PPC_EXTERN_FUNC(x) extern PPC_FUNC(x)
  #define PPC_WEAK_FUNC(x) __attribute__((weak,noinline)) PPC_FUNC(x)
  
@@ -56,10 +56,81 @@ diff -ruN --strip-trailing-cr output_ref/ppc_context.h output/ppc_context.h
 +extern "C" void lswtcs_gil_quantum();
 +#define PPC_FUNC_PROLOGUE() do { __builtin_assume(((size_t)base & 0x1F) == 0); \
 +    if (__builtin_expect((((++lswtcs_gil_ctr) & 0x3FFu) == 0u), 0)) lswtcs_gil_quantum(); } while (0)
++
++// LSWTCS address fold (LSW_ADDR_FOLD, default 1). The 360's 512 MB of physical memory appears at
++// guest 0x80000000, 0xA0000000 and 0xC0000000. Switch homebrew cannot map one block at several
++// writable addresses (Eden probe #1, 2026-10-06), so every guest access folds the two physical views
++// 0xA0000000-0xDFFFFFFF onto 0x80000000 + (addr & 0x1FFFFFFF): one host copy, branch-free (cmov).
++// LSW_ADDR_FOLD=0 = the old direct base + addr (needs the three host views mapped).
++#ifndef LSW_ADDR_FOLD
++#define LSW_ADDR_FOLD 1
++#endif
++static inline uint32_t ppc_fold(uint32_t a) {
++#if LSW_ADDR_FOLD
++    return (a - 0xA0000000u) < 0x40000000u ? ((a & 0x1FFFFFFFu) | 0x80000000u) : a;
++#else
++    return a;
++#endif
++}
++// Host pointer for a guest address. Every generated guest access (scalar macros below, vector
++// load/store, lwarx/stwcx, dcbz) goes through this. Table form of ppc_fold: ppc_view_base[i] is the
++// host base for guest region i (512 MB each, addr >> 29), set at startup (main.cpp): base for most
++// regions, base - 0x20000000 / base - 0x40000000 for the 0xA0000000 / 0xC0000000 views when folding.
++// Shift + load + add (~2 instructions over base + x) instead of compare + cmov (+20% guest CPU time
++// measured on PC, 2026-10-06). LSW_ADDR_FOLD_CMOV=1 selects the compare form for comparison.
++extern "C" uint8_t* ppc_view_base[8];
++#if defined(LSW_ADDR_FOLD_CMOV) && LSW_ADDR_FOLD_CMOV
++#define PPC_HOST(x) (base + ppc_fold((uint32_t)(x)))
++#else
++#define PPC_HOST(x) (ppc_view_base[(uint32_t)(x) >> 29] + (uint32_t)(x))
++#endif
  
  #ifndef PPC_LOAD_U8
- #define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
-@@ -110,10 +118,61 @@
+-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
++#define PPC_LOAD_U8(x) *(volatile uint8_t*)PPC_HOST(x)
+ #endif
+ 
+ #ifndef PPC_LOAD_U16
+-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
++#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)PPC_HOST(x))
+ #endif
+ 
+ #ifndef PPC_LOAD_U32
+-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
++#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)PPC_HOST(x))
+ #endif
+ 
+ #ifndef PPC_LOAD_U64
+-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
++#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)PPC_HOST(x))
+ #endif
+ 
+ // TODO: Implement.
+@@ -71,19 +107,19 @@
+ #endif
+ 
+ #ifndef PPC_STORE_U8
+-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
++#define PPC_STORE_U8(x, y) *(volatile uint8_t*)PPC_HOST(x) = (y)
+ #endif
+ 
+ #ifndef PPC_STORE_U16
+-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
++#define PPC_STORE_U16(x, y) *(volatile uint16_t*)PPC_HOST(x) = __builtin_bswap16(y)
+ #endif
+ 
+ #ifndef PPC_STORE_U32
+-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
++#define PPC_STORE_U32(x, y) *(volatile uint32_t*)PPC_HOST(x) = __builtin_bswap32(y)
+ #endif
+ 
+ #ifndef PPC_STORE_U64
+-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
++#define PPC_STORE_U64(x, y) *(volatile uint64_t*)PPC_HOST(x) = __builtin_bswap64(y)
+ #endif
+ 
+ // MMIO Store handling is completely reliant on being preeceded by eieio.
+@@ -110,10 +146,61 @@
  
  #define PPC_MEMORY_SIZE 0x100000000ull
  
@@ -124,8 +195,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_context.h output/ppc_context.h
  
  typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.0.cpp output/ppc_recomp.0.cpp
---- output_ref/ppc_recomp.0.cpp	2026-05-26 07:04:16.307341800 -0400
-+++ output/ppc_recomp.0.cpp	2026-05-31 14:09:04.221517200 -0400
+--- output_ref/ppc_recomp.0.cpp	2026-10-07 12:28:07.545131700 -0400
++++ output/ppc_recomp.0.cpp	2026-10-07 12:28:11.286431500 -0400
 @@ -1480,8 +1480,10 @@
  	ctx.r11.s64 = ctx.r11.s64 + 23200;
  	// mtctr r11
@@ -139,8 +210,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.0.cpp output/ppc_recomp.0.cp
  }
  
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.101.cpp output/ppc_recomp.101.cpp
---- output_ref/ppc_recomp.101.cpp	2026-05-26 07:04:16.571343300 -0400
-+++ output/ppc_recomp.101.cpp	2026-05-29 21:03:39.473116500 -0400
+--- output_ref/ppc_recomp.101.cpp	2026-10-07 12:28:07.115368000 -0400
++++ output/ppc_recomp.101.cpp	2026-10-07 12:28:08.750233700 -0400
 @@ -1938,7 +1938,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -151,8 +222,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.101.cpp output/ppc_recomp.10
  		goto loc_8218FB3C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.133.cpp output/ppc_recomp.133.cpp
---- output_ref/ppc_recomp.133.cpp	2026-05-26 07:04:16.710270200 -0400
-+++ output/ppc_recomp.133.cpp	2026-05-29 21:03:39.477112300 -0400
+--- output_ref/ppc_recomp.133.cpp	2026-10-07 12:28:07.405376100 -0400
++++ output/ppc_recomp.133.cpp	2026-10-07 12:28:09.091208300 -0400
 @@ -385,7 +385,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -163,8 +234,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.133.cpp output/ppc_recomp.13
  		goto loc_821B3048;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.134.cpp output/ppc_recomp.134.cpp
---- output_ref/ppc_recomp.134.cpp	2026-05-26 07:04:16.713269100 -0400
-+++ output/ppc_recomp.134.cpp	2026-05-29 21:03:39.477112300 -0400
+--- output_ref/ppc_recomp.134.cpp	2026-10-07 12:28:07.329213100 -0400
++++ output/ppc_recomp.134.cpp	2026-10-07 12:28:09.101416500 -0400
 @@ -199,7 +199,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -184,8 +255,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.134.cpp output/ppc_recomp.13
  		goto loc_821B49AC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.135.cpp output/ppc_recomp.135.cpp
---- output_ref/ppc_recomp.135.cpp	2026-05-26 07:04:16.716269300 -0400
-+++ output/ppc_recomp.135.cpp	2026-05-29 21:03:39.487482700 -0400
+--- output_ref/ppc_recomp.135.cpp	2026-10-07 12:28:07.577400100 -0400
++++ output/ppc_recomp.135.cpp	2026-10-07 12:28:09.117387000 -0400
 @@ -191,7 +191,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -196,8 +267,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.135.cpp output/ppc_recomp.13
  		goto loc_821B4FB0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.136.cpp output/ppc_recomp.136.cpp
---- output_ref/ppc_recomp.136.cpp	2026-05-26 07:04:16.719272000 -0400
-+++ output/ppc_recomp.136.cpp	2026-05-29 21:03:39.487482700 -0400
+--- output_ref/ppc_recomp.136.cpp	2026-10-07 12:28:11.524287300 -0400
++++ output/ppc_recomp.136.cpp	2026-10-07 12:28:09.128907000 -0400
 @@ -3198,7 +3198,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -208,8 +279,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.136.cpp output/ppc_recomp.13
  		goto loc_821B77EC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.154.cpp output/ppc_recomp.154.cpp
---- output_ref/ppc_recomp.154.cpp	2026-05-26 07:04:16.777267200 -0400
-+++ output/ppc_recomp.154.cpp	2026-05-29 21:03:39.503421700 -0400
+--- output_ref/ppc_recomp.154.cpp	2026-10-07 12:28:07.617185800 -0400
++++ output/ppc_recomp.154.cpp	2026-10-07 12:28:09.361672600 -0400
 @@ -2941,7 +2941,7 @@
  	// nop 
  	// nop 
@@ -229,8 +300,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.154.cpp output/ppc_recomp.15
  		// ERROR: 0x821CB010
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.208.cpp output/ppc_recomp.208.cpp
---- output_ref/ppc_recomp.208.cpp	2026-05-26 07:04:16.944702500 -0400
-+++ output/ppc_recomp.208.cpp	2026-10-03 21:24:58.988393500 -0400
+--- output_ref/ppc_recomp.208.cpp	2026-10-07 12:28:06.315448200 -0400
++++ output/ppc_recomp.208.cpp	2026-10-07 12:28:11.276344100 -0400
 @@ -238,6 +238,7 @@
  __attribute__((alias("__imp__sub_82208570"))) PPC_WEAK_FUNC(sub_82208570);
  PPC_FUNC_IMPL(__imp__sub_82208570) {
@@ -251,8 +322,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.208.cpp output/ppc_recomp.20
  	ctx.r1.s64 = ctx.r1.s64 + 448;
  	// b 0x8250f26c
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.212.cpp output/ppc_recomp.212.cpp
---- output_ref/ppc_recomp.212.cpp	2026-05-26 07:04:16.955698100 -0400
-+++ output/ppc_recomp.212.cpp	2026-08-23 19:00:52.178911200 -0400
+--- output_ref/ppc_recomp.212.cpp	2026-10-07 12:28:11.618258300 -0400
++++ output/ppc_recomp.212.cpp	2026-10-07 12:28:11.230706200 -0400
 @@ -1596,6 +1596,7 @@
  __attribute__((alias("__imp__sub_8220D680"))) PPC_WEAK_FUNC(sub_8220D680);
  PPC_FUNC_IMPL(__imp__sub_8220D680) {
@@ -525,8 +596,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.212.cpp output/ppc_recomp.21
  	ctx.r1.s64 = ctx.r1.s64 + 560;
  	// addi r12,r1,-152
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.213.cpp output/ppc_recomp.213.cpp
---- output_ref/ppc_recomp.213.cpp	2026-05-26 07:04:16.957701700 -0400
-+++ output/ppc_recomp.213.cpp	2026-10-03 21:25:14.812644400 -0400
+--- output_ref/ppc_recomp.213.cpp	2026-10-07 12:28:07.034432700 -0400
++++ output/ppc_recomp.213.cpp	2026-10-07 12:28:11.155609400 -0400
 @@ -1049,6 +1049,9 @@
  	PPC_FUNC_PROLOGUE();
  	PPCRegister temp{};
@@ -665,8 +736,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.213.cpp output/ppc_recomp.21
  	ctx.r1.s64 = ctx.r1.s64 + 576;
  	// b 0x8250f270
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.219.cpp output/ppc_recomp.219.cpp
---- output_ref/ppc_recomp.219.cpp	2026-05-26 07:04:16.974698100 -0400
-+++ output/ppc_recomp.219.cpp	2026-08-23 01:24:00.298635800 -0400
+--- output_ref/ppc_recomp.219.cpp	2026-10-07 12:28:07.357285100 -0400
++++ output/ppc_recomp.219.cpp	2026-10-07 12:28:11.238224500 -0400
 @@ -1047,8 +1047,17 @@
  __attribute__((alias("__imp__sub_82215AA0"))) PPC_WEAK_FUNC(sub_82215AA0);
  PPC_FUNC_IMPL(__imp__sub_82215AA0) {
@@ -781,8 +852,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.219.cpp output/ppc_recomp.21
  	ctx.r10.s64 = int16_t(PPC_LOAD_U16(ctx.r11.u32 + 98));
  	// stw r10,-11412(r9)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.236.cpp output/ppc_recomp.236.cpp
---- output_ref/ppc_recomp.236.cpp	2026-05-26 07:04:17.016714100 -0400
-+++ output/ppc_recomp.236.cpp	2026-05-29 21:03:39.518960100 -0400
+--- output_ref/ppc_recomp.236.cpp	2026-10-07 12:28:06.115465700 -0400
++++ output/ppc_recomp.236.cpp	2026-10-07 12:28:10.245524200 -0400
 @@ -748,7 +748,7 @@
  	// nop 
  	// nop 
@@ -793,8 +864,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.236.cpp output/ppc_recomp.23
  		goto loc_822291FC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.268.cpp output/ppc_recomp.268.cpp
---- output_ref/ppc_recomp.268.cpp	2026-05-26 07:04:17.113543800 -0400
-+++ output/ppc_recomp.268.cpp	2026-10-04 12:47:40.298758000 -0400
+--- output_ref/ppc_recomp.268.cpp	2026-10-07 12:28:06.133798500 -0400
++++ output/ppc_recomp.268.cpp	2026-10-07 12:28:11.242225500 -0400
 @@ -1939,6 +1939,17 @@
  	if (ctx.cr6.eq) goto loc_8224FD94;
  	// addi r4,r11,184
@@ -814,8 +885,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.268.cpp output/ppc_recomp.26
  	ctx.r3.u64 = PPC_LOAD_U32(ctx.r31.u32 + 24788);
  	// li r5,64
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2794.cpp output/ppc_recomp.2794.cpp
---- output_ref/ppc_recomp.2794.cpp	2026-05-26 07:04:24.571585200 -0400
-+++ output/ppc_recomp.2794.cpp	2026-05-29 21:03:39.518960100 -0400
+--- output_ref/ppc_recomp.2794.cpp	2026-10-07 12:28:11.816411400 -0400
++++ output/ppc_recomp.2794.cpp	2026-10-07 12:28:10.704024800 -0400
 @@ -49314,7 +49314,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -835,8 +906,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2794.cpp output/ppc_recomp.2
  		goto loc_82D6A580;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.286.cpp output/ppc_recomp.286.cpp
---- output_ref/ppc_recomp.286.cpp	2026-05-26 07:04:17.175539000 -0400
-+++ output/ppc_recomp.286.cpp	2026-08-23 20:11:35.846442600 -0400
+--- output_ref/ppc_recomp.286.cpp	2026-10-07 12:28:11.838570600 -0400
++++ output/ppc_recomp.286.cpp	2026-10-07 12:28:11.145588500 -0400
 @@ -1060,6 +1060,12 @@
  	ctx.r29.s64 = ctx.r11.s64 + 31304;
  	// mr r3,r29
@@ -937,8 +1008,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.286.cpp output/ppc_recomp.28
  	ctx.r1.s64 = ctx.r1.s64 + 816;
  	// addi r12,r1,-152
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2861.cpp output/ppc_recomp.2861.cpp
---- output_ref/ppc_recomp.2861.cpp	2026-05-26 07:04:24.697542900 -0400
-+++ output/ppc_recomp.2861.cpp	2026-05-29 21:03:39.539676200 -0400
+--- output_ref/ppc_recomp.2861.cpp	2026-10-07 12:28:11.875273900 -0400
++++ output/ppc_recomp.2861.cpp	2026-10-07 12:28:10.778215800 -0400
 @@ -4818,7 +4818,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -976,8 +1047,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2861.cpp output/ppc_recomp.2
  		goto loc_82D9BE80;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2970.cpp output/ppc_recomp.2970.cpp
---- output_ref/ppc_recomp.2970.cpp	2026-05-26 07:04:24.997459100 -0400
-+++ output/ppc_recomp.2970.cpp	2026-05-29 21:03:39.547331800 -0400
+--- output_ref/ppc_recomp.2970.cpp	2026-10-07 12:28:11.958850600 -0400
++++ output/ppc_recomp.2970.cpp	2026-10-07 12:28:08.080072500 -0400
 @@ -8965,7 +8965,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -1123,8 +1194,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.2970.cpp output/ppc_recomp.2
  		goto loc_82E107C4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.3.cpp output/ppc_recomp.3.cpp
---- output_ref/ppc_recomp.3.cpp	2026-05-26 07:04:16.323341500 -0400
-+++ output/ppc_recomp.3.cpp	2026-05-31 14:09:57.198109500 -0400
+--- output_ref/ppc_recomp.3.cpp	2026-10-07 12:28:07.319032000 -0400
++++ output/ppc_recomp.3.cpp	2026-10-07 12:28:11.253736900 -0400
 @@ -2417,8 +2417,10 @@
  	ctx.r11.s64 = ctx.r11.s64 + 19112;
  	// mtctr r11
@@ -1138,8 +1209,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.3.cpp output/ppc_recomp.3.cp
  }
  
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.337.cpp output/ppc_recomp.337.cpp
---- output_ref/ppc_recomp.337.cpp	2026-05-26 07:04:17.325677600 -0400
-+++ output/ppc_recomp.337.cpp	2026-06-10 15:48:40.783961300 -0400
+--- output_ref/ppc_recomp.337.cpp	2026-10-07 12:28:07.041943100 -0400
++++ output/ppc_recomp.337.cpp	2026-10-07 12:28:11.222667500 -0400
 @@ -1,4 +1,6 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -2170,8 +2241,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.337.cpp output/ppc_recomp.33
  	ctx.r8.u64 = PPC_LOAD_U16(ctx.r11.u32 + -8);
  	// cmplw cr6,r10,r8
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.338.cpp output/ppc_recomp.338.cpp
---- output_ref/ppc_recomp.338.cpp	2026-05-26 07:04:17.334689000 -0400
-+++ output/ppc_recomp.338.cpp	2026-05-29 21:03:39.561432700 -0400
+--- output_ref/ppc_recomp.338.cpp	2026-10-07 12:28:12.040889200 -0400
++++ output/ppc_recomp.338.cpp	2026-10-07 12:28:11.165133000 -0400
 @@ -8344,7 +8344,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -2202,8 +2273,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.338.cpp output/ppc_recomp.33
  		// ERROR: 0x822A7904
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.339.cpp output/ppc_recomp.339.cpp
---- output_ref/ppc_recomp.339.cpp	2026-05-26 07:04:17.345728500 -0400
-+++ output/ppc_recomp.339.cpp	2026-10-05 15:05:54.965198900 -0400
+--- output_ref/ppc_recomp.339.cpp	2026-10-07 12:28:12.045395600 -0400
++++ output/ppc_recomp.339.cpp	2026-10-07 12:28:11.283345500 -0400
 @@ -1,5 +1,8 @@
  #include "ppc_recomp_shared.h"
  
@@ -2276,8 +2347,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.339.cpp output/ppc_recomp.33
  	ctx.r12.u64 = ctx.lr;
  	// bl 0x8250f23c
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.340.cpp output/ppc_recomp.340.cpp
---- output_ref/ppc_recomp.340.cpp	2026-05-26 07:04:17.352724100 -0400
-+++ output/ppc_recomp.340.cpp	2026-10-06 16:26:56.622835100 -0400
+--- output_ref/ppc_recomp.340.cpp	2026-10-07 12:28:06.673863800 -0400
++++ output/ppc_recomp.340.cpp	2026-10-07 12:28:07.782349400 -0400
 @@ -1,4 +1,9 @@
  #include "ppc_recomp_shared.h"
 +extern "C" uint64_t lsw_guest_timebase(void);   // mftb: 360 timebase rate (kernel_stubs.cpp)
@@ -2512,8 +2583,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.340.cpp output/ppc_recomp.34
  	ctx.r3.s64 = 0;
  	// stw r31,0(r27)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.342.cpp output/ppc_recomp.342.cpp
---- output_ref/ppc_recomp.342.cpp	2026-05-26 07:04:17.370834800 -0400
-+++ output/ppc_recomp.342.cpp	2026-10-06 16:26:56.627348100 -0400
+--- output_ref/ppc_recomp.342.cpp	2026-10-07 12:28:12.053403300 -0400
++++ output/ppc_recomp.342.cpp	2026-10-07 12:28:11.228699100 -0400
 @@ -1,4 +1,6 @@
  #include "ppc_recomp_shared.h"
 +extern "C" uint64_t lsw_guest_timebase(void);   // mftb: 360 timebase rate (kernel_stubs.cpp)
@@ -2969,8 +3040,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.342.cpp output/ppc_recomp.34
  		goto loc_822B9C20;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.343.cpp output/ppc_recomp.343.cpp
---- output_ref/ppc_recomp.343.cpp	2026-05-26 07:04:17.377226500 -0400
-+++ output/ppc_recomp.343.cpp	2026-07-19 21:57:14.360656300 -0400
+--- output_ref/ppc_recomp.343.cpp	2026-10-07 12:28:12.058944800 -0400
++++ output/ppc_recomp.343.cpp	2026-10-07 12:28:11.157629400 -0400
 @@ -2982,7 +2982,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -3003,8 +3074,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.343.cpp output/ppc_recomp.34
  	ctx.r11.s64 = ctx.r4.s64 + 2552;
  	// rlwinm r11,r11,2,0,29
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.344.cpp output/ppc_recomp.344.cpp
---- output_ref/ppc_recomp.344.cpp	2026-05-26 07:04:17.386801500 -0400
-+++ output/ppc_recomp.344.cpp	2026-10-06 00:22:04.108318200 -0400
+--- output_ref/ppc_recomp.344.cpp	2026-10-07 12:28:07.411506300 -0400
++++ output/ppc_recomp.344.cpp	2026-10-07 12:28:11.256256300 -0400
 @@ -1,8 +1,10 @@
  #include "ppc_recomp_shared.h"
  
@@ -3106,8 +3177,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.344.cpp output/ppc_recomp.34
  	ctx.r1.s64 = ctx.r1.s64 + 128;
  	// b 0x8250f284
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.346.cpp output/ppc_recomp.346.cpp
---- output_ref/ppc_recomp.346.cpp	2026-05-26 07:04:17.411804200 -0400
-+++ output/ppc_recomp.346.cpp	2026-10-06 16:26:56.631350100 -0400
+--- output_ref/ppc_recomp.346.cpp	2026-10-07 12:28:12.071456600 -0400
++++ output/ppc_recomp.346.cpp	2026-10-07 12:28:11.193660000 -0400
 @@ -1,4 +1,7 @@
  #include "ppc_recomp_shared.h"
 +extern "C" uint64_t lsw_guest_timebase(void);   // mftb: 360 timebase rate (kernel_stubs.cpp)
@@ -3562,8 +3633,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.346.cpp output/ppc_recomp.34
  	simde_mm_store_si128((simde__m128i*)ctx.v0.u32, simde_mm_shuffle_epi32(simde_mm_load_si128((simde__m128i*)ctx.v0.u32), 0xFF));
  	// stvewx v0,r0,r11
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.347.cpp output/ppc_recomp.347.cpp
---- output_ref/ppc_recomp.347.cpp	2026-05-26 07:04:17.423803500 -0400
-+++ output/ppc_recomp.347.cpp	2026-10-04 16:43:26.073066600 -0400
+--- output_ref/ppc_recomp.347.cpp	2026-10-07 12:28:12.076982200 -0400
++++ output/ppc_recomp.347.cpp	2026-10-07 12:28:11.288425300 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -3660,8 +3731,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.347.cpp output/ppc_recomp.34
  	ctx.r3.s64 = 0;
  	// addi r1,r1,160
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.348.cpp output/ppc_recomp.348.cpp
---- output_ref/ppc_recomp.348.cpp	2026-05-26 07:04:17.428787100 -0400
-+++ output/ppc_recomp.348.cpp	2026-08-23 20:03:55.164376200 -0400
+--- output_ref/ppc_recomp.348.cpp	2026-10-07 12:28:07.047461300 -0400
++++ output/ppc_recomp.348.cpp	2026-10-07 12:28:11.154102900 -0400
 @@ -5245,6 +5245,9 @@
  __attribute__((alias("__imp__sub_822D91C8"))) PPC_WEAK_FUNC(sub_822D91C8);
  PPC_FUNC_IMPL(__imp__sub_822D91C8) {
@@ -3673,8 +3744,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.348.cpp output/ppc_recomp.34
  	ctx.r11.s64 = 128;
  	// stw r4,4(r3)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.350.cpp output/ppc_recomp.350.cpp
---- output_ref/ppc_recomp.350.cpp	2026-05-26 07:04:17.445785700 -0400
-+++ output/ppc_recomp.350.cpp	2026-10-06 20:34:15.306348100 -0400
+--- output_ref/ppc_recomp.350.cpp	2026-10-07 12:28:06.815116300 -0400
++++ output/ppc_recomp.350.cpp	2026-10-07 12:28:11.201643300 -0400
 @@ -1877,107 +1877,40 @@
  __attribute__((alias("__imp__sub_822DE7F8"))) PPC_WEAK_FUNC(sub_822DE7F8);
  PPC_FUNC_IMPL(__imp__sub_822DE7F8) {
@@ -3830,8 +3901,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.350.cpp output/ppc_recomp.35
  	// mflr r12
  	ctx.r12.u64 = ctx.lr;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.351.cpp output/ppc_recomp.351.cpp
---- output_ref/ppc_recomp.351.cpp	2026-05-26 07:04:17.458970600 -0400
-+++ output/ppc_recomp.351.cpp	2026-08-23 20:05:41.090124700 -0400
+--- output_ref/ppc_recomp.351.cpp	2026-10-07 12:28:07.049460000 -0400
++++ output/ppc_recomp.351.cpp	2026-10-07 12:28:11.273310900 -0400
 @@ -3403,6 +3403,8 @@
  	if (!ctx.cr6.eq) goto loc_822E32C8;
  	// lwz r10,0(r10)
@@ -3960,8 +4031,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.351.cpp output/ppc_recomp.35
  	ctx.lr = 0x822E7948;
  	sub_8231CB58(ctx, base);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.352.cpp output/ppc_recomp.352.cpp
---- output_ref/ppc_recomp.352.cpp	2026-05-26 07:04:17.465400500 -0400
-+++ output/ppc_recomp.352.cpp	2026-05-31 14:10:03.096842900 -0400
+--- output_ref/ppc_recomp.352.cpp	2026-10-07 12:28:12.081978400 -0400
++++ output/ppc_recomp.352.cpp	2026-10-07 12:28:11.271309900 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +#include <ctime>
@@ -4007,8 +4078,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.352.cpp output/ppc_recomp.35
  	ctx.r1.s64 = ctx.r1.s64 + 112;
  	// b 0x8250f28c
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.353.cpp output/ppc_recomp.353.cpp
---- output_ref/ppc_recomp.353.cpp	2026-05-26 07:04:17.494048200 -0400
-+++ output/ppc_recomp.353.cpp	2026-10-06 22:00:08.606207400 -0400
+--- output_ref/ppc_recomp.353.cpp	2026-10-07 12:28:12.095496700 -0400
++++ output/ppc_recomp.353.cpp	2026-10-07 12:28:11.142589300 -0400
 @@ -749,7 +749,7 @@
  	// nop 
  	// nop 
@@ -4125,8 +4196,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.353.cpp output/ppc_recomp.35
  	ctx.lr = 0x822F9F64;
  	sub_823272A8(ctx, base);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.354.cpp output/ppc_recomp.354.cpp
---- output_ref/ppc_recomp.354.cpp	2026-05-26 07:04:17.519024500 -0400
-+++ output/ppc_recomp.354.cpp	2026-08-23 20:06:11.540319800 -0400
+--- output_ref/ppc_recomp.354.cpp	2026-10-07 12:28:12.110678400 -0400
++++ output/ppc_recomp.354.cpp	2026-10-07 12:28:11.196630100 -0400
 @@ -25668,6 +25668,16 @@
  __attribute__((alias("__imp__sub_823047B0"))) PPC_WEAK_FUNC(sub_823047B0);
  PPC_FUNC_IMPL(__imp__sub_823047B0) {
@@ -4341,8 +4412,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.354.cpp output/ppc_recomp.35
  	ctx.r29.s64 = -2097217536;
  	// li r5,440
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.355.cpp output/ppc_recomp.355.cpp
---- output_ref/ppc_recomp.355.cpp	2026-05-26 07:04:17.536071000 -0400
-+++ output/ppc_recomp.355.cpp	2026-08-23 20:04:25.190893700 -0400
+--- output_ref/ppc_recomp.355.cpp	2026-10-07 12:28:12.118192200 -0400
++++ output/ppc_recomp.355.cpp	2026-10-07 12:28:11.161624600 -0400
 @@ -10236,6 +10236,9 @@
  __attribute__((alias("__imp__sub_8230D560"))) PPC_WEAK_FUNC(sub_8230D560);
  PPC_FUNC_IMPL(__imp__sub_8230D560) {
@@ -4396,8 +4467,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.355.cpp output/ppc_recomp.35
  		goto loc_8230E214;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.356.cpp output/ppc_recomp.356.cpp
---- output_ref/ppc_recomp.356.cpp	2026-05-26 07:04:17.566797200 -0400
-+++ output/ppc_recomp.356.cpp	2026-08-23 20:04:29.678640700 -0400
+--- output_ref/ppc_recomp.356.cpp	2026-10-07 12:28:12.122194600 -0400
++++ output/ppc_recomp.356.cpp	2026-10-07 12:28:11.144591400 -0400
 @@ -4726,7 +4726,9 @@
  	ctx.r4.s64 = ctx.r31.s64 + 1936;
  	// bl 0x8231b2e8
@@ -4489,8 +4560,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.356.cpp output/ppc_recomp.35
  	// mflr r12
  	ctx.r12.u64 = ctx.lr;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.357.cpp output/ppc_recomp.357.cpp
---- output_ref/ppc_recomp.357.cpp	2026-05-26 07:04:17.572850800 -0400
-+++ output/ppc_recomp.357.cpp	2026-05-31 14:10:03.439947700 -0400
+--- output_ref/ppc_recomp.357.cpp	2026-10-07 12:28:12.125192500 -0400
++++ output/ppc_recomp.357.cpp	2026-10-07 12:28:11.285342400 -0400
 @@ -680,7 +680,9 @@
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r11.u32 + 64);
  	// mtctr r11
@@ -4728,8 +4799,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.357.cpp output/ppc_recomp.35
  	ctx.r11.u64 = ctx.r28.u64;
  	// stw r11,48(r31)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.358.cpp output/ppc_recomp.358.cpp
---- output_ref/ppc_recomp.358.cpp	2026-05-26 07:04:17.579841600 -0400
-+++ output/ppc_recomp.358.cpp	2026-06-12 13:52:50.894355100 -0400
+--- output_ref/ppc_recomp.358.cpp	2026-10-07 12:28:12.129352200 -0400
++++ output/ppc_recomp.358.cpp	2026-10-07 12:28:11.287427800 -0400
 @@ -5274,6 +5274,10 @@
  __attribute__((alias("__imp__sub_8231B2E8"))) PPC_WEAK_FUNC(sub_8231B2E8);
  PPC_FUNC_IMPL(__imp__sub_8231B2E8) {
@@ -4863,8 +4934,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.358.cpp output/ppc_recomp.35
  		// ERROR: 0x8231B7A4
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.359.cpp output/ppc_recomp.359.cpp
---- output_ref/ppc_recomp.359.cpp	2026-05-26 07:04:17.589828200 -0400
-+++ output/ppc_recomp.359.cpp	2026-08-23 20:03:51.693663400 -0400
+--- output_ref/ppc_recomp.359.cpp	2026-10-07 12:28:12.135352300 -0400
++++ output/ppc_recomp.359.cpp	2026-10-07 12:28:11.188658300 -0400
 @@ -6545,6 +6545,11 @@
  __attribute__((alias("__imp__sub_8231FE50"))) PPC_WEAK_FUNC(sub_8231FE50);
  PPC_FUNC_IMPL(__imp__sub_8231FE50) {
@@ -4936,8 +5007,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.359.cpp output/ppc_recomp.35
  	ctx.r11.s64 = -2097020928;
  	// stw r3,-1720(r11)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.360.cpp output/ppc_recomp.360.cpp
---- output_ref/ppc_recomp.360.cpp	2026-05-26 07:04:17.601830700 -0400
-+++ output/ppc_recomp.360.cpp	2026-07-20 22:18:43.963516200 -0400
+--- output_ref/ppc_recomp.360.cpp	2026-10-07 12:28:12.142873200 -0400
++++ output/ppc_recomp.360.cpp	2026-10-07 12:28:11.159663500 -0400
 @@ -986,6 +986,7 @@
  __attribute__((alias("__imp__sub_82323960"))) PPC_WEAK_FUNC(sub_82323960);
  PPC_FUNC_IMPL(__imp__sub_82323960) {
@@ -4955,8 +5026,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.360.cpp output/ppc_recomp.36
  	return;
  }
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.368.cpp output/ppc_recomp.368.cpp
---- output_ref/ppc_recomp.368.cpp	2026-05-26 07:04:17.689306900 -0400
-+++ output/ppc_recomp.368.cpp	2026-05-29 21:03:39.680599900 -0400
+--- output_ref/ppc_recomp.368.cpp	2026-10-07 12:28:12.180577300 -0400
++++ output/ppc_recomp.368.cpp	2026-10-07 12:28:11.184145900 -0400
 @@ -2328,7 +2328,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -4976,8 +5047,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.368.cpp output/ppc_recomp.36
  	ctx.lr = 0x82355790;
  	sub_82358468(ctx, base);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.369.cpp output/ppc_recomp.369.cpp
---- output_ref/ppc_recomp.369.cpp	2026-05-26 07:04:17.701298600 -0400
-+++ output/ppc_recomp.369.cpp	2026-10-03 22:26:04.422402800 -0400
+--- output_ref/ppc_recomp.369.cpp	2026-10-07 12:28:12.186077700 -0400
++++ output/ppc_recomp.369.cpp	2026-10-07 12:28:08.139623000 -0400
 @@ -3925,6 +3925,7 @@
  __attribute__((alias("__imp__sub_82357998"))) PPC_WEAK_FUNC(sub_82357998);
  PPC_FUNC_IMPL(__imp__sub_82357998) {
@@ -5036,8 +5107,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.369.cpp output/ppc_recomp.36
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r3.u32 + 584);
  	// lwz r10,588(r3)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.370.cpp output/ppc_recomp.370.cpp
---- output_ref/ppc_recomp.370.cpp	2026-05-26 07:04:17.720298900 -0400
-+++ output/ppc_recomp.370.cpp	2026-05-29 21:03:39.685601100 -0400
+--- output_ref/ppc_recomp.370.cpp	2026-10-07 12:28:05.947828600 -0400
++++ output/ppc_recomp.370.cpp	2026-10-07 12:28:07.804475700 -0400
 @@ -6291,7 +6291,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5048,8 +5119,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.370.cpp output/ppc_recomp.37
  		goto loc_8235EDD8;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.374.cpp output/ppc_recomp.374.cpp
---- output_ref/ppc_recomp.374.cpp	2026-05-26 07:04:17.821570600 -0400
-+++ output/ppc_recomp.374.cpp	2026-05-29 21:03:39.693427800 -0400
+--- output_ref/ppc_recomp.374.cpp	2026-10-07 12:28:12.203932300 -0400
++++ output/ppc_recomp.374.cpp	2026-10-07 12:28:08.146124500 -0400
 @@ -4436,7 +4436,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5060,8 +5131,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.374.cpp output/ppc_recomp.37
  		goto loc_82392154;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.376.cpp output/ppc_recomp.376.cpp
---- output_ref/ppc_recomp.376.cpp	2026-05-26 07:04:17.853151700 -0400
-+++ output/ppc_recomp.376.cpp	2026-05-29 21:03:39.693427800 -0400
+--- output_ref/ppc_recomp.376.cpp	2026-10-07 12:28:12.213446300 -0400
++++ output/ppc_recomp.376.cpp	2026-10-07 12:28:08.148124500 -0400
 @@ -12143,7 +12143,7 @@
  	// nop 
  	// nop 
@@ -5099,8 +5170,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.376.cpp output/ppc_recomp.37
  		goto loc_823B28A4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.378.cpp output/ppc_recomp.378.cpp
---- output_ref/ppc_recomp.378.cpp	2026-05-26 07:04:17.884832500 -0400
-+++ output/ppc_recomp.378.cpp	2026-05-29 21:03:39.706535300 -0400
+--- output_ref/ppc_recomp.378.cpp	2026-10-07 12:28:12.226473800 -0400
++++ output/ppc_recomp.378.cpp	2026-10-07 12:28:08.150631100 -0400
 @@ -2191,7 +2191,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5111,8 +5182,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.378.cpp output/ppc_recomp.37
  		goto loc_823BDC24;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.381.cpp output/ppc_recomp.381.cpp
---- output_ref/ppc_recomp.381.cpp	2026-05-26 07:04:17.936855200 -0400
-+++ output/ppc_recomp.381.cpp	2026-10-04 12:52:25.367951400 -0400
+--- output_ref/ppc_recomp.381.cpp	2026-10-07 12:28:12.236042000 -0400
++++ output/ppc_recomp.381.cpp	2026-10-07 12:28:11.269307600 -0400
 @@ -20292,6 +20292,14 @@
  __attribute__((alias("__imp__sub_823DF470"))) PPC_WEAK_FUNC(sub_823DF470);
  PPC_FUNC_IMPL(__imp__sub_823DF470) {
@@ -5129,8 +5200,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.381.cpp output/ppc_recomp.38
  	uint32_t ea{};
  	// mflr r12
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.384.cpp output/ppc_recomp.384.cpp
---- output_ref/ppc_recomp.384.cpp	2026-05-26 07:04:17.984105300 -0400
-+++ output/ppc_recomp.384.cpp	2026-08-23 01:24:12.569055200 -0400
+--- output_ref/ppc_recomp.384.cpp	2026-10-07 12:28:12.253570100 -0400
++++ output/ppc_recomp.384.cpp	2026-10-07 12:28:11.235215500 -0400
 @@ -8269,6 +8269,12 @@
  __attribute__((alias("__imp__sub_823F75C8"))) PPC_WEAK_FUNC(sub_823F75C8);
  PPC_FUNC_IMPL(__imp__sub_823F75C8) {
@@ -5173,8 +5244,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.384.cpp output/ppc_recomp.38
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r3.u32 + 12);
  	// li r10,-1
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.386.cpp output/ppc_recomp.386.cpp
---- output_ref/ppc_recomp.386.cpp	2026-05-26 07:04:18.019818500 -0400
-+++ output/ppc_recomp.386.cpp	2026-05-29 21:03:39.718880800 -0400
+--- output_ref/ppc_recomp.386.cpp	2026-10-07 12:28:12.267128800 -0400
++++ output/ppc_recomp.386.cpp	2026-10-07 12:28:08.153638500 -0400
 @@ -13105,7 +13105,7 @@
  	// nop 
  	// nop 
@@ -5185,8 +5256,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.386.cpp output/ppc_recomp.38
  		goto loc_8240B874;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.388.cpp output/ppc_recomp.388.cpp
---- output_ref/ppc_recomp.388.cpp	2026-05-26 07:04:18.046808100 -0400
-+++ output/ppc_recomp.388.cpp	2026-05-29 21:03:39.718880800 -0400
+--- output_ref/ppc_recomp.388.cpp	2026-10-07 12:28:12.278640700 -0400
++++ output/ppc_recomp.388.cpp	2026-10-07 12:28:08.155145100 -0400
 @@ -11626,7 +11626,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5206,8 +5277,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.388.cpp output/ppc_recomp.38
  		goto loc_8241E418;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.389.cpp output/ppc_recomp.389.cpp
---- output_ref/ppc_recomp.389.cpp	2026-05-26 07:04:18.065878000 -0400
-+++ output/ppc_recomp.389.cpp	2026-05-29 21:03:39.729357400 -0400
+--- output_ref/ppc_recomp.389.cpp	2026-10-07 12:28:05.820118300 -0400
++++ output/ppc_recomp.389.cpp	2026-10-07 12:28:08.156158600 -0400
 @@ -11334,7 +11334,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5218,8 +5289,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.389.cpp output/ppc_recomp.38
  		goto loc_82424070;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.390.cpp output/ppc_recomp.390.cpp
---- output_ref/ppc_recomp.390.cpp	2026-05-26 07:04:18.078783000 -0400
-+++ output/ppc_recomp.390.cpp	2026-08-23 20:50:51.237877300 -0400
+--- output_ref/ppc_recomp.390.cpp	2026-10-07 12:28:12.283640100 -0400
++++ output/ppc_recomp.390.cpp	2026-10-07 12:28:11.185657800 -0400
 @@ -1429,6 +1429,37 @@
  __attribute__((alias("__imp__sub_8242ABB0"))) PPC_WEAK_FUNC(sub_8242ABB0);
  PPC_FUNC_IMPL(__imp__sub_8242ABB0) {
@@ -5271,8 +5342,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.390.cpp output/ppc_recomp.39
  	// mflr r12
  	ctx.r12.u64 = ctx.lr;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.393.cpp output/ppc_recomp.393.cpp
---- output_ref/ppc_recomp.393.cpp	2026-05-26 07:04:18.127093700 -0400
-+++ output/ppc_recomp.393.cpp	2026-05-29 21:03:39.729357400 -0400
+--- output_ref/ppc_recomp.393.cpp	2026-10-07 12:28:12.300334200 -0400
++++ output/ppc_recomp.393.cpp	2026-10-07 12:28:08.160155100 -0400
 @@ -23816,7 +23816,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5283,8 +5354,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.393.cpp output/ppc_recomp.39
  		goto loc_8244A524;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.395.cpp output/ppc_recomp.395.cpp
---- output_ref/ppc_recomp.395.cpp	2026-05-26 07:04:18.161138800 -0400
-+++ output/ppc_recomp.395.cpp	2026-05-29 21:03:39.739395800 -0400
+--- output_ref/ppc_recomp.395.cpp	2026-10-07 12:28:12.314249700 -0400
++++ output/ppc_recomp.395.cpp	2026-10-07 12:28:08.163157600 -0400
 @@ -21597,7 +21597,7 @@
  	// nop 
  	// nop 
@@ -5295,8 +5366,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.395.cpp output/ppc_recomp.39
  		// ERROR: 0x8245EA5C
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.401.cpp output/ppc_recomp.401.cpp
---- output_ref/ppc_recomp.401.cpp	2026-05-26 07:04:18.232138600 -0400
-+++ output/ppc_recomp.401.cpp	2026-05-31 14:10:04.862949800 -0400
+--- output_ref/ppc_recomp.401.cpp	2026-10-07 12:28:12.339341700 -0400
++++ output/ppc_recomp.401.cpp	2026-10-07 12:28:11.253736900 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -5342,8 +5413,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.401.cpp output/ppc_recomp.40
  	ctx.r1.s64 = ctx.r1.s64 + 160;
  	// b 0x8250f28c
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.402.cpp output/ppc_recomp.402.cpp
---- output_ref/ppc_recomp.402.cpp	2026-05-26 07:04:18.242138800 -0400
-+++ output/ppc_recomp.402.cpp	2026-05-29 21:03:39.758427000 -0400
+--- output_ref/ppc_recomp.402.cpp	2026-10-07 12:28:12.342341000 -0400
++++ output/ppc_recomp.402.cpp	2026-10-07 12:28:08.169673000 -0400
 @@ -10282,7 +10282,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5354,8 +5425,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.402.cpp output/ppc_recomp.40
  		goto loc_82491C18;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.406.cpp output/ppc_recomp.406.cpp
---- output_ref/ppc_recomp.406.cpp	2026-05-26 07:04:18.276138600 -0400
-+++ output/ppc_recomp.406.cpp	2026-06-15 17:30:34.872802400 -0400
+--- output_ref/ppc_recomp.406.cpp	2026-10-07 12:28:12.355376000 -0400
++++ output/ppc_recomp.406.cpp	2026-10-07 12:28:11.189660300 -0400
 @@ -10136,6 +10136,10 @@
  	ctx.r27.u64 = ctx.r8.u64;
  	// mr r26,r9
@@ -5387,7 +5458,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.406.cpp output/ppc_recomp.40
 +	  // PATH B: compile the game's assembled HLSL straight to a D3D12 shader (raw src; our
 +	  // preprocess fills semantics + strips shared/registers). Verifies the runtime shaders compile.
 +	  if (s >= 0x82000000u && s < 0xF0000000u && ctx.r28.u32 >= 32u)
-+	    lswtcs_pathb_compile((const char*)(base + s), ctx.r28.u32);
++	    lswtcs_pathb_compile((const char*)(PPC_HOST(s)), ctx.r28.u32);
 +	  // EXPERIMENTAL: inject input-attribute semantics (LSWTCS_SEMFIX) into the parser's src (r3) + len (r4)
 +	  uint32_t _nl=0; uint32_t _ns=lswtcs_fix_semantics(ctx.r3.u32, ctx.r4.u32, &_nl);
 +	  if(_ns){ ctx.r3.u32=_ns; ctx.r4.u32=_nl; }
@@ -5412,7 +5483,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.406.cpp output/ppc_recomp.40
 +	  dbg_ram("[SHC] after parser ret=0x%08X obj96=0x%08X\n", ctx.r3.u32, o);
 +	  if(o && _n++<3){ uint32_t b=(uint32_t)(uintptr_t)0; (void)b;
 +	    for(int off=0; off<=120; off+=4){ uint32_t v=PPC_LOAD_U32(o+off);
-+	      if(v>=0x82000000u && v<0xF0000000u){ const char* p=(const char*)(base+v); int pr=1;
++	      if(v>=0x82000000u && v<0xF0000000u){ const char* p=(const char*)PPC_HOST(v); int pr=1;
 +	        for(int k=0;k<8;k++){ unsigned char c=p[k]; if(!(c==0||(c>=32&&c<127)||c==10||c==13)){pr=0;break;} }
 +	        if(pr && p[0]) dbg_ram("[SHCOBJ] [+%d]=0x%08X str=\"%.64s\"\n", off, v, p);
 +	        else dbg_ram("[SHCOBJ] [+%d]=0x%08X (ptr)\n", off, v);
@@ -5478,8 +5549,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.406.cpp output/ppc_recomp.40
  	ctx.r1.s64 = ctx.r1.s64 + 128;
  	// lwz r12,-8(r1)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.407.cpp output/ppc_recomp.407.cpp
---- output_ref/ppc_recomp.407.cpp	2026-05-26 07:04:18.285138700 -0400
-+++ output/ppc_recomp.407.cpp	2026-06-02 11:21:59.474544000 -0400
+--- output_ref/ppc_recomp.407.cpp	2026-10-07 12:28:12.358477600 -0400
++++ output/ppc_recomp.407.cpp	2026-10-07 12:28:11.262253400 -0400
 @@ -1656,7 +1656,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5657,7 +5728,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.407.cpp output/ppc_recomp.40
  	// bl 0x824aef60
  	ctx.lr = 0x824AB480;
 +	dbg_ram("[AB3B0 loc430] calling sub_824AEF60 r3=0x%08X r4=0x%08X r5=0x%08X\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
-+	{ uint32_t s=ctx.r4.u32; const unsigned char* p=(s>=0x82000000u&&s<0xA0000000u)?(const unsigned char*)(base+s):0;
++	{ uint32_t s=ctx.r4.u32; const unsigned char* p=(s>=0x82000000u&&s<0xA0000000u)?(const unsigned char*)PPC_HOST(s):0;
 +	  char b[97]; int j=0; if(p){ for(int i=0;i<96;i++){ unsigned char c=p[i]; b[j++]=(c>=32&&c<127)?c:(c==0?'.':'?'); } } b[j]=0;
 +	  dbg_ram("[TMPLSRC] r4=0x%08X bytes[0..96]: %s\n", s, p?b:"<oob>"); }
  	sub_824AEF60(ctx, base);
@@ -5705,8 +5776,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.407.cpp output/ppc_recomp.40
  	ctx.r3.u64 = ctx.r31.u64;
  	// addi r1,r1,112
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.408.cpp output/ppc_recomp.408.cpp
---- output_ref/ppc_recomp.408.cpp	2026-05-26 07:04:18.293783300 -0400
-+++ output/ppc_recomp.408.cpp	2026-06-02 11:13:05.946875400 -0400
+--- output_ref/ppc_recomp.408.cpp	2026-10-07 12:28:12.362477600 -0400
++++ output/ppc_recomp.408.cpp	2026-10-07 12:28:11.285342400 -0400
 @@ -423,7 +423,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5722,8 +5793,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.408.cpp output/ppc_recomp.40
  	ctx.r31.u64 = ctx.r4.u64;
 +	// LSWTCS DIAG: log only NON-EMPTY source fragments (does any real HLSL ever get appended?)
 +	{ static int _n=0; uint32_t s=ctx.r4.u32;
-+	  if(_n<24 && s>=0x82000000u && s<0xA0000000u && *(const char*)(base+s)!=0){ _n++;
-+	    dbg_ram("[APPEND-NE] src=0x%08X \"%.90s\"\n", s, (const char*)(base+s)); } }
++	  if(_n<24 && s>=0x82000000u && s<0xA0000000u && *(const char*)PPC_HOST(s)!=0){ _n++;
++	    dbg_ram("[APPEND-NE] src=0x%08X \"%.90s\"\n", s, (const char*)PPC_HOST(s)); } }
  	// cmplwi cr6,r31,0
  	ctx.cr6.compare<uint32_t>(ctx.r31.u32, 0, ctx.xer);
  	// lwz r20,2460(r29)
@@ -5780,7 +5851,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.408.cpp output/ppc_recomp.40
  	ctx.r27.u64 = ctx.r6.u64;
 +	// LSWTCS DIAG: identify the src-object (r30) class + its template field [+520]
 +	{ static int _n=0; if(_n<2){ _n++; uint32_t o=ctx.r30.u32; uint32_t vt=PPC_LOAD_U32(o+0);
-+	  uint32_t t520=PPC_LOAD_U32(o+520); const char* tp=(t520>=0x82000000u&&t520<0xA0000000u)?(const char*)(base+t520):"<oob>";
++	  uint32_t t520=PPC_LOAD_U32(o+520); const char* tp=(t520>=0x82000000u&&t520<0xA0000000u)?(const char*)PPC_HOST(t520):"<oob>";
 +	  dbg_ram("[SRCOBJ] r30=0x%08X vtable=0x%08X [+520]=0x%08X(\"%.40s\") [+516]=0x%08X [+524]=0x%08X\n",
 +	    o, vt, t520, t520?tp:"<null>", PPC_LOAD_U32(o+516), PPC_LOAD_U32(o+524));
 +	  dbg_ram("[SRCOBJ] vtmethods +0=%08X +4=%08X +8=%08X +12=%08X +20=%08X +24=%08X +28=%08X\n",
@@ -5806,8 +5877,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.408.cpp output/ppc_recomp.40
  	if (ctx.cr6.lt) goto loc_824B13A0;
  	// li r3,0
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.409.cpp output/ppc_recomp.409.cpp
---- output_ref/ppc_recomp.409.cpp	2026-05-26 07:04:18.304888700 -0400
-+++ output/ppc_recomp.409.cpp	2026-05-31 14:10:05.238085600 -0400
+--- output_ref/ppc_recomp.409.cpp	2026-10-07 12:28:12.366547400 -0400
++++ output/ppc_recomp.409.cpp	2026-10-07 12:28:11.250737200 -0400
 @@ -911,12 +911,16 @@
  	PPC_STORE_U32(ctx.r31.u32 + 1112, ctx.r30.u32);
  	// bl 0x824b1fb0
@@ -5837,8 +5908,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.409.cpp output/ppc_recomp.40
  		goto loc_824B3498;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.414.cpp output/ppc_recomp.414.cpp
---- output_ref/ppc_recomp.414.cpp	2026-05-26 07:04:18.419129600 -0400
-+++ output/ppc_recomp.414.cpp	2026-05-29 21:03:39.804637600 -0400
+--- output_ref/ppc_recomp.414.cpp	2026-10-07 12:28:12.393964200 -0400
++++ output/ppc_recomp.414.cpp	2026-10-07 12:28:08.179284500 -0400
 @@ -8186,7 +8186,7 @@
  	// nop 
  	// nop 
@@ -5858,8 +5929,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.414.cpp output/ppc_recomp.41
  		goto loc_824F091C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.415.cpp output/ppc_recomp.415.cpp
---- output_ref/ppc_recomp.415.cpp	2026-05-26 07:04:18.430847100 -0400
-+++ output/ppc_recomp.415.cpp	2026-05-31 13:42:44.588661600 -0400
+--- output_ref/ppc_recomp.415.cpp	2026-10-07 12:28:07.572876600 -0400
++++ output/ppc_recomp.415.cpp	2026-10-07 12:28:11.239225400 -0400
 @@ -5539,7 +5539,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -5887,8 +5958,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.415.cpp output/ppc_recomp.41
  }
  
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.416.cpp output/ppc_recomp.416.cpp
---- output_ref/ppc_recomp.416.cpp	2026-05-26 07:04:18.438847900 -0400
-+++ output/ppc_recomp.416.cpp	2026-07-05 21:38:24.922011600 -0400
+--- output_ref/ppc_recomp.416.cpp	2026-10-07 12:28:07.298952700 -0400
++++ output/ppc_recomp.416.cpp	2026-10-07 12:28:11.226184600 -0400
 @@ -8646,6 +8646,10 @@
  __attribute__((alias("__imp__sub_824FC438"))) PPC_WEAK_FUNC(sub_824FC438);
  PPC_FUNC_IMPL(__imp__sub_824FC438) {
@@ -5901,8 +5972,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.416.cpp output/ppc_recomp.41
  	ctx.r11.s64 = -2094530560;
  	// stw r3,-5536(r11)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.417.cpp
---- output_ref/ppc_recomp.417.cpp	2026-05-26 07:04:18.448847500 -0400
-+++ output/ppc_recomp.417.cpp	2026-07-20 23:20:30.648522300 -0400
+--- output_ref/ppc_recomp.417.cpp	2026-10-07 12:28:07.221389400 -0400
++++ output/ppc_recomp.417.cpp	2026-10-07 12:28:11.240225200 -0400
 @@ -2254,6 +2254,9 @@
  	ctx.r10.u64 = ctx.r3.u64;
  	// lwz r11,-1940(r8)
@@ -5989,7 +6060,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	ctx.r3.s64 = ctx.r23.s64 + 2048;
 +	dbg_ram("[FB8] QUEUED handle=0x%08X slot=%d req=0x%08X name=\"%.48s\"\n",
 +	        ctx.r23.u32 + 2048, ctx.r23.u32, ctx.r30.u32,
-+	        (const char*)(base + PPC_LOAD_U32(ctx.r30.u32 + 184)));
++	        (const char*)(PPC_HOST(PPC_LOAD_U32(ctx.r30.u32 + 184))));
  	// b 0x82503190
  	goto loc_82503190;
  loc_82503144:
@@ -5997,11 +6068,11 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	ctx.r29.u64 = ctx.r5.u64;
  	// mr r25,r6
  	ctx.r25.u64 = ctx.r6.u64;
-+	dbg_ram("[82503A10] entry: r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X caller=0x%08X str=\"%.32s\"\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (uint32_t)ctx.r12.u32, (char*)(base+ctx.r30.u32));
++	dbg_ram("[82503A10] entry: r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X caller=0x%08X str=\"%.32s\"\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (uint32_t)ctx.r12.u32, (char*)PPC_HOST(ctx.r30.u32));
  	// bl 0x82502cf0
  	ctx.lr = 0x82503A30;
  	sub_82502CF0(ctx, base);
-+	dbg_ram("[82503A10] after CF0: r30=0x%08X str=\"%.32s\"\n", ctx.r30.u32, (char*)(base+ctx.r30.u32));
++	dbg_ram("[82503A10] after CF0: r30=0x%08X str=\"%.32s\"\n", ctx.r30.u32, (char*)PPC_HOST(ctx.r30.u32));
  	// mr. r31,r3
  	ctx.r31.u64 = ctx.r3.u64;
  	ctx.cr0.compare<int32_t>(ctx.r31.s32, 0, ctx.xer);
@@ -6013,7 +6084,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	ctx.r11.s64 = -2098069504;
  	// lwz r31,-1940(r11)
  	ctx.r31.u64 = PPC_LOAD_U32(ctx.r11.u32 + -1940);
-+	dbg_ram("[82503A10] path_struct=0x%08X state=0x%08X path+16=%d path+172=\"%s\"\n", ctx.r31.u32, ctx.r31.u32 ? PPC_LOAD_U32(ctx.r31.u32 + 0) : 0xDEADu, ctx.r31.u32 ? (int)PPC_LOAD_U8(ctx.r31.u32 + 16) : -1, ctx.r31.u32 ? (const char*)(base + ctx.r31.u32 + 172) : "NULL");
++	dbg_ram("[82503A10] path_struct=0x%08X state=0x%08X path+16=%d path+172=\"%s\"\n", ctx.r31.u32, ctx.r31.u32 ? PPC_LOAD_U32(ctx.r31.u32 + 0) : 0xDEADu, ctx.r31.u32 ? (int)PPC_LOAD_U8(ctx.r31.u32 + 16) : -1, ctx.r31.u32 ? (const char*)(PPC_HOST(ctx.r31.u32 + 172)) : "NULL");
  loc_82503A70:
  	// lwz r11,556(r31)
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r31.u32 + 556);
@@ -6030,7 +6101,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r31.u32 + 0);
  	// cmpwi cr6,r11,2
  	ctx.cr6.compare<int32_t>(ctx.r11.s32, 2, ctx.xer);
-+	dbg_ram("[82503A10] after vtable call state=0x%08X path_buf=\"%s\"\n", ctx.r11.u32, (const char*)(base + ctx.r1.u32 + 112));
++	dbg_ram("[82503A10] after vtable call state=0x%08X path_buf=\"%s\"\n", ctx.r11.u32, (const char*)(PPC_HOST(ctx.r1.u32 + 112)));
  	// bne cr6,0x82503ad8
  	if (!ctx.cr6.eq) goto loc_82503AD8;
  	// lis r11,-32253
@@ -6038,7 +6109,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	// mr. r26,r3
  	ctx.r26.u64 = ctx.r3.u64;
  	ctx.cr0.compare<int32_t>(ctx.r26.s32, 0, ctx.xer);
-+	dbg_ram("[82503A10] sub_82509B88 r26=0x%08X (path_buf=\"%s\")\n", ctx.r26.u32, (const char*)(base + ctx.r1.u32 + 112));
++	dbg_ram("[82503A10] sub_82509B88 r26=0x%08X (path_buf=\"%s\")\n", ctx.r26.u32, (const char*)(PPC_HOST(ctx.r1.u32 + 112)));
  	// blt 0x82503b20
  	if (ctx.cr0.lt) goto loc_82503B20;
  	// lis r11,-31974
@@ -6113,8 +6184,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.417.cpp output/ppc_recomp.41
  	// cmpwi r3,0
  	ctx.cr0.compare<int32_t>(ctx.r3.s32, 0, ctx.xer);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.418.cpp output/ppc_recomp.418.cpp
---- output_ref/ppc_recomp.418.cpp	2026-05-26 07:04:18.458848900 -0400
-+++ output/ppc_recomp.418.cpp	2026-10-03 21:11:56.232130300 -0400
+--- output_ref/ppc_recomp.418.cpp	2026-10-07 12:28:12.401481600 -0400
++++ output/ppc_recomp.418.cpp	2026-10-07 12:28:11.220667000 -0400
 @@ -1531,6 +1531,7 @@
  __attribute__((alias("__imp__sub_82506A38"))) PPC_WEAK_FUNC(sub_82506A38);
  PPC_FUNC_IMPL(__imp__sub_82506A38) {
@@ -6495,7 +6566,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.418.cpp output/ppc_recomp.41
  PPC_FUNC_IMPL(__imp__sub_82509B88) {
  	PPC_FUNC_PROLOGUE();
  	uint32_t ea{};
-+	dbg_ram("[82509B88] entry r3(path)=\"%.40s\" r4(mode)=0x%08X\n", (const char*)(base+ctx.r3.u32), ctx.r4.u32);
++	dbg_ram("[82509B88] entry r3(path)=\"%.40s\" r4(mode)=0x%08X\n", (const char*)PPC_HOST(ctx.r3.u32), ctx.r4.u32);
  	// mflr r12
  	ctx.r12.u64 = ctx.lr;
  	// bl 0x8250f234
@@ -6511,7 +6582,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.418.cpp output/ppc_recomp.41
  	ctx.r4.u64 = ctx.r30.u64;
  	// lwz r3,1472(r11)
  	ctx.r3.u64 = PPC_LOAD_U32(ctx.r11.u32 + 1472);
-+	dbg_ram("[82509B88] r27(slot)=%d calling sub_8250D1E8 r3(obj)=0x%08X r4(path)=\"%.40s\"\n", ctx.r27.s32, ctx.r3.u32, (const char*)(base+ctx.r4.u32));
++	dbg_ram("[82509B88] r27(slot)=%d calling sub_8250D1E8 r3(obj)=0x%08X r4(path)=\"%.40s\"\n", ctx.r27.s32, ctx.r3.u32, (const char*)PPC_HOST(ctx.r4.u32));
  	// bl 0x8250d1e8
  	ctx.lr = 0x82509C38;
  	sub_8250D1E8(ctx, base);
@@ -6661,8 +6732,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.418.cpp output/ppc_recomp.41
  	ctx.r3.s64 = 0;
  	// addi r1,r1,160
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.419.cpp output/ppc_recomp.419.cpp
---- output_ref/ppc_recomp.419.cpp	2026-05-26 07:04:18.463419600 -0400
-+++ output/ppc_recomp.419.cpp	2026-06-15 16:05:53.472756200 -0400
+--- output_ref/ppc_recomp.419.cpp	2026-10-07 12:28:12.404483600 -0400
++++ output/ppc_recomp.419.cpp	2026-10-07 12:28:11.264254500 -0400
 @@ -2016,6 +2016,7 @@
  __attribute__((alias("__imp__sub_8250C430"))) PPC_WEAK_FUNC(sub_8250C430);
  PPC_FUNC_IMPL(__imp__sub_8250C430) {
@@ -6722,7 +6793,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.419.cpp output/ppc_recomp.41
  loc_8250D224:
  	// lwz r10,1452(r3)
  	ctx.r10.u64 = PPC_LOAD_U32(ctx.r3.u32 + 1452);
-+	dbg_ram("[8250D1E8] r3(obj)=0x%08X r10=[r3+1452]=0x%08X r11(path)=\"%.40s\"\n", ctx.r3.u32, ctx.r10.u32, (const char*)(base+ctx.r11.u32));
++	dbg_ram("[8250D1E8] r3(obj)=0x%08X r10=[r3+1452]=0x%08X r11(path)=\"%.40s\"\n", ctx.r3.u32, ctx.r10.u32, (const char*)PPC_HOST(ctx.r11.u32));
  	// cmpwi cr6,r10,0
  	ctx.cr6.compare<int32_t>(ctx.r10.s32, 0, ctx.xer);
  	// bne cr6,0x8250d218
@@ -6816,8 +6887,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.419.cpp output/ppc_recomp.41
  loc_8250EB74:
  	// lis r10,-31967
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.420.cpp output/ppc_recomp.420.cpp
---- output_ref/ppc_recomp.420.cpp	2026-05-26 07:04:18.473815000 -0400
-+++ output/ppc_recomp.420.cpp	2026-10-04 18:48:11.385112100 -0400
+--- output_ref/ppc_recomp.420.cpp	2026-10-07 12:28:07.255114300 -0400
++++ output/ppc_recomp.420.cpp	2026-10-07 12:28:11.227691500 -0400
 @@ -7985,7 +7985,7 @@
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r29.u32 + 5068);
  	// mtctr r11
@@ -6828,8 +6899,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.420.cpp output/ppc_recomp.42
  	PPC_CALL_INDIRECT_FUNC(ctx.ctr.u32);
  	// cmpwi r3,0
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.422.cpp output/ppc_recomp.422.cpp
---- output_ref/ppc_recomp.422.cpp	2026-05-26 07:04:18.491919200 -0400
-+++ output/ppc_recomp.422.cpp	2026-05-29 21:03:39.843777800 -0400
+--- output_ref/ppc_recomp.422.cpp	2026-10-07 12:28:07.051459200 -0400
++++ output/ppc_recomp.422.cpp	2026-10-07 12:28:11.233701500 -0400
 @@ -5176,7 +5176,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -6849,8 +6920,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.422.cpp output/ppc_recomp.42
  		goto loc_825166F0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.423.cpp output/ppc_recomp.423.cpp
---- output_ref/ppc_recomp.423.cpp	2026-05-26 07:04:18.510522900 -0400
-+++ output/ppc_recomp.423.cpp	2026-05-29 21:03:39.853938600 -0400
+--- output_ref/ppc_recomp.423.cpp	2026-10-07 12:28:05.967867600 -0400
++++ output/ppc_recomp.423.cpp	2026-10-07 12:28:08.180283900 -0400
 @@ -1016,7 +1016,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -6906,8 +6977,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.423.cpp output/ppc_recomp.42
  		goto loc_8251E6F4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.424.cpp output/ppc_recomp.424.cpp
---- output_ref/ppc_recomp.424.cpp	2026-05-26 07:04:18.518522400 -0400
-+++ output/ppc_recomp.424.cpp	2026-05-29 21:03:39.865689300 -0400
+--- output_ref/ppc_recomp.424.cpp	2026-10-07 12:28:07.396368000 -0400
++++ output/ppc_recomp.424.cpp	2026-10-07 12:28:08.181284400 -0400
 @@ -5349,7 +5349,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -6927,8 +6998,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.424.cpp output/ppc_recomp.42
  		goto loc_8252459C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.425.cpp output/ppc_recomp.425.cpp
---- output_ref/ppc_recomp.425.cpp	2026-05-26 07:04:18.534531500 -0400
-+++ output/ppc_recomp.425.cpp	2026-06-01 09:58:44.413329400 -0400
+--- output_ref/ppc_recomp.425.cpp	2026-10-07 12:28:12.453566000 -0400
++++ output/ppc_recomp.425.cpp	2026-10-07 12:28:11.190659200 -0400
 @@ -2424,7 +2424,7 @@
  	// nop 
  	// nop 
@@ -6988,8 +7059,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.425.cpp output/ppc_recomp.42
  	// beq 0x825332e0
  	if (ctx.cr0.eq) goto loc_825332E0;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.426.cpp output/ppc_recomp.426.cpp
---- output_ref/ppc_recomp.426.cpp	2026-05-26 07:04:18.545523500 -0400
-+++ output/ppc_recomp.426.cpp	2026-10-06 16:26:56.634854300 -0400
+--- output_ref/ppc_recomp.426.cpp	2026-10-07 12:28:12.460823200 -0400
++++ output/ppc_recomp.426.cpp	2026-10-07 12:28:11.236225700 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +extern "C" uint64_t lsw_guest_timebase(void);   // mftb: 360 timebase rate (kernel_stubs.cpp)
@@ -7177,8 +7248,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.426.cpp output/ppc_recomp.42
  	// mflr r12
  	ctx.r12.u64 = ctx.lr;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.427.cpp output/ppc_recomp.427.cpp
---- output_ref/ppc_recomp.427.cpp	2026-05-26 07:04:18.563523600 -0400
-+++ output/ppc_recomp.427.cpp	2026-05-31 14:10:06.008855700 -0400
+--- output_ref/ppc_recomp.427.cpp	2026-10-07 12:28:12.469341100 -0400
++++ output/ppc_recomp.427.cpp	2026-10-07 12:28:11.202641000 -0400
 @@ -1,4 +1,15 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -7196,8 +7267,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.427.cpp output/ppc_recomp.42
  __attribute__((alias("__imp__sub_82539404"))) PPC_WEAK_FUNC(sub_82539404);
  PPC_FUNC_IMPL(__imp__sub_82539404) {
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.428.cpp output/ppc_recomp.428.cpp
---- output_ref/ppc_recomp.428.cpp	2026-05-26 07:04:18.578526800 -0400
-+++ output/ppc_recomp.428.cpp	2026-06-01 09:06:29.080625300 -0400
+--- output_ref/ppc_recomp.428.cpp	2026-10-07 12:28:05.970870000 -0400
++++ output/ppc_recomp.428.cpp	2026-10-07 12:28:11.266309200 -0400
 @@ -5656,9 +5656,11 @@
  	ctx.r21.u64 = ctx.r9.u64;
  	// mr r27,r10
@@ -7329,8 +7400,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.428.cpp output/ppc_recomp.42
  		goto loc_8254D970;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.429.cpp output/ppc_recomp.429.cpp
---- output_ref/ppc_recomp.429.cpp	2026-05-26 07:04:18.594524800 -0400
-+++ output/ppc_recomp.429.cpp	2026-05-29 21:03:39.907418100 -0400
+--- output_ref/ppc_recomp.429.cpp	2026-10-07 12:28:05.629841400 -0400
++++ output/ppc_recomp.429.cpp	2026-10-07 12:28:11.247735800 -0400
 @@ -216,7 +216,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -7386,8 +7457,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.429.cpp output/ppc_recomp.42
  		goto loc_82553C18;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.430.cpp output/ppc_recomp.430.cpp
---- output_ref/ppc_recomp.430.cpp	2026-05-26 07:04:18.616502900 -0400
-+++ output/ppc_recomp.430.cpp	2026-05-29 21:03:39.918982400 -0400
+--- output_ref/ppc_recomp.430.cpp	2026-10-07 12:28:12.479432500 -0400
++++ output/ppc_recomp.430.cpp	2026-10-07 12:28:07.810853200 -0400
 @@ -2091,7 +2091,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -7452,8 +7523,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.430.cpp output/ppc_recomp.43
  		goto loc_82565F7C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.431.cpp output/ppc_recomp.431.cpp
---- output_ref/ppc_recomp.431.cpp	2026-05-26 07:04:18.654502900 -0400
-+++ output/ppc_recomp.431.cpp	2026-05-31 14:10:06.227533400 -0400
+--- output_ref/ppc_recomp.431.cpp	2026-10-07 12:28:05.633349700 -0400
++++ output/ppc_recomp.431.cpp	2026-10-07 12:28:11.281345500 -0400
 @@ -1,4 +1,15 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -7516,8 +7587,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.431.cpp output/ppc_recomp.43
  		goto loc_825711F4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.432.cpp output/ppc_recomp.432.cpp
---- output_ref/ppc_recomp.432.cpp	2026-05-26 07:04:18.703151100 -0400
-+++ output/ppc_recomp.432.cpp	2026-05-31 14:10:06.296049900 -0400
+--- output_ref/ppc_recomp.432.cpp	2026-10-07 12:28:05.972869600 -0400
++++ output/ppc_recomp.432.cpp	2026-10-07 12:28:11.154102900 -0400
 @@ -1,4 +1,15 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -7571,8 +7642,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.432.cpp output/ppc_recomp.43
  		goto loc_825826D4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.434.cpp output/ppc_recomp.434.cpp
---- output_ref/ppc_recomp.434.cpp	2026-05-26 07:04:18.731846200 -0400
-+++ output/ppc_recomp.434.cpp	2026-06-15 16:29:21.234062500 -0400
+--- output_ref/ppc_recomp.434.cpp	2026-10-07 12:28:12.493940600 -0400
++++ output/ppc_recomp.434.cpp	2026-10-07 12:28:11.191659100 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +#include "lswtcs_vmx128.h"
@@ -7625,8 +7696,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.434.cpp output/ppc_recomp.43
  	simde_mm_store_si128((simde__m128i*)ctx.v0.u32, simde_mm_shuffle_epi32(simde_mm_load_si128((simde__m128i*)ctx.v0.u32), 0xFF));
  	// stvewx v0,r0,r8
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.436.cpp output/ppc_recomp.436.cpp
---- output_ref/ppc_recomp.436.cpp	2026-05-26 07:04:18.766848400 -0400
-+++ output/ppc_recomp.436.cpp	2026-05-29 21:03:39.946257000 -0400
+--- output_ref/ppc_recomp.436.cpp	2026-10-07 12:28:07.515066300 -0400
++++ output/ppc_recomp.436.cpp	2026-10-07 12:28:08.185797200 -0400
 @@ -11409,7 +11409,7 @@
  	// nop 
  	// nop 
@@ -7673,8 +7744,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.436.cpp output/ppc_recomp.43
  		goto loc_825B8388;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.437.cpp output/ppc_recomp.437.cpp
---- output_ref/ppc_recomp.437.cpp	2026-05-26 07:04:18.805971000 -0400
-+++ output/ppc_recomp.437.cpp	2026-06-14 18:14:48.406128500 -0400
+--- output_ref/ppc_recomp.437.cpp	2026-10-07 12:28:05.973871900 -0400
++++ output/ppc_recomp.437.cpp	2026-10-07 12:28:11.246735300 -0400
 @@ -1,4 +1,15 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -7850,8 +7921,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.437.cpp output/ppc_recomp.43
  	PPC_STORE_U32(ctx.r3.u32 + 8, ctx.r31.u32);
  	// stw r31,12(r3)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.438.cpp output/ppc_recomp.438.cpp
---- output_ref/ppc_recomp.438.cpp	2026-05-26 07:04:18.818974000 -0400
-+++ output/ppc_recomp.438.cpp	2026-06-01 09:58:57.829701400 -0400
+--- output_ref/ppc_recomp.438.cpp	2026-10-07 12:28:12.523000200 -0400
++++ output/ppc_recomp.438.cpp	2026-10-07 12:28:11.242225500 -0400
 @@ -2610,6 +2610,7 @@
  	// bl 0x8213d990
  	ctx.lr = 0x825D3824;
@@ -7906,8 +7977,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.438.cpp output/ppc_recomp.43
  		goto loc_825D70A8;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.439.cpp output/ppc_recomp.439.cpp
---- output_ref/ppc_recomp.439.cpp	2026-05-26 07:04:18.844514400 -0400
-+++ output/ppc_recomp.439.cpp	2026-05-29 21:03:39.962540900 -0400
+--- output_ref/ppc_recomp.439.cpp	2026-10-07 12:28:07.453153000 -0400
++++ output/ppc_recomp.439.cpp	2026-10-07 12:28:08.186799800 -0400
 @@ -1649,7 +1649,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -7972,8 +8043,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.439.cpp output/ppc_recomp.43
  		goto loc_825E138C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.44.cpp output/ppc_recomp.44.cpp
---- output_ref/ppc_recomp.44.cpp	2026-05-26 07:04:16.409354800 -0400
-+++ output/ppc_recomp.44.cpp	2026-05-29 21:03:39.972028200 -0400
+--- output_ref/ppc_recomp.44.cpp	2026-10-07 12:28:12.528517900 -0400
++++ output/ppc_recomp.44.cpp	2026-10-07 12:28:08.187805800 -0400
 @@ -3756,7 +3756,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -7984,8 +8055,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.44.cpp output/ppc_recomp.44.
  		goto loc_8214CDD8;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.440.cpp output/ppc_recomp.440.cpp
---- output_ref/ppc_recomp.440.cpp	2026-05-26 07:04:18.867528600 -0400
-+++ output/ppc_recomp.440.cpp	2026-07-19 22:08:01.563434400 -0400
+--- output_ref/ppc_recomp.440.cpp	2026-10-07 12:28:12.536024800 -0400
++++ output/ppc_recomp.440.cpp	2026-10-07 12:28:11.230706200 -0400
 @@ -20294,6 +20294,11 @@
  	PPC_FUNC_PROLOGUE();
  	PPCRegister temp{};
@@ -8035,8 +8106,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.440.cpp output/ppc_recomp.44
  		goto loc_825F1BBC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.441.cpp output/ppc_recomp.441.cpp
---- output_ref/ppc_recomp.441.cpp	2026-05-26 07:04:18.880528900 -0400
-+++ output/ppc_recomp.441.cpp	2026-05-31 14:10:06.765450300 -0400
+--- output_ref/ppc_recomp.441.cpp	2026-10-07 12:28:05.976391900 -0400
++++ output/ppc_recomp.441.cpp	2026-10-07 12:28:11.274307600 -0400
 @@ -1,4 +1,17 @@
  #include "ppc_recomp_shared.h"
 +#include <cstdio>
@@ -8100,8 +8171,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.441.cpp output/ppc_recomp.44
  		goto loc_825F9B80;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.444.cpp output/ppc_recomp.444.cpp
---- output_ref/ppc_recomp.444.cpp	2026-05-26 07:04:18.950267900 -0400
-+++ output/ppc_recomp.444.cpp	2026-05-29 21:03:39.985619300 -0400
+--- output_ref/ppc_recomp.444.cpp	2026-10-07 12:28:05.978392100 -0400
++++ output/ppc_recomp.444.cpp	2026-10-07 12:28:08.191801600 -0400
 @@ -2304,7 +2304,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8121,8 +8192,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.444.cpp output/ppc_recomp.44
  		goto loc_8260B638;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.445.cpp output/ppc_recomp.445.cpp
---- output_ref/ppc_recomp.445.cpp	2026-05-26 07:04:18.975998300 -0400
-+++ output/ppc_recomp.445.cpp	2026-05-29 21:03:39.996605700 -0400
+--- output_ref/ppc_recomp.445.cpp	2026-10-07 12:28:07.613667800 -0400
++++ output/ppc_recomp.445.cpp	2026-10-07 12:28:08.193800300 -0400
 @@ -11231,7 +11231,7 @@
  	// nop 
  	// nop 
@@ -8142,8 +8213,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.445.cpp output/ppc_recomp.44
  		goto loc_82627FC0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.447.cpp output/ppc_recomp.447.cpp
---- output_ref/ppc_recomp.447.cpp	2026-05-26 07:04:19.048997700 -0400
-+++ output/ppc_recomp.447.cpp	2026-05-29 21:03:40.009875200 -0400
+--- output_ref/ppc_recomp.447.cpp	2026-10-07 12:28:07.667038800 -0400
++++ output/ppc_recomp.447.cpp	2026-10-07 12:28:08.198324500 -0400
 @@ -51008,7 +51008,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8154,8 +8225,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.447.cpp output/ppc_recomp.44
  		goto loc_8265BE60;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.448.cpp output/ppc_recomp.448.cpp
---- output_ref/ppc_recomp.448.cpp	2026-05-26 07:04:19.067000000 -0400
-+++ output/ppc_recomp.448.cpp	2026-05-29 21:03:40.018876400 -0400
+--- output_ref/ppc_recomp.448.cpp	2026-10-07 12:28:06.515049900 -0400
++++ output/ppc_recomp.448.cpp	2026-10-07 12:28:08.200325900 -0400
 @@ -3542,7 +3542,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -8175,8 +8246,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.448.cpp output/ppc_recomp.44
  		goto loc_82665310;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.449.cpp output/ppc_recomp.449.cpp
---- output_ref/ppc_recomp.449.cpp	2026-05-26 07:04:19.099129100 -0400
-+++ output/ppc_recomp.449.cpp	2026-05-29 21:03:40.018876400 -0400
+--- output_ref/ppc_recomp.449.cpp	2026-10-07 12:28:06.822125500 -0400
++++ output/ppc_recomp.449.cpp	2026-10-07 12:28:08.201327800 -0400
 @@ -3712,7 +3712,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -8250,8 +8321,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.449.cpp output/ppc_recomp.44
  		goto loc_82678554;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.450.cpp output/ppc_recomp.450.cpp
---- output_ref/ppc_recomp.450.cpp	2026-05-26 07:04:19.108128000 -0400
-+++ output/ppc_recomp.450.cpp	2026-05-29 21:03:40.031738900 -0400
+--- output_ref/ppc_recomp.450.cpp	2026-10-07 12:28:12.561456900 -0400
++++ output/ppc_recomp.450.cpp	2026-10-07 12:28:07.810853200 -0400
 @@ -150,7 +150,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8262,8 +8333,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.450.cpp output/ppc_recomp.45
  		goto loc_8267B7B8;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.451.cpp output/ppc_recomp.451.cpp
---- output_ref/ppc_recomp.451.cpp	2026-05-26 07:04:19.117128200 -0400
-+++ output/ppc_recomp.451.cpp	2026-06-01 16:41:53.744762600 -0400
+--- output_ref/ppc_recomp.451.cpp	2026-10-07 12:28:07.454156000 -0400
++++ output/ppc_recomp.451.cpp	2026-10-07 12:28:11.223669000 -0400
 @@ -7974,6 +7974,8 @@
  	ctx.r29.s64 = ctx.r31.s64 + 128;
  	// lwz r11,128(r31)
@@ -8274,8 +8345,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.451.cpp output/ppc_recomp.45
  	ctx.cr6.compare<int32_t>(ctx.r11.s32, 0, ctx.xer);
  	// blt cr6,0x82683654
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.452.cpp output/ppc_recomp.452.cpp
---- output_ref/ppc_recomp.452.cpp	2026-05-26 07:04:19.128148500 -0400
-+++ output/ppc_recomp.452.cpp	2026-06-15 16:29:39.152754300 -0400
+--- output_ref/ppc_recomp.452.cpp	2026-10-07 12:28:12.568982300 -0400
++++ output/ppc_recomp.452.cpp	2026-10-07 12:28:11.153104300 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +#include "lswtcs_vmx128.h"
@@ -8283,7 +8354,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.452.cpp output/ppc_recomp.45
  __attribute__((alias("__imp__sub_82684CBC"))) PPC_WEAK_FUNC(sub_82684CBC);
  PPC_FUNC_IMPL(__imp__sub_82684CBC) {
 @@ -7839,8 +7840,14 @@
- 	simde_mm_store_si128((simde__m128i*)ctx.v0.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + (temp.u32 & ~0xF))), simde_mm_load_si128((simde__m128i*)&VectorMaskL[(temp.u32 & 0xF) * 16])));
+ 	simde_mm_store_si128((simde__m128i*)ctx.v0.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(PPC_HOST((temp.u32 & ~0xF)))), simde_mm_load_si128((simde__m128i*)&VectorMaskL[(temp.u32 & 0xF) * 16])));
  	// vsplth v0,v0,0
  	simde_mm_store_si128((simde__m128i*)ctx.v0.u16, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)ctx.v0.u16), simde_mm_set1_epi16(short(0xF0E))));
 -	// vupkd3d128 v0,v0,20
@@ -8300,7 +8371,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.452.cpp output/ppc_recomp.45
  	ea = (ctx.r10.u32) & ~0x3;
  	PPC_STORE_U32(ea, ctx.v0.u32[3 - ((ea & 0xF) >> 2)]);
 @@ -7931,8 +7938,14 @@
- 	simde_mm_store_si128((simde__m128i*)ctx.v0.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + (temp.u32 & ~0xF))), simde_mm_load_si128((simde__m128i*)&VectorMaskL[(temp.u32 & 0xF) * 16])));
+ 	simde_mm_store_si128((simde__m128i*)ctx.v0.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(PPC_HOST((temp.u32 & ~0xF)))), simde_mm_load_si128((simde__m128i*)&VectorMaskL[(temp.u32 & 0xF) * 16])));
  	// vsplth v0,v0,0
  	simde_mm_store_si128((simde__m128i*)ctx.v0.u16, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)ctx.v0.u16), simde_mm_set1_epi16(short(0xF0E))));
 -	// vupkd3d128 v0,v0,20
@@ -8326,8 +8397,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.452.cpp output/ppc_recomp.45
  		goto loc_8268C1E0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.453.cpp output/ppc_recomp.453.cpp
---- output_ref/ppc_recomp.453.cpp	2026-05-26 07:04:19.139222300 -0400
-+++ output/ppc_recomp.453.cpp	2026-06-11 01:33:16.865309900 -0400
+--- output_ref/ppc_recomp.453.cpp	2026-10-07 12:28:12.574365800 -0400
++++ output/ppc_recomp.453.cpp	2026-10-07 12:28:11.187659700 -0400
 @@ -8593,7 +8593,7 @@
  	// nop 
  	// nop 
@@ -8345,7 +8416,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.453.cpp output/ppc_recomp.45
 +	// compile, longjmp out (abort this compile) instead of returning and falling off a caller that
 +	// never restores its callee-saved regs. r4 = assert/error code. No-op outside compiles.
 +	{ static int _asrt=0; if(++_asrt<=16){ uint32_t m=ctx.r5.u32; char buf[121]; buf[0]=0;
-+	  if(m>=0x82000000u && m<0xF0000000u){ const char* s=(const char*)(base+m); int j=0;
++	  if(m>=0x82000000u && m<0xF0000000u){ const char* s=(const char*)PPC_HOST(m); int j=0;
 +	    for(;j<120;j++){ char c=s[j]; if(!c)break; buf[j]=(c>=32&&c<127)?c:'.'; } buf[j]=0; }
 +	  printf("[ASSERT #%d] code=%u caller=0x%08X obj=0x%08X r5=0x%08X r6=0x%08X msg=\"%s\"\n",
 +	    _asrt, ctx.r4.u32, (uint32_t)ctx.lr, ctx.r3.u32, ctx.r5.u32, ctx.r6.u32, buf); fflush(stdout); }}
@@ -8424,8 +8495,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.453.cpp output/ppc_recomp.45
  	ctx.r11.u64 = ctx.r3.u32 & 0xFF;
  	ctx.cr0.compare<int32_t>(ctx.r11.s32, 0, ctx.xer);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.454.cpp output/ppc_recomp.454.cpp
---- output_ref/ppc_recomp.454.cpp	2026-05-26 07:04:19.158872100 -0400
-+++ output/ppc_recomp.454.cpp	2026-06-11 01:27:42.033438200 -0400
+--- output_ref/ppc_recomp.454.cpp	2026-10-07 12:28:06.144321300 -0400
++++ output/ppc_recomp.454.cpp	2026-10-07 12:28:11.192657700 -0400
 @@ -4,6 +4,8 @@
  PPC_FUNC_IMPL(__imp__sub_82693508) {
  	PPC_FUNC_PROLOGUE();
@@ -8526,8 +8597,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.454.cpp output/ppc_recomp.45
  		goto loc_8269DB90;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.456.cpp output/ppc_recomp.456.cpp
---- output_ref/ppc_recomp.456.cpp	2026-05-26 07:04:19.177643000 -0400
-+++ output/ppc_recomp.456.cpp	2026-05-29 21:03:40.056602900 -0400
+--- output_ref/ppc_recomp.456.cpp	2026-10-07 12:28:07.300956300 -0400
++++ output/ppc_recomp.456.cpp	2026-10-07 12:28:08.203324600 -0400
 @@ -5011,7 +5011,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8565,8 +8636,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.456.cpp output/ppc_recomp.45
  		// ERROR: 0x826AA860
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.457.cpp output/ppc_recomp.457.cpp
---- output_ref/ppc_recomp.457.cpp	2026-05-26 07:04:19.188641700 -0400
-+++ output/ppc_recomp.457.cpp	2026-06-14 23:28:34.880642900 -0400
+--- output_ref/ppc_recomp.457.cpp	2026-10-07 12:28:07.301954300 -0400
++++ output/ppc_recomp.457.cpp	2026-10-07 12:28:11.259254600 -0400
 @@ -2267,6 +2267,7 @@
  	PPC_STORE_U32(ea, ctx.r1.u32);
  	ctx.r1.u32 = ea;
@@ -8621,8 +8692,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.457.cpp output/ppc_recomp.45
  		goto loc_826B1780;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.459.cpp output/ppc_recomp.459.cpp
---- output_ref/ppc_recomp.459.cpp	2026-05-26 07:04:19.198664300 -0400
-+++ output/ppc_recomp.459.cpp	2026-06-14 23:15:33.857117500 -0400
+--- output_ref/ppc_recomp.459.cpp	2026-10-07 12:28:05.979393600 -0400
++++ output/ppc_recomp.459.cpp	2026-10-07 12:28:11.270307100 -0400
 @@ -4999,6 +4999,7 @@
  	ctx.r1.u32 = ea;
  	// mr r31,r3
@@ -8640,8 +8711,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.459.cpp output/ppc_recomp.45
  	ctx.r1.s64 = ctx.r1.s64 + 112;
  	// b 0x8250f28c
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.461.cpp output/ppc_recomp.461.cpp
---- output_ref/ppc_recomp.461.cpp	2026-05-26 07:04:19.229664500 -0400
-+++ output/ppc_recomp.461.cpp	2026-06-15 11:14:46.419254900 -0400
+--- output_ref/ppc_recomp.461.cpp	2026-10-07 12:28:07.336242500 -0400
++++ output/ppc_recomp.461.cpp	2026-10-07 12:28:11.223669000 -0400
 @@ -175,6 +175,16 @@
  loc_826C0D44:
  	// lwz r11,0(r10)
@@ -8758,8 +8829,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.461.cpp output/ppc_recomp.46
  	ctx.r10.u64 = ctx.r11.u32 & 0x1;
  	ctx.cr0.compare<int32_t>(ctx.r10.s32, 0, ctx.xer);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.462.cpp output/ppc_recomp.462.cpp
---- output_ref/ppc_recomp.462.cpp	2026-05-26 07:04:19.246664700 -0400
-+++ output/ppc_recomp.462.cpp	2026-05-31 19:27:19.061722900 -0400
+--- output_ref/ppc_recomp.462.cpp	2026-10-07 12:28:05.833175600 -0400
++++ output/ppc_recomp.462.cpp	2026-10-07 12:28:07.780348400 -0400
 @@ -20480,6 +20480,7 @@
  	ea = -96 + ctx.r1.u32;
  	PPC_STORE_U32(ea, ctx.r1.u32);
@@ -8769,8 +8840,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.462.cpp output/ppc_recomp.46
  	ctx.r11.s64 = ctx.r3.s64 + 764;
  	// cmplwi cr6,r4,132
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.463.cpp output/ppc_recomp.463.cpp
---- output_ref/ppc_recomp.463.cpp	2026-05-26 07:04:19.265664500 -0400
-+++ output/ppc_recomp.463.cpp	2026-06-11 00:48:30.590880900 -0400
+--- output_ref/ppc_recomp.463.cpp	2026-10-07 12:28:07.519074600 -0400
++++ output/ppc_recomp.463.cpp	2026-10-07 12:28:11.197638300 -0400
 @@ -15573,7 +15573,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8816,8 +8887,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.463.cpp output/ppc_recomp.46
  	ctx.cr0.compare<uint32_t>(ctx.r31.u32, 0, ctx.xer);
  	// beq 0x826e31e8
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.466.cpp output/ppc_recomp.466.cpp
---- output_ref/ppc_recomp.466.cpp	2026-05-26 07:04:19.316601400 -0400
-+++ output/ppc_recomp.466.cpp	2026-06-10 22:50:29.599072700 -0400
+--- output_ref/ppc_recomp.466.cpp	2026-10-07 12:28:06.823124400 -0400
++++ output/ppc_recomp.466.cpp	2026-10-07 12:28:11.232701200 -0400
 @@ -345,6 +345,10 @@
  	ctx.cr6.compare<uint32_t>(ctx.r10.u32, 65535, ctx.xer);
  	// ble cr6,0x826f9370
@@ -8830,8 +8901,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.466.cpp output/ppc_recomp.46
  	ctx.r4.s64 = 3528;
  	// b 0x82692af8
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.467.cpp output/ppc_recomp.467.cpp
---- output_ref/ppc_recomp.467.cpp	2026-05-26 07:04:19.367861000 -0400
-+++ output/ppc_recomp.467.cpp	2026-05-29 21:03:40.082552800 -0400
+--- output_ref/ppc_recomp.467.cpp	2026-10-07 12:28:07.569877300 -0400
++++ output/ppc_recomp.467.cpp	2026-10-07 12:28:08.209593900 -0400
 @@ -12772,7 +12772,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -8842,8 +8913,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.467.cpp output/ppc_recomp.46
  		goto loc_827065A4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.468.cpp output/ppc_recomp.468.cpp
---- output_ref/ppc_recomp.468.cpp	2026-05-26 07:04:19.415929400 -0400
-+++ output/ppc_recomp.468.cpp	2026-06-15 12:32:24.396311100 -0400
+--- output_ref/ppc_recomp.468.cpp	2026-10-07 12:28:07.174222500 -0400
++++ output/ppc_recomp.468.cpp	2026-10-07 12:28:11.200642800 -0400
 @@ -1,5 +1,8 @@
  #include "ppc_recomp_shared.h"
  
@@ -9417,8 +9488,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.468.cpp output/ppc_recomp.46
  	ctx.r3.s64 = ctx.r31.s64 + 924;
  	// bl 0x82692d88
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.469.cpp output/ppc_recomp.469.cpp
---- output_ref/ppc_recomp.469.cpp	2026-05-26 07:04:19.422908900 -0400
-+++ output/ppc_recomp.469.cpp	2026-06-14 23:23:19.163989700 -0400
+--- output_ref/ppc_recomp.469.cpp	2026-10-07 12:28:07.456441000 -0400
++++ output/ppc_recomp.469.cpp	2026-10-07 12:28:11.237229200 -0400
 @@ -2989,6 +2989,37 @@
  	ctx.r1.u32 = ea;
  	// mr r27,r3
@@ -9522,7 +9593,7 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.469.cpp output/ppc_recomp.46
  	// bl 0x8276b330
  	ctx.lr = 0x827294D8;
  	sub_8276B330(ctx, base);
-+	{ static int _a3523=0; if(++_a3523<=8){ const char* m=(const char*)(base+ctx.r1.u32+208);
++	{ static int _a3523=0; if(++_a3523<=8){ const char* m=(const char*)PPC_HOST(ctx.r1.u32+208);
 +	  char buf[101]; int j=0; for(;j<100;j++){ char c=m[j]; if(!c)break; buf[j]=(c>=32&&c<127)?c:'.'; } buf[j]=0;
 +	  printf("[A3523 #%d] tblcnt=%u tbl=0x%08X bind=0x%08X r19=0x%08X r20=0x%08X msg=\"%s\"\n",
 +	    _a3523, ctx.r29.u32, ctx.r23.u32, ctx.r21.u32, ctx.r19.u32, ctx.r20.u32, buf); fflush(stdout); }}
@@ -9539,8 +9610,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.469.cpp output/ppc_recomp.46
  		goto loc_8272A0A0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.473.cpp output/ppc_recomp.473.cpp
---- output_ref/ppc_recomp.473.cpp	2026-05-26 07:04:19.491617100 -0400
-+++ output/ppc_recomp.473.cpp	2026-06-02 05:07:33.584947800 -0400
+--- output_ref/ppc_recomp.473.cpp	2026-10-07 12:28:06.825640400 -0400
++++ output/ppc_recomp.473.cpp	2026-10-07 12:28:11.244223900 -0400
 @@ -2913,7 +2913,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -9704,8 +9775,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.473.cpp output/ppc_recomp.47
  		// ERROR: 0x8274D44C
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.474.cpp output/ppc_recomp.474.cpp
---- output_ref/ppc_recomp.474.cpp	2026-05-26 07:04:19.523627400 -0400
-+++ output/ppc_recomp.474.cpp	2026-05-29 21:03:40.116659400 -0400
+--- output_ref/ppc_recomp.474.cpp	2026-10-07 12:28:07.527585000 -0400
++++ output/ppc_recomp.474.cpp	2026-10-07 12:28:08.211591900 -0400
 @@ -17370,7 +17370,7 @@
  	// nop 
  	// nop 
@@ -9725,8 +9796,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.474.cpp output/ppc_recomp.47
  		goto loc_827587C0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.475.cpp output/ppc_recomp.475.cpp
---- output_ref/ppc_recomp.475.cpp	2026-05-26 07:04:19.537627500 -0400
-+++ output/ppc_recomp.475.cpp	2026-05-29 21:03:40.127576500 -0400
+--- output_ref/ppc_recomp.475.cpp	2026-10-07 12:28:05.980391200 -0400
++++ output/ppc_recomp.475.cpp	2026-10-07 12:28:08.213592300 -0400
 @@ -3654,7 +3654,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -9746,8 +9817,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.475.cpp output/ppc_recomp.47
  		goto loc_827647B4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.476.cpp output/ppc_recomp.476.cpp
---- output_ref/ppc_recomp.476.cpp	2026-05-26 07:04:19.563627500 -0400
-+++ output/ppc_recomp.476.cpp	2026-06-15 10:06:15.403373700 -0400
+--- output_ref/ppc_recomp.476.cpp	2026-10-07 12:28:05.982392500 -0400
++++ output/ppc_recomp.476.cpp	2026-10-07 12:28:11.249740300 -0400
 @@ -3758,6 +3758,7 @@
  	// bl 0x829eb820
  	ctx.lr = 0x8276C600;
@@ -10072,8 +10143,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.476.cpp output/ppc_recomp.47
  	ctx.r10.s64 = ctx.r11.s64 + 8;
  loc_82779684:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.479.cpp output/ppc_recomp.479.cpp
---- output_ref/ppc_recomp.479.cpp	2026-05-26 07:04:19.630959200 -0400
-+++ output/ppc_recomp.479.cpp	2026-05-29 21:03:40.140950300 -0400
+--- output_ref/ppc_recomp.479.cpp	2026-10-07 12:28:07.337249400 -0400
++++ output/ppc_recomp.479.cpp	2026-10-07 12:28:08.215098900 -0400
 @@ -8919,7 +8919,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -10084,8 +10155,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.479.cpp output/ppc_recomp.47
  		goto loc_82792398;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.48.cpp output/ppc_recomp.48.cpp
---- output_ref/ppc_recomp.48.cpp	2026-05-26 07:04:16.414338100 -0400
-+++ output/ppc_recomp.48.cpp	2026-05-29 21:03:40.142953600 -0400
+--- output_ref/ppc_recomp.48.cpp	2026-10-07 12:28:07.027912400 -0400
++++ output/ppc_recomp.48.cpp	2026-10-07 12:28:08.217108100 -0400
 @@ -2634,7 +2634,7 @@
  	// nop 
  	// nop 
@@ -10096,8 +10167,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.48.cpp output/ppc_recomp.48.
  		goto loc_82151540;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.480.cpp output/ppc_recomp.480.cpp
---- output_ref/ppc_recomp.480.cpp	2026-05-26 07:04:19.645959600 -0400
-+++ output/ppc_recomp.480.cpp	2026-05-29 21:03:40.142953600 -0400
+--- output_ref/ppc_recomp.480.cpp	2026-10-07 12:28:05.983391900 -0400
++++ output/ppc_recomp.480.cpp	2026-10-07 12:28:07.814372900 -0400
 @@ -23309,7 +23309,7 @@
  	// nop 
  	// nop 
@@ -10108,8 +10179,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.480.cpp output/ppc_recomp.48
  		goto loc_8279CDFC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.484.cpp output/ppc_recomp.484.cpp
---- output_ref/ppc_recomp.484.cpp	2026-05-26 07:04:19.690959400 -0400
-+++ output/ppc_recomp.484.cpp	2026-05-29 21:03:40.158458700 -0400
+--- output_ref/ppc_recomp.484.cpp	2026-10-07 12:28:07.609147200 -0400
++++ output/ppc_recomp.484.cpp	2026-10-07 12:28:11.186658900 -0400
 @@ -3233,7 +3233,7 @@
  	// nop 
  	// nop 
@@ -10210,8 +10281,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.484.cpp output/ppc_recomp.48
  		// ERROR: 0x827B43B4
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.485.cpp output/ppc_recomp.485.cpp
---- output_ref/ppc_recomp.485.cpp	2026-05-26 07:04:19.702959700 -0400
-+++ output/ppc_recomp.485.cpp	2026-05-29 21:03:40.160295400 -0400
+--- output_ref/ppc_recomp.485.cpp	2026-10-07 12:28:12.614533800 -0400
++++ output/ppc_recomp.485.cpp	2026-10-07 12:28:08.219115800 -0400
 @@ -1062,7 +1062,7 @@
  	// nop 
  	// nop 
@@ -10240,8 +10311,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.485.cpp output/ppc_recomp.48
  		goto loc_827B82F8;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.490.cpp output/ppc_recomp.490.cpp
---- output_ref/ppc_recomp.490.cpp	2026-05-26 07:04:19.746942100 -0400
-+++ output/ppc_recomp.490.cpp	2026-05-29 21:03:40.171181200 -0400
+--- output_ref/ppc_recomp.490.cpp	2026-10-07 12:28:07.440626800 -0400
++++ output/ppc_recomp.490.cpp	2026-10-07 12:28:07.815875200 -0400
 @@ -6343,7 +6343,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -10270,8 +10341,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.490.cpp output/ppc_recomp.49
  		// ERROR: 0x827D4518
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.491.cpp output/ppc_recomp.491.cpp
---- output_ref/ppc_recomp.491.cpp	2026-05-26 07:04:19.751959300 -0400
-+++ output/ppc_recomp.491.cpp	2026-05-29 21:03:40.176481300 -0400
+--- output_ref/ppc_recomp.491.cpp	2026-10-07 12:28:07.647998300 -0400
++++ output/ppc_recomp.491.cpp	2026-10-07 12:28:08.222117600 -0400
 @@ -2487,7 +2487,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -10282,8 +10353,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.491.cpp output/ppc_recomp.49
  		goto loc_827D61DC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.492.cpp output/ppc_recomp.492.cpp
---- output_ref/ppc_recomp.492.cpp	2026-05-26 07:04:19.758960400 -0400
-+++ output/ppc_recomp.492.cpp	2026-10-06 01:42:37.326960300 -0400
+--- output_ref/ppc_recomp.492.cpp	2026-10-07 12:28:12.627239700 -0400
++++ output/ppc_recomp.492.cpp	2026-10-07 12:28:11.151108900 -0400
 @@ -7241,8 +7241,10 @@
  }
  
@@ -10371,8 +10442,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.492.cpp output/ppc_recomp.49
  	ctx.r11.s64 = 2146041856;
  	// lis r10,-31967
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.493.cpp output/ppc_recomp.493.cpp
---- output_ref/ppc_recomp.493.cpp	2026-05-26 07:04:19.798259800 -0400
-+++ output/ppc_recomp.493.cpp	2026-10-06 16:26:56.636868900 -0400
+--- output_ref/ppc_recomp.493.cpp	2026-10-07 12:28:12.631237900 -0400
++++ output/ppc_recomp.493.cpp	2026-10-07 12:28:08.224115100 -0400
 @@ -1,4 +1,5 @@
  #include "ppc_recomp_shared.h"
 +extern "C" uint64_t lsw_guest_timebase(void);   // mftb: 360 timebase rate (kernel_stubs.cpp)
@@ -10469,8 +10540,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.493.cpp output/ppc_recomp.49
  	// lwz r11,0(r7)
  	ctx.r11.u64 = PPC_LOAD_U32(ctx.r7.u32 + 0);
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.496.cpp output/ppc_recomp.496.cpp
---- output_ref/ppc_recomp.496.cpp	2026-05-26 07:04:19.827501900 -0400
-+++ output/ppc_recomp.496.cpp	2026-05-29 21:03:40.186479400 -0400
+--- output_ref/ppc_recomp.496.cpp	2026-10-07 12:28:06.928829500 -0400
++++ output/ppc_recomp.496.cpp	2026-10-07 12:28:08.228164000 -0400
 @@ -11623,7 +11623,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10481,8 +10552,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.496.cpp output/ppc_recomp.49
  		goto loc_827ED13C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.497.cpp output/ppc_recomp.497.cpp
---- output_ref/ppc_recomp.497.cpp	2026-05-26 07:04:19.835505800 -0400
-+++ output/ppc_recomp.497.cpp	2026-10-06 01:00:29.683628400 -0400
+--- output_ref/ppc_recomp.497.cpp	2026-10-07 12:28:12.643747800 -0400
++++ output/ppc_recomp.497.cpp	2026-10-07 12:28:08.230163000 -0400
 @@ -2314,8 +2314,10 @@
  }
  
@@ -10546,8 +10617,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.497.cpp output/ppc_recomp.49
  		// ERROR: 0x827F3EE8
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.498.cpp output/ppc_recomp.498.cpp
---- output_ref/ppc_recomp.498.cpp	2026-05-26 07:04:19.845564300 -0400
-+++ output/ppc_recomp.498.cpp	2026-05-29 21:03:40.202360000 -0400
+--- output_ref/ppc_recomp.498.cpp	2026-10-07 12:28:12.649259300 -0400
++++ output/ppc_recomp.498.cpp	2026-10-07 12:28:08.232164400 -0400
 @@ -1343,7 +1343,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10567,8 +10638,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.498.cpp output/ppc_recomp.49
  		goto loc_827F9378;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.500.cpp output/ppc_recomp.500.cpp
---- output_ref/ppc_recomp.500.cpp	2026-05-26 07:04:19.881562800 -0400
-+++ output/ppc_recomp.500.cpp	2026-05-29 21:03:40.211926800 -0400
+--- output_ref/ppc_recomp.500.cpp	2026-10-07 12:28:07.498174600 -0400
++++ output/ppc_recomp.500.cpp	2026-10-07 12:28:07.817886000 -0400
 @@ -14258,7 +14258,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10579,8 +10650,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.500.cpp output/ppc_recomp.50
  		goto loc_82811C10;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.501.cpp output/ppc_recomp.501.cpp
---- output_ref/ppc_recomp.501.cpp	2026-05-26 07:04:19.888562900 -0400
-+++ output/ppc_recomp.501.cpp	2026-05-29 21:03:40.218231300 -0400
+--- output_ref/ppc_recomp.501.cpp	2026-10-07 12:28:12.670285100 -0400
++++ output/ppc_recomp.501.cpp	2026-10-07 12:28:08.235251400 -0400
 @@ -3215,7 +3215,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10600,8 +10671,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.501.cpp output/ppc_recomp.50
  		goto loc_82816B20;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.503.cpp output/ppc_recomp.503.cpp
---- output_ref/ppc_recomp.503.cpp	2026-05-26 07:04:19.925266400 -0400
-+++ output/ppc_recomp.503.cpp	2026-05-29 21:03:40.224265800 -0400
+--- output_ref/ppc_recomp.503.cpp	2026-10-07 12:28:12.676348600 -0400
++++ output/ppc_recomp.503.cpp	2026-10-07 12:28:08.237261300 -0400
 @@ -7966,7 +7966,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10648,8 +10719,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.503.cpp output/ppc_recomp.50
  		// ERROR: 0x8281F2EC
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.504.cpp output/ppc_recomp.504.cpp
---- output_ref/ppc_recomp.504.cpp	2026-05-26 07:04:19.935254400 -0400
-+++ output/ppc_recomp.504.cpp	2026-05-29 21:03:40.227265600 -0400
+--- output_ref/ppc_recomp.504.cpp	2026-10-07 12:28:12.680348800 -0400
++++ output/ppc_recomp.504.cpp	2026-10-07 12:28:08.238260300 -0400
 @@ -228,7 +228,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10714,8 +10785,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.504.cpp output/ppc_recomp.50
  		goto loc_82825F2C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.505.cpp output/ppc_recomp.505.cpp
---- output_ref/ppc_recomp.505.cpp	2026-05-26 07:04:19.953266400 -0400
-+++ output/ppc_recomp.505.cpp	2026-05-29 21:03:40.227265600 -0400
+--- output_ref/ppc_recomp.505.cpp	2026-10-07 12:28:12.684347800 -0400
++++ output/ppc_recomp.505.cpp	2026-10-07 12:28:08.239259800 -0400
 @@ -18357,7 +18357,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10735,8 +10806,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.505.cpp output/ppc_recomp.50
  		goto loc_8282E8E0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.506.cpp output/ppc_recomp.506.cpp
---- output_ref/ppc_recomp.506.cpp	2026-05-26 07:04:19.989298000 -0400
-+++ output/ppc_recomp.506.cpp	2026-05-29 21:03:40.237576100 -0400
+--- output_ref/ppc_recomp.506.cpp	2026-10-07 12:28:07.262167300 -0400
++++ output/ppc_recomp.506.cpp	2026-10-07 12:28:08.241263900 -0400
 @@ -323,7 +323,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10846,8 +10917,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.506.cpp output/ppc_recomp.50
  		goto loc_828441C4;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.507.cpp output/ppc_recomp.507.cpp
---- output_ref/ppc_recomp.507.cpp	2026-05-26 07:04:20.008312500 -0400
-+++ output/ppc_recomp.507.cpp	2026-05-29 21:03:40.253715600 -0400
+--- output_ref/ppc_recomp.507.cpp	2026-10-07 12:28:07.366811400 -0400
++++ output/ppc_recomp.507.cpp	2026-10-07 12:28:08.242260700 -0400
 @@ -16049,7 +16049,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -10867,8 +10938,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.507.cpp output/ppc_recomp.50
  		goto loc_8284DD30;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.508.cpp output/ppc_recomp.508.cpp
---- output_ref/ppc_recomp.508.cpp	2026-05-26 07:04:20.066345500 -0400
-+++ output/ppc_recomp.508.cpp	2026-05-29 21:03:40.265861200 -0400
+--- output_ref/ppc_recomp.508.cpp	2026-10-07 12:28:07.053467000 -0400
++++ output/ppc_recomp.508.cpp	2026-10-07 12:28:08.244260400 -0400
 @@ -7252,7 +7252,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11014,8 +11085,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.508.cpp output/ppc_recomp.50
  		// ERROR: 0x8285F770
  		return;
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.509.cpp output/ppc_recomp.509.cpp
---- output_ref/ppc_recomp.509.cpp	2026-05-26 07:04:20.099994600 -0400
-+++ output/ppc_recomp.509.cpp	2026-05-29 21:03:40.272327500 -0400
+--- output_ref/ppc_recomp.509.cpp	2026-10-07 12:28:12.699367500 -0400
++++ output/ppc_recomp.509.cpp	2026-10-07 12:28:11.112427200 -0400
 @@ -43192,7 +43192,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11034,8 +11105,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.509.cpp output/ppc_recomp.50
  	ctx.r1.s64 = ctx.r1.s64 + 1104;
  	// lwz r12,-8(r1)
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.510.cpp output/ppc_recomp.510.cpp
---- output_ref/ppc_recomp.510.cpp	2026-05-26 07:04:20.171035300 -0400
-+++ output/ppc_recomp.510.cpp	2026-05-29 21:03:40.276327000 -0400
+--- output_ref/ppc_recomp.510.cpp	2026-10-07 12:28:12.725549100 -0400
++++ output/ppc_recomp.510.cpp	2026-10-07 12:28:07.820883400 -0400
 @@ -89816,7 +89816,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11055,8 +11126,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.510.cpp output/ppc_recomp.51
  		goto loc_8289D498;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.511.cpp output/ppc_recomp.511.cpp
---- output_ref/ppc_recomp.511.cpp	2026-05-26 07:04:20.233434000 -0400
-+++ output/ppc_recomp.511.cpp	2026-05-29 21:03:40.287459700 -0400
+--- output_ref/ppc_recomp.511.cpp	2026-10-07 12:28:12.743075100 -0400
++++ output/ppc_recomp.511.cpp	2026-10-07 12:28:08.247293700 -0400
 @@ -31228,7 +31228,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11094,8 +11165,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.511.cpp output/ppc_recomp.51
  		goto loc_828BB03C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.512.cpp output/ppc_recomp.512.cpp
---- output_ref/ppc_recomp.512.cpp	2026-05-26 07:04:20.306698200 -0400
-+++ output/ppc_recomp.512.cpp	2026-05-29 21:03:40.296989100 -0400
+--- output_ref/ppc_recomp.512.cpp	2026-10-07 12:28:12.767443800 -0400
++++ output/ppc_recomp.512.cpp	2026-10-07 12:28:08.250289600 -0400
 @@ -58773,7 +58773,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11151,8 +11222,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.512.cpp output/ppc_recomp.51
  		goto loc_828E6A00;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.514.cpp output/ppc_recomp.514.cpp
---- output_ref/ppc_recomp.514.cpp	2026-05-26 07:04:20.426966300 -0400
-+++ output/ppc_recomp.514.cpp	2026-05-29 21:03:40.302619800 -0400
+--- output_ref/ppc_recomp.514.cpp	2026-10-07 12:28:12.803040200 -0400
++++ output/ppc_recomp.514.cpp	2026-10-07 12:28:08.254293900 -0400
 @@ -52627,7 +52627,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11172,8 +11243,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.514.cpp output/ppc_recomp.51
  		goto loc_8291F43C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.515.cpp output/ppc_recomp.515.cpp
---- output_ref/ppc_recomp.515.cpp	2026-05-26 07:04:20.450007800 -0400
-+++ output/ppc_recomp.515.cpp	2026-05-29 21:03:40.308618300 -0400
+--- output_ref/ppc_recomp.515.cpp	2026-10-07 12:28:07.067184900 -0400
++++ output/ppc_recomp.515.cpp	2026-10-07 12:28:08.255291800 -0400
 @@ -28730,7 +28730,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11184,8 +11255,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.515.cpp output/ppc_recomp.51
  		goto loc_8293087C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.517.cpp output/ppc_recomp.517.cpp
---- output_ref/ppc_recomp.517.cpp	2026-05-26 07:04:20.580022300 -0400
-+++ output/ppc_recomp.517.cpp	2026-05-29 21:03:40.309617900 -0400
+--- output_ref/ppc_recomp.517.cpp	2026-10-07 12:28:12.852357600 -0400
++++ output/ppc_recomp.517.cpp	2026-10-07 12:28:08.261534300 -0400
 @@ -22569,7 +22569,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11214,8 +11285,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.517.cpp output/ppc_recomp.51
  		goto loc_82974F40;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.518.cpp output/ppc_recomp.518.cpp
---- output_ref/ppc_recomp.518.cpp	2026-05-26 07:04:20.637022600 -0400
-+++ output/ppc_recomp.518.cpp	2026-05-29 21:03:40.322429700 -0400
+--- output_ref/ppc_recomp.518.cpp	2026-10-07 12:28:12.868537000 -0400
++++ output/ppc_recomp.518.cpp	2026-10-07 12:28:08.263535700 -0400
 @@ -4675,7 +4675,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11334,8 +11405,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.518.cpp output/ppc_recomp.51
  		goto loc_82995A9C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.519.cpp output/ppc_recomp.519.cpp
---- output_ref/ppc_recomp.519.cpp	2026-05-26 07:04:20.684275900 -0400
-+++ output/ppc_recomp.519.cpp	2026-05-29 21:03:40.326894800 -0400
+--- output_ref/ppc_recomp.519.cpp	2026-10-07 12:28:06.353244800 -0400
++++ output/ppc_recomp.519.cpp	2026-10-07 12:28:11.113426700 -0400
 @@ -10118,7 +10118,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11364,8 +11435,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.519.cpp output/ppc_recomp.51
  		goto loc_829A545C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.520.cpp output/ppc_recomp.520.cpp
---- output_ref/ppc_recomp.520.cpp	2026-05-26 07:04:20.704993500 -0400
-+++ output/ppc_recomp.520.cpp	2026-05-29 21:03:40.336761300 -0400
+--- output_ref/ppc_recomp.520.cpp	2026-10-07 12:28:12.878044200 -0400
++++ output/ppc_recomp.520.cpp	2026-10-07 12:28:07.821884200 -0400
 @@ -6725,7 +6725,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11394,8 +11465,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.520.cpp output/ppc_recomp.52
  		goto loc_829B1634;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.521.cpp output/ppc_recomp.521.cpp
---- output_ref/ppc_recomp.521.cpp	2026-05-26 07:04:20.716970100 -0400
-+++ output/ppc_recomp.521.cpp	2026-05-29 21:03:40.342763400 -0400
+--- output_ref/ppc_recomp.521.cpp	2026-10-07 12:28:12.882045200 -0400
++++ output/ppc_recomp.521.cpp	2026-10-07 12:28:08.265044300 -0400
 @@ -1499,7 +1499,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -11415,8 +11486,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.521.cpp output/ppc_recomp.52
  		goto loc_829BAE04;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.524.cpp output/ppc_recomp.524.cpp
---- output_ref/ppc_recomp.524.cpp	2026-05-26 07:04:20.744972600 -0400
-+++ output/ppc_recomp.524.cpp	2026-05-29 21:03:40.351126600 -0400
+--- output_ref/ppc_recomp.524.cpp	2026-10-07 12:28:12.890562300 -0400
++++ output/ppc_recomp.524.cpp	2026-10-07 12:28:08.268052200 -0400
 @@ -14511,7 +14511,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -11427,8 +11498,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.524.cpp output/ppc_recomp.52
  		goto loc_829CB434;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.525.cpp output/ppc_recomp.525.cpp
---- output_ref/ppc_recomp.525.cpp	2026-05-26 07:04:20.750973000 -0400
-+++ output/ppc_recomp.525.cpp	2026-05-29 21:03:40.352127500 -0400
+--- output_ref/ppc_recomp.525.cpp	2026-10-07 12:28:12.892559300 -0400
++++ output/ppc_recomp.525.cpp	2026-10-07 12:28:08.268052200 -0400
 @@ -2185,7 +2185,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -11448,8 +11519,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.525.cpp output/ppc_recomp.52
  		goto loc_829D005C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.527.cpp output/ppc_recomp.527.cpp
---- output_ref/ppc_recomp.527.cpp	2026-05-26 07:04:20.766973200 -0400
-+++ output/ppc_recomp.527.cpp	2026-05-29 21:03:40.363579400 -0400
+--- output_ref/ppc_recomp.527.cpp	2026-10-07 12:28:12.898070500 -0400
++++ output/ppc_recomp.527.cpp	2026-10-07 12:28:08.271051400 -0400
 @@ -310,7 +310,7 @@
  	// nop 
  	// nop 
@@ -11478,8 +11549,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.527.cpp output/ppc_recomp.52
  		goto loc_829D2850;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.532.cpp output/ppc_recomp.532.cpp
---- output_ref/ppc_recomp.532.cpp	2026-05-26 07:04:20.826508500 -0400
-+++ output/ppc_recomp.532.cpp	2026-05-29 21:03:40.368786200 -0400
+--- output_ref/ppc_recomp.532.cpp	2026-10-07 12:28:12.919091600 -0400
++++ output/ppc_recomp.532.cpp	2026-10-07 12:28:11.114429100 -0400
 @@ -4504,7 +4504,7 @@
  	// nop 
  	// nop 
@@ -11507,8 +11578,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.532.cpp output/ppc_recomp.53
  		goto loc_829F2E74;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.534.cpp output/ppc_recomp.534.cpp
---- output_ref/ppc_recomp.534.cpp	2026-05-26 07:04:20.871518500 -0400
-+++ output/ppc_recomp.534.cpp	2026-05-29 21:03:40.376330900 -0400
+--- output_ref/ppc_recomp.534.cpp	2026-10-07 12:28:07.268269900 -0400
++++ output/ppc_recomp.534.cpp	2026-10-07 12:28:08.277573800 -0400
 @@ -6458,7 +6458,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11564,8 +11635,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.534.cpp output/ppc_recomp.53
  		goto loc_82A0D404;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.535.cpp output/ppc_recomp.535.cpp
---- output_ref/ppc_recomp.535.cpp	2026-05-26 07:04:20.967797000 -0400
-+++ output/ppc_recomp.535.cpp	2026-05-29 21:03:40.383336200 -0400
+--- output_ref/ppc_recomp.535.cpp	2026-10-07 12:28:07.343245000 -0400
++++ output/ppc_recomp.535.cpp	2026-10-07 12:28:08.280571100 -0400
 @@ -11439,7 +11439,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11621,8 +11692,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.535.cpp output/ppc_recomp.53
  		goto loc_82A19350;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.536.cpp output/ppc_recomp.536.cpp
---- output_ref/ppc_recomp.536.cpp	2026-05-26 07:04:21.046435300 -0400
-+++ output/ppc_recomp.536.cpp	2026-05-29 21:03:40.389944100 -0400
+--- output_ref/ppc_recomp.536.cpp	2026-10-07 12:28:12.939120300 -0400
++++ output/ppc_recomp.536.cpp	2026-10-07 12:28:08.282570000 -0400
 @@ -48601,7 +48601,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11651,8 +11722,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.536.cpp output/ppc_recomp.53
  		goto loc_82A591AC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.537.cpp output/ppc_recomp.537.cpp
---- output_ref/ppc_recomp.537.cpp	2026-05-26 07:04:21.064425800 -0400
-+++ output/ppc_recomp.537.cpp	2026-05-29 21:03:40.393946500 -0400
+--- output_ref/ppc_recomp.537.cpp	2026-10-07 12:28:07.548279100 -0400
++++ output/ppc_recomp.537.cpp	2026-10-07 12:28:08.283576100 -0400
 @@ -7089,7 +7089,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11663,8 +11734,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.537.cpp output/ppc_recomp.53
  		goto loc_82A62704;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.538.cpp output/ppc_recomp.538.cpp
---- output_ref/ppc_recomp.538.cpp	2026-05-26 07:04:21.148517100 -0400
-+++ output/ppc_recomp.538.cpp	2026-05-29 21:03:40.405014900 -0400
+--- output_ref/ppc_recomp.538.cpp	2026-10-07 12:28:12.967362000 -0400
++++ output/ppc_recomp.538.cpp	2026-10-07 12:28:08.286087000 -0400
 @@ -91203,7 +91203,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11675,8 +11746,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.538.cpp output/ppc_recomp.53
  		goto loc_82A943E0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.539.cpp output/ppc_recomp.539.cpp
---- output_ref/ppc_recomp.539.cpp	2026-05-26 07:04:21.173517000 -0400
-+++ output/ppc_recomp.539.cpp	2026-05-29 21:03:40.419324900 -0400
+--- output_ref/ppc_recomp.539.cpp	2026-10-07 12:28:12.981413300 -0400
++++ output/ppc_recomp.539.cpp	2026-10-07 12:28:08.287089200 -0400
 @@ -18994,7 +18994,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11714,8 +11785,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.539.cpp output/ppc_recomp.53
  		goto loc_82AA1CFC;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.540.cpp output/ppc_recomp.540.cpp
---- output_ref/ppc_recomp.540.cpp	2026-05-26 07:04:21.206058100 -0400
-+++ output/ppc_recomp.540.cpp	2026-05-29 21:03:40.426325000 -0400
+--- output_ref/ppc_recomp.540.cpp	2026-10-07 12:28:06.685449100 -0400
++++ output/ppc_recomp.540.cpp	2026-10-07 12:28:07.823884900 -0400
 @@ -24124,7 +24124,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11780,8 +11851,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.540.cpp output/ppc_recomp.54
  		goto loc_82AB6858;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.541.cpp output/ppc_recomp.541.cpp
---- output_ref/ppc_recomp.541.cpp	2026-05-26 07:04:21.244091400 -0400
-+++ output/ppc_recomp.541.cpp	2026-05-29 21:03:40.426325000 -0400
+--- output_ref/ppc_recomp.541.cpp	2026-10-07 12:28:13.001016400 -0400
++++ output/ppc_recomp.541.cpp	2026-10-07 12:28:08.290087700 -0400
 @@ -5031,7 +5031,7 @@
  	// mtctr r0
  	ctx.ctr.u64 = ctx.r0.u64;
@@ -11792,8 +11863,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.541.cpp output/ppc_recomp.54
  		goto loc_82ABCDB0;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp.98.cpp output/ppc_recomp.98.cpp
---- output_ref/ppc_recomp.98.cpp	2026-05-26 07:04:16.561338300 -0400
-+++ output/ppc_recomp.98.cpp	2026-05-29 21:03:40.437597200 -0400
+--- output_ref/ppc_recomp.98.cpp	2026-10-07 12:28:06.498227500 -0400
++++ output/ppc_recomp.98.cpp	2026-10-07 12:28:08.720137900 -0400
 @@ -3037,7 +3037,7 @@
  	ctx.ctr.u64 = ctx.r12.u64;
  	// nop 
@@ -11804,8 +11875,8 @@ diff -ruN --strip-trailing-cr output_ref/ppc_recomp.98.cpp output/ppc_recomp.98.
  		goto loc_8218C04C;
  	case 1:
 diff -ruN --strip-trailing-cr output_ref/ppc_recomp_shared.h output/ppc_recomp_shared.h
---- output_ref/ppc_recomp_shared.h	2026-05-26 07:04:15.959881500 -0400
-+++ output/ppc_recomp_shared.h	2026-10-04 17:10:53.540613000 -0400
+--- output_ref/ppc_recomp_shared.h	2026-10-07 12:28:07.493659000 -0400
++++ output/ppc_recomp_shared.h	2026-10-07 12:28:11.216668900 -0400
 @@ -2,6 +2,11 @@
  
  #include "ppc_config.h"

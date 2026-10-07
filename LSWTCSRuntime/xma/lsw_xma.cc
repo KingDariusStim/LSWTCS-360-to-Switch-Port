@@ -67,7 +67,7 @@ extern "C" int lswtcs_xma_init(uint8_t* base, uint32_t ctx_va) {
     g_xbase = base;
     g_mem = new xe::Memory(base);
     g_first = ctx_va;
-    memset(base + ctx_va, 0, kContextCount * 64);
+    memset(ppc_view_base[ctx_va >> 29] + ctx_va, 0, kContextCount * 64);  // folded (single-view)
     for (uint32_t i = 0; i < kContextCount; ++i) {
         auto* c = new xe::apu::XmaContextNew();
         if (c->Setup(i, g_mem, ctx_va + i * 64)) { dbg_ram("[XMA] context %u setup FAILED\n", i); delete c; continue; }

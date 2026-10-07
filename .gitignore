@@ -12,6 +12,10 @@
 !/ladscan.c
 !/ghidra_scripts/
 !/patches/
+!/switch/
+*.elf
+*.nro
+*.nacp
 
 !/LSWTCSRuntime/
 /LSWTCSRuntime/*

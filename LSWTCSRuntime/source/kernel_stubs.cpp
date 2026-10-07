@@ -28,6 +28,9 @@
 
 // g_base is defined in main.cpp; VdSwap needs it to pass to the GPU renderer.
 extern uint8_t* g_base;
+// Host pointer for a guest address in host-side code: folds the 0xA0000000/0xC0000000 physical views
+// onto 0x80000000 like PPC_HOST() does for generated code (ppc_context.h, LSW_ADDR_FOLD).
+static inline uint8_t* lsw_host(uint32_t a) { return g_base + ppc_fold(a); }
 extern "C" void lswtcs_set_vtable_watch();  // arms the fs-device vtable hardware watchpoint (main.cpp)
 extern "C" void lswtcs_set_pending_shad(const char* hash);  // gpu_d3d12.cpp — harvester hash↔HLSL pairing
 
@@ -272,7 +275,7 @@ static void dbg_ram_do_init() {
             for(;;){
                 if (g_base) {
                     for (int i=0;i<4;i++){
-                        uint32_t v = __builtin_bswap32(*(volatile uint32_t*)(g_base + waddr + offs[i]));
+                        uint32_t v = __builtin_bswap32(*(volatile uint32_t*)(g_base + ppc_fold(waddr + offs[i])));
                         if (!init || v != last[i]) {
                             if (init) dbg_ram("[WATCH] 0x%08X+%d : 0x%08X -> 0x%08X (tgt node 0x%08X)\n",
                                 waddr, offs[i], last[i], v, (v>=0x24 && v<0xF0000000u)?((v&~1u)-36):0);
@@ -306,7 +309,8 @@ extern "C" int      dbg_tinit() { return g_thread_inited; }
 
 // Milliseconds since module load (process start), for timing diagnostics.
 static const unsigned long long g_proc_start_ms = (unsigned long long)GetTickCount64();
-// Guest timebase for mftb (see ppc_recomp_shared.h): QPC scaled to 49.875 MHz, from process start.
+// Guest timebase for mftb (see ppc_recomp_shared.h): QPC scaled to 50 MHz (= KeQueryPerformanceFrequency,
+// Xenia's guest tick rate), from process start.
 // LSWTCS_MFTB_RAW=1 restores the raw x86 TSC.
 extern "C" unsigned long long lswtcs_guest_timebase(void) {
     static int raw = -1; if (raw < 0) { const char* e = getenv("LSWTCS_MFTB_RAW"); raw = (e && e[0] == '1') ? 1 : 0; }
@@ -315,7 +319,7 @@ extern "C" unsigned long long lswtcs_guest_timebase(void) {
     if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     unsigned long long d = (unsigned long long)(t.QuadPart - t0.QuadPart);
-    return (unsigned long long)((__int128)d * 49875000 / f.QuadPart);
+    return (unsigned long long)((__int128)d * 50000000 / f.QuadPart);
 }
 extern "C" unsigned long long _kstub_start_ms() {
     return (unsigned long long)GetTickCount64() - g_proc_start_ms;
@@ -346,7 +350,7 @@ static inline void vclock_advance_quantum() {
     g_vclock_ms.fetch_add((uint64_t)rate, std::memory_order_relaxed);
 }
 
-// Guest timebase (mftb): the 360 timebase runs at 49.875 MHz (= KeQueryPerformanceFrequency). The
+// Guest timebase (mftb): scaled to 50 MHz (= KeQueryPerformanceFrequency; see that stub). The
 // recompiler emitted mftb as __rdtsc(), i.e. host TSC ticks (~2 GHz+ here), so guest code that
 // converts timebase deltas with the 360 frequency ran ~40x fast (the HUD studs' spin angle advanced
 // ~a whole number of turns per frame and looked frozen). Real time, scaled to the 360 rate.
@@ -355,7 +359,7 @@ extern "C" uint64_t lsw_guest_timebase(void) {
     static LARGE_INTEGER t0 = [] { LARGE_INTEGER x; QueryPerformanceCounter(&x); return x; }();
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     uint64_t d = uint64_t(t.QuadPart - t0.QuadPart), q = uint64_t(f.QuadPart);
-    return (d / q) * 49875000ull + ((d % q) * 49875000ull) / q;
+    return (d / q) * 50000000ull + ((d % q) * 50000000ull) / q;
 }
 
 // Called from sub_822AE698's spin loop so the KPRCB tick counter advances in
@@ -1128,7 +1132,7 @@ static uint32_t g_phys_alloc(uint32_t raw_size) {
         auto fl = g_phys_free.find(size);
         if (fl != g_phys_free.end() && !fl->second.empty()) {
             uint32_t a = fl->second.back(); fl->second.pop_back();
-            memset(g_base + a, 0, size);   // fresh physical pages read as zero
+            memset(lsw_host(a), 0, size);   // fresh physical pages read as zero
             g_phys_sizes[a] = size;
             return a;
         }
@@ -1174,10 +1178,10 @@ static void g_phys_free_block(uint32_t addr) {
 extern "C" int lswtcs_d070_advance(uint8_t* base, uint32_t node, uint32_t pre8) {
     static int en = -1; if (en < 0) { const char* e = getenv("LSWTCS_D070PROG"); en = (e && e[0]=='0') ? 0 : 1; }
     if (!en || node < 0xA0000000u || node >= 0xF0000000u) return 0;
-    uint32_t cur = __builtin_bswap32(*(volatile uint32_t*)(base + node + 8));  // guest BE
+    uint32_t cur = __builtin_bswap32(*(volatile uint32_t*)(base + ppc_fold(node + 8)));  // guest BE
     if (cur != pre8) return 0;   // real change happened → let the loop restart (legit fixpoint progress)
     static int _n = 0; if (_n++ < 16) dbg_ram("[D070PROG] node 0x%08X unchanged -> mark done(bit25)+advance\n", node);
-    *(volatile uint32_t*)(base + node + 8) = __builtin_bswap32(cur | 0x02000000u);  // set skip-flag
+    *(volatile uint32_t*)(base + ppc_fold(node + 8)) = __builtin_bswap32(cur | 0x02000000u);  // set skip-flag
     return 1;
 }
 // Allocate and initialize a PCR block for the main (host) thread.
@@ -1188,7 +1192,7 @@ extern "C" uint32_t ppc_alloc_main_thread_pcr() {
     uint8_t* base = g_base;  // PPC_STORE_* macros require a local named 'base'
     uint32_t pcr = g_phys_alloc(0x1000);
     if (pcr) {
-        memset(g_base + pcr, 0, 0x1000);
+        memset(lsw_host(pcr), 0, 0x1000);
         PPC_STORE_U8(pcr + 268, 0);              // cpu_id = 0
         PPC_STORE_U32(pcr + 256, pcr + 0x200);  // PCR+256 → KPRCB at PCR+0x200
         PPC_STORE_U32(pcr + 0x200 + 88, (uint32_t)(lswtcs_now_ms() * 10000ULL));
@@ -1527,7 +1531,7 @@ PPC_FUNC(__imp__NtReadFile) {
 
     // Read through the per-handle read-ahead cache (64 KB refills) so the game's
     // 1-byte fgetc-style reads don't each hit a syscall.
-    uint32_t bytes_read = host_file_read(handle, base + buf_ptr, length, offset, has_off);
+    uint32_t bytes_read = host_file_read(handle, lsw_host(buf_ptr), length, offset, has_off);
     { bool content; { std::lock_guard<std::mutex> lk(g_content_mtx); content = g_content_handles.count(handle) != 0; }
       if (content) dbg_ram("[SAVE] NtReadFile handle=0x%X off=%s0x%llX len=0x%X -> read 0x%X into 0x%08X (first dwords %08X %08X %08X %08X)\n",
                            handle, has_off ? "" : "cur+", (unsigned long long)offset, length, bytes_read, buf_ptr,
@@ -1558,7 +1562,7 @@ PPC_FUNC(__imp__NtWriteFile) {
         FileRAH& r = g_rah[handle];
         if (!has_off) pos = r.cur;
         LARGE_INTEGER li; li.QuadPart = (LONGLONG)pos;
-        ok = SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && WriteFile(h, base + buf_ptr, length, &written, nullptr);
+        ok = SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && WriteFile(h, lsw_host(buf_ptr), length, &written, nullptr);
         r.cur = pos + written; r.cache_len = 0;
     }
     ctx.r3.u32 = ok ? 0u : 0xC0000185u;   // STATUS_IO_DEVICE_ERROR
@@ -1608,7 +1612,7 @@ PPC_FUNC(__imp__NtQueryInformationFile) {
         if (iosb) { PPC_STORE_U32(iosb, 0); PPC_STORE_U32(iosb + 4, 22); }
     } else if (info_class == 4 && info_ptr && info_len >= 40) {
         // FileBasicInformation: 4 timestamps + FileAttributes (+32)
-        memset(base + info_ptr, 0, 40);
+        memset(lsw_host(info_ptr), 0, 40);
         put_times(info_ptr);
         PPC_STORE_U32(info_ptr + 32, 0x80);   // FILE_ATTRIBUTE_NORMAL
         ctx.r3.u32 = 0;
@@ -1646,7 +1650,7 @@ PPC_FUNC(__imp__NtQueryVolumeInformationFile) {
     ctx.r3.u32 = 0;
     // Return zeroed buffer — game mostly ignores volume info
     if (ctx.r5.u32 && ctx.r6.u32 && ctx.r6.u32 <= 256)
-        memset(base + ctx.r5.u32, 0, ctx.r6.u32);
+        memset(lsw_host(ctx.r5.u32), 0, ctx.r6.u32);
 }
 
 PPC_FUNC(__imp__NtQueryFullAttributesFile) {
@@ -1665,7 +1669,7 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile) {
     // FILE_NETWORK_OPEN_INFORMATION: 4 timestamps, AllocationSize (+32), EndOfFile (+40), FileAttributes (+48)
     if (ctx.r4.u32) {
         uint32_t p = ctx.r4.u32;
-        memset(base + p, 0, 56);
+        memset(lsw_host(p), 0, 56);
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         if (GetFileAttributesExA(host.c_str(), GetFileExInfoStandard, &fa)) {
             const FILETIME t4[4] = {fa.ftCreationTime, fa.ftLastAccessTime, fa.ftLastWriteTime, fa.ftLastWriteTime};
@@ -2111,7 +2115,7 @@ PPC_FUNC(__imp__ExCreateThread) {
         // Minimal PCR: 4KB block, r13+268 = CPU_ID for interrupt callback mask
         uint32_t pcr = g_phys_alloc(0x1000);
         if (pcr) {
-            memset(g_base + pcr, 0, 0x1000);
+            memset(lsw_host(pcr), 0, 0x1000);
             uint8_t cpu_id;
             { std::lock_guard<std::mutex> lk(g_thread_mutex); cpu_id = g_next_cpu_id++; if (g_next_cpu_id > 5) g_next_cpu_id = 1; }
             // Creation flags bits 24-31 = hardware-thread affinity mask (Xenia: lowest set bit is the
@@ -2397,14 +2401,14 @@ PPC_FUNC(__imp__XMsgCancelIORequest)        { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG
 static inline uint32_t rb_read(uint32_t dw_idx) {
     uint32_t rb_dwords = g_rb_size >> 2;
     uint32_t idx = dw_idx % rb_dwords;
-    return __builtin_bswap32(*(const volatile uint32_t*)(g_base + g_rb_base + idx * 4));
+    return __builtin_bswap32(*(const volatile uint32_t*)lsw_host(g_rb_base + idx * 4));
 }
 
 // Write a 32-bit value to a guest address (EOS fence completion).
 static void gpu_shm_invalidate(uint32_t phys);
 static inline void pm4_store32(uint32_t ga, uint32_t val) {
     gpu_shm_invalidate(ga & 0x1FFFFFFFu);
-    *(volatile uint32_t*)(g_base + ga) = __builtin_bswap32(val);
+    *(volatile uint32_t*)lsw_host(ga) = __builtin_bswap32(val);
 }
 // GPU memory write as Xenia's command processor does it (EVENT_WRITE_SHD / MEM_WRITE): the low 2
 // address bits are the endian swap applied to the (host-order) value, the rest is a physical
@@ -2433,7 +2437,7 @@ static void pm4_gpu_write(uint32_t addr_endian, uint32_t value) {
 
 // Read big-endian dword from flat IB guest memory.
 static inline uint32_t ib_read(uint32_t guest_base, uint32_t offset) {
-    return __builtin_bswap32(*(const uint32_t*)(g_base + guest_base + offset * 4));
+    return __builtin_bswap32(*(const uint32_t*)lsw_host(guest_base + offset * 4));
 }
 
 // Forward-declared so pm4_process_ring can call it.
@@ -3097,9 +3101,9 @@ static void xvs_draw(uint32_t draw_initiator, uint32_t dma_base, uint32_t dma_si
     // Per-vertex pixel shader (Gouraud approximation of the real PS lighting). LSWTCS_XPS=0 disables.
     { static int xps = -1; if (xps < 0) { const char* e = getenv("LSWTCS_XPS"); xps = (e && e[0] == '0') ? 0 : 1; }
       bool ok = xps && g_ps_addr >= 0x80000000u && g_ps_addr < 0xA0000000u && g_ps_size && g_ps_size < 0x4000;
-      lswtcs_xvs_set_ps(ok ? reinterpret_cast<const uint32_t*>(g_base + g_ps_addr) : nullptr, ok ? g_ps_size : 0); }
+      lswtcs_xvs_set_ps(ok ? reinterpret_cast<const uint32_t*>(lsw_host(g_ps_addr)) : nullptr, ok ? g_ps_size : 0); }
     uint32_t n = lswtcs_xvs_run_draw(g_xe_regs, g_base + 0x80000000u,
-                                     reinterpret_cast<const uint32_t*>(g_base + g_vs_addr), g_vs_size,
+                                     reinterpret_cast<const uint32_t*>(lsw_host(g_vs_addr)), g_vs_size,
                                      draw_initiator, dma_base, dma_size, buf, 65536);
     g_xvs_draws++;
     if (g_xvs_draws <= 2) {   // input diagnostics for the first draws
@@ -3491,8 +3495,8 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     bool ps_ok = g_ps_addr >= 0x80000000u && g_ps_addr < 0xA0000000u && g_ps_size && g_ps_size < 0x4000;
     LswGpuDraw d;
     uint64_t gp0 = gp_now();
-    int prepared = lsw_gpu_prepare(g_xe_regs, reinterpret_cast<const uint32_t*>(g_base + g_vs_addr), g_vs_size,
-                                   ps_ok ? reinterpret_cast<const uint32_t*>(g_base + g_ps_addr) : nullptr,
+    int prepared = lsw_gpu_prepare(g_xe_regs, reinterpret_cast<const uint32_t*>(lsw_host(g_vs_addr)), g_vs_size,
+                                   ps_ok ? reinterpret_cast<const uint32_t*>(lsw_host(g_ps_addr)) : nullptr,
                                    ps_ok ? g_ps_size : 0, endian, 1280, 720, &d);
     g_gpuprof[GP_PREPARE] += gp_now() - gp0;
     if (!prepared) {
@@ -4096,7 +4100,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     else if (src5 == 2)
                         gpu_record_draw(init5, 0, 0, nullptr, 0, 5);
                     else if (op == 0x36 && src5 == 1 && body >= 2)
-                        gpu_record_draw(init5, 0, 0, reinterpret_cast<const uint8_t*>(g_base + guest_base + (pos + 2) * 4), body - 1, 5);
+                        gpu_record_draw(init5, 0, 0, reinterpret_cast<const uint8_t*>(lsw_host(guest_base + (pos + 2) * 4)), body - 1, 5);
                 }
                 if (mode == 4 && g_vs_addr) {               // kColorDepth geometry → collect
                     uint32_t init = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
@@ -4139,7 +4143,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     else if (srcsel == 2)
                         gpu_done = gpu_record_draw(init0, 0, 0, nullptr, 0);
                     else if (op == 0x36 && srcsel == 1 && body >= 2)
-                        gpu_done = gpu_record_draw(init0, 0, 0, reinterpret_cast<const uint8_t*>(g_base + guest_base + (pos + 2) * 4), body - 1);
+                        gpu_done = gpu_record_draw(init0, 0, 0, reinterpret_cast<const uint8_t*>(lsw_host(guest_base + (pos + 2) * 4)), body - 1);
                     if (!gpu_done) {   // census of draws the GPU path did not take
                         static uint32_t miss[64]; static uint32_t nmiss = 0;
                         uint32_t key = ((op == 0x36) ? 32u : 0u) | (srcsel << 3) | ((init0 & 0x3F) < 8 ? (init0 & 7) : 7);
@@ -5072,6 +5076,53 @@ PPC_FUNC(__imp__VdSwap) {
         }
     }
 
+    // ── Game frame time = real time (cutscene A/V sync at 60 fps) ──
+    // The game's frame time is rounded UP twice, both assuming vsync-quantized frames (16.7/33.3 ms):
+    //  1. sub_82506A38 (frame timer): measured < K/fps -> exactly 1/fps, K = 1.03 at 0x8203679C (its
+    //     only reader), so every frame under ~17.2 ms counts as 16.67 ms;
+    //  2. the main loop (sub_82215AA0) clamps [0x830AA97C] to at least [0x830AA980] (1/60 from the
+    //     image; sub_8229D8B8 sets 1/30, or 1/25 in PAL mode).
+    // Under the GIL the game's own frame measurements jitter by a few ms around 16.7 even though the
+    // limiter is exact, so rounding the short frames up (the long ones count in full) made game time
+    // run ~10% fast at 60 fps (FTSTAT x1.10; x1.02 at 30 fps). Cutscenes (fpsec x frame time) then
+    // drifted 1-2 s ahead of their real-time audio and were cut off at the end. Set K = 0 and the floor
+    // to 1 ms: game time becomes the sum of measured deltas = real time. LSWTCS_FTFLOOR=0 disables.
+    {
+        static int en = -1; static uint32_t floor_bits = 0;
+        if (en < 0) {
+            const char* e = getenv("LSWTCS_FTFLOOR"); en = (e && e[0] == '0') ? 0 : 1;
+            float ft = 0.001f;
+            memcpy(&floor_bits, &ft, 4);
+            if (en) {
+                dbg_ram("[FTFLOOR] frame-timer snap K 0x%08X -> 0\n", PPC_LOAD_U32(0x8203679Cu));
+                PPC_STORE_U32(0x8203679Cu, 0u);
+            }
+        }
+        if (en) {
+            uint32_t cur = PPC_LOAD_U32(0x830AA980u);
+            if (cur == 0x3D088889u /* 1/30 */ || cur == 0x3D23D70Au /* 1/25 */ || cur == 0x3C888889u /* 1/60 */) {
+                PPC_STORE_U32(0x830AA980u, floor_bits);
+                dbg_ram("[FTFLOOR] game min frame time 0x%08X -> 0x%08X\n", cur, floor_bits);
+            }
+        }
+        // [FTSTAT] every ~5 s: game time advanced (sum of the frame time [0x830AA97C] seen at each swap,
+        // and the game's own accumulator [0x82FEEAD4]) vs real time and the swap count.
+        static LARGE_INTEGER qf{}, q0{}; static double ft_sum = 0; static uint32_t swaps = 0; static float acc0 = 0;
+        if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
+        uint32_t ftb = PPC_LOAD_U32(0x830AA97Cu), accb = PPC_LOAD_U32(0x82FEEAD4u);
+        float ft, acc; memcpy(&ft, &ftb, 4); memcpy(&acc, &accb, 4);
+        if (swaps == 0) acc0 = acc;
+        ft_sum += ft; ++swaps;
+        LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+        double real = double(qn.QuadPart - q0.QuadPart) / double(qf.QuadPart);
+        if (real >= 5.0) {
+            dbg_ram("[FTSTAT] real=%.2fs swaps=%u (%.1f/s) ft_sum=%.2fs (x%.3f) acc_delta=%.2fs (x%.3f) ft_now=%.5f floor=%08X\n",
+                    real, swaps, swaps / real, ft_sum, ft_sum / real, double(acc - acc0), double(acc - acc0) / real,
+                    ft, PPC_LOAD_U32(0x830AA980u));
+            q0 = qn; ft_sum = 0; swaps = 0;
+        }
+    }
+
     // ── Frame-rate limiter — lock to the Nintendo Switch Lite's 60 Hz display ──
     // Paces every frame to exactly 1/target_fps using an accumulating deadline
     // (smooth pacing, no drift). Hybrid sleep: coarse sleep to ~1ms before the
@@ -5424,12 +5475,15 @@ PPC_FUNC(__imp__KeInitializeSemaphore) {
 }
 PPC_FUNC(__imp__KeQueryPerformanceFrequency) {
     PPC_FUNC_PROLOGUE();
-    // Xbox 360 high-resolution timer: 49,875,000 Hz (CPU timebase / 64).
+    // Guest timer rate: 50,000,000 Hz (Xenia's guest tick rate; mftb is scaled to match). Not the
+    // 360's nominal 49.875 MHz: the game derives its frame-timer frequency as (this / 1000000) *
+    // 1000000 in integer math (sub_8250E160), which turned 49875000 into 49000000 and made game
+    // time run 1.8% fast against the 49.875 MHz timebase (cutscene A/V drift, 2026-10-07).
     // LARGE_INTEGER KeQueryPerformanceFrequency(void) RETURNS the value in r3 (Xenia:
     // return 50000000). It used to store through r3 as if it were an out-pointer, which
     // left r3 = garbage for callers (sub_822B7998 divides by freq/refresh -> host #DE) and
     // scribbled 8 bytes wherever r3 happened to point.
-    ctx.r3.u64 = 49875000ull;
+    ctx.r3.u64 = 50000000ull;
 }
 PPC_FUNC(__imp__KeRaiseIrqlToDpcLevel) { PPC_FUNC_PROLOGUE(); lswtcs_spin_enter(); ctx.r3.u32 = 0; }  // DPC level disables preemption
 PPC_FUNC(__imp__KeReleaseSemaphore) {
@@ -5562,7 +5616,7 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient) {
     uint32_t sp = stack ? ((stack + gs - 0x100u) & ~0xFu) : 0u;
     uint32_t pcr = g_phys_alloc(0x1000);
     if (pcr) {
-        memset(g_base + pcr, 0, 0x1000);
+        memset(lsw_host(pcr), 0, 0x1000);
         PPC_STORE_U8(pcr + 268, 0);
         PPC_STORE_U32(pcr + 256, pcr + 0x200);
         PPC_STORE_U32(pcr + 0x200 + 88, (uint32_t)(lswtcs_now_ms() * 10000ULL));
@@ -5587,7 +5641,7 @@ PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame) {
         if (c.in_use) {
             c.pending++;
             uint32_t s = ctx.r4.u32;
-            if (c.host_out && s >= 0x10000u && s < 0xFFFF0000u) host_audio_submit(h & 0xFFFFu, g_base + s);
+            if (c.host_out && s >= 0x10000u && s < 0xFFFF0000u) host_audio_submit(h & 0xFFFFu, lsw_host(s));
             else if (c.host_out) audio_frame_played(h & 0xFFFFu);   // bad pointer: keep the credit chain alive
             if (c.wake) SetEvent(c.wake);
         }
@@ -5865,7 +5919,7 @@ PPC_FUNC(__imp__XamContentCreateEx) {
     }
     if (disposition == 1) {
         content_mkdirs(pkg);
-        if (FILE* fp = fopen(hdr.c_str(), "wb")) { fwrite(base + data, 1, kXContentDataSize, fp); fclose(fp); }   // guest layout as-is
+        if (FILE* fp = fopen(hdr.c_str(), "wb")) { fwrite(lsw_host(data), 1, kXContentDataSize, fp); fclose(fp); }   // guest layout as-is
         if (!content_exists(pkg)) result = 0x65Bu;
     }
     if (!result && disposition) {
@@ -5978,7 +6032,7 @@ PPC_FUNC(__imp__XamContentSetThumbnail) {
     if (data >= 0x80000000u && data < 0x94000000u && img >= 0x80000000u && img < 0x94000000u && n && n < (1u << 20)) {
         std::string pkg = content_type_dir(PPC_LOAD_U32(data + 4)) + content_name(base, data);
         if (!content_exists(pkg)) result = 3u;
-        else if (FILE* fp = fopen((pkg + ".png").c_str(), "wb")) { fwrite(base + img, 1, n, fp); fclose(fp); result = 0; }
+        else if (FILE* fp = fopen((pkg + ".png").c_str(), "wb")) { fwrite(lsw_host(img), 1, n, fp); fclose(fp); result = 0; }
     }
     ctx.r3.u32 = xam_ovl_return(base, ctx.r7.u32, result, 0);
 }
@@ -6089,7 +6143,7 @@ PPC_FUNC(__imp__XamEnumerate) {
         uint32_t buf = ctx.r5.u32, cb = ctx.r6.u32, n = 0;
         if (buf >= 0x80000000u && buf < 0x94000000u)
             while (e.pos < e.items.size() && n < e.per && (n + 1) * kXContentDataSize <= cb) {
-                memcpy(base + buf + n * kXContentDataSize, e.items[e.pos].data(), kXContentDataSize);
+                memcpy(lsw_host(buf + n * kXContentDataSize), e.items[e.pos].data(), kXContentDataSize);
                 ++n; ++e.pos;
             }
         uint32_t result = n ? 0u : 0x12u;   // ERROR_NO_MORE_FILES
@@ -6359,7 +6413,7 @@ PPC_FUNC(__imp__VdGetCurrentDisplayInformation) {
     // Layout matches Xenia's xboxkrnl_video.cc VdGetCurrentDisplayInformation_entry
     uint32_t ptr = ctx.r3.u32;
     if (!ptr) return;
-    memset(base + ptr, 0, 0x58);
+    memset(lsw_host(ptr), 0, 0x58);
     // front_buffer_width/height (be<uint16_t> at +0, +2)
     PPC_STORE_U16(ptr + 0x00, 1280);
     PPC_STORE_U16(ptr + 0x02, 720);
@@ -6400,7 +6454,7 @@ PPC_FUNC(__imp__VdGetSystemCommandBuffer) {
         logged = true;
     }
     if (ctx.r3.u32 >= 0x80000000u && ctx.r3.u32 < 0x94000000u) {
-        memset(g_base + ctx.r3.u32, 0, 0x94);        // zero 0x94 bytes like Xenia
+        memset(lsw_host(ctx.r3.u32), 0, 0x94);        // zero 0x94 bytes like Xenia
         PPC_STORE_U32(ctx.r3.u32, 0xBEEF0000u);
     }
     if (ctx.r4.u32 >= 0x80000000u && ctx.r4.u32 < 0x94000000u)
@@ -6468,7 +6522,7 @@ PPC_FUNC(__imp__VdQueryVideoMode) {
     // r3 = pointer to X_VIDEO_MODE (48 bytes, all big-endian)
     uint32_t ptr = ctx.r3.u32;
     if (!ptr) return;
-    memset(base + ptr, 0, 48);
+    memset(lsw_host(ptr), 0, 48);
     PPC_STORE_U32(ptr +  0, 1280);   // display_width
     PPC_STORE_U32(ptr +  4, 720);    // display_height
     PPC_STORE_U32(ptr +  8, 0);      // is_interlaced
