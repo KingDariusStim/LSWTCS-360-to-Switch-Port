@@ -2,6 +2,10 @@
 #ifndef LSW_ROOT_DIR
 #define LSW_ROOT_DIR ".."
 #endif
+// image.bin / pristine.bin / game files (Switch: sdmc:/lswtcs, set by switch/CMakeLists.txt).
+#ifndef LSW_DATA_DIR
+#define LSW_DATA_DIR LSW_ROOT_DIR "/Convert 360/LSWTCS"
+#endif
 #include "../../Convert 360/LSWTCS/output/ppc_config.h"
 #include "../../Convert 360/LSWTCS/output/ppc_context.h"
 #include "../../Convert 360/LSWTCS/output/ppc_recomp_shared.h"
@@ -627,12 +631,22 @@ extern "C" void lswtcs_bubble_init() {
     fflush(stdout);
 }
 
+#ifdef __SWITCH__
+extern "C" void lsw_switch_init();                          // switch/source/platform_switch.cpp
+extern "C" uint8_t* lsw_switch_guest_window(size_t size);   // reserves + backs the used ranges
+#endif
+
 int main() {
+#ifdef __SWITCH__
+    lsw_switch_init();   // cwd = data dir, env file, stdout -> log
+#endif
     setbuf(stdout, nullptr);
     AddVectoredExceptionHandler(1, crash_handler);
     //signal(SIGSEGV, signal_handler);  // disabled: let GDB catch raw crash
     //signal(SIGILL,  signal_handler);
+#if defined(__x86_64__)
     { void* _rsp; asm("mov %%rsp, %0":"=r"(_rsp)); printf("[MAIN] rsp=%p\n",_rsp); }
+#endif
 
     // Allocate full 4GB guest address space: any valid 32-bit PPC pointer is safe to dereference.
     // Corrupted Xenia pointers that land outside the image simply read zero instead of crashing.
@@ -641,6 +655,12 @@ int main() {
     // physical view.
     size_t alloc_size = (size_t)(PPC_FUNC_TABLE_BASE + 0x4000000ULL);
     g_base = nullptr;
+#ifdef __SWITCH__
+    // No overcommit and no multi-mapping on Switch: single view (LSW_ADDR_FOLD), only the ranges
+    // the runtime and game use are backed (switch/source/platform_switch.cpp).
+    g_base = lsw_switch_guest_window(alloc_size);
+    if (!g_base) { printf("[INIT] guest window failed\n"); return 1; }
+#else
     // ── Physical-memory aliasing (Xbox 360 / Xenia memory model) ──────────────────
     // The game addresses physical page P through several views and converts between them
     // with phys = va & 0x1FFFFFFF: GPU command buffers allocated at 0xA0xxxxxx are handed
@@ -709,6 +729,7 @@ int main() {
     } else {
         printf("[INIT] Guest memory (4GB): %p, size 0x%zX\n", g_base, alloc_size);
     }
+#endif
 
     // PPC_HOST region table: identity for every 512 MB region, except that the 0xA0000000 and
     // 0xC0000000 physical views fold onto the 0x80000000 copy (LSW_ADDR_FOLD).
@@ -729,7 +750,7 @@ int main() {
     }
 
     // Load image.bin
-    FILE* f = fopen(LSW_ROOT_DIR "/Convert 360/LSWTCS/image.bin", "rb");
+    FILE* f = fopen(LSW_DATA_DIR "/image.bin", "rb");
     if (!f) {
         printf("Failed to open image.bin\n");
         return 1;
@@ -750,7 +771,7 @@ int main() {
         const char* e = getenv("LSWTCS_PRISTINE");
         if (e && e[0] == '1') {
             const uint32_t DATA_VA = 0x82E70000u, DATA_SZ = 0x0041491Cu;
-            FILE* pf = fopen(LSW_ROOT_DIR "/Convert 360/LSWTCS/pristine.bin", "rb");
+            FILE* pf = fopen(LSW_DATA_DIR "/pristine.bin", "rb");
             if (!pf) {
                 printf("[PRISTINE] pristine.bin not found — skipping .data overlay\n");
             } else {

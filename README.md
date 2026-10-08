@@ -13,6 +13,7 @@ included — you need your own copy of the game to rebuild.
 | `Convert 360/LSWTCS/*.toml` | XenonRecomp configs |
 | `patches/recomp_output_edits.patch` | Hand edits to the recompiled output (`output_ref` → `output`). Apply after running XenonRecomp. |
 | `patches/XenonRecomp.patch`, `patches/xenia-canary.patch` | Local changes to those upstream repos; `*.base` holds the commit each patch applies to |
+| `patches/SPIRV-Cross.base` | Pinned commit (tag `vulkan-sdk-1.4.363.0`) of SPIRV-Cross, checked out at `SPIRV-Cross/` (Switch OpenGL shader path, unmodified). The Switch build also needs xenia-canary's `third_party/glslang` submodule (`git submodule update --init third_party/glslang`) |
 | `ghidra_scripts/` | Ghidra scripts used as the 360 disassembly oracle |
 | `HANDOFF_*.md` | Session handoff / progress notes |
 | `*.sh`, `*.ps1` | Run, backup, Xenia dump and capture helpers |

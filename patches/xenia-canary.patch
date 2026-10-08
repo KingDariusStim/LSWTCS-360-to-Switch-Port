@@ -29,3 +29,342 @@ index ec7cf9a..a6be977 100644
                                       fetch_constant.endian);
        }
        data[i] = dword_value;
+diff --git a/src/xenia/gpu/spirv_shader_translator.cc b/src/xenia/gpu/spirv_shader_translator.cc
+index 83ba944..1304304 100644
+--- a/src/xenia/gpu/spirv_shader_translator.cc
++++ b/src/xenia/gpu/spirv_shader_translator.cc
+@@ -283,12 +283,13 @@ void SpirvShaderTranslator::StartTranslation() {
+        type_uint_},
+       {"alpha_test_reference", offsetof(SystemConstants, alpha_test_reference),
+        type_float_},
+-      {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
+       {"edram_32bpp_tile_pitch_dwords_scaled",
+        offsetof(SystemConstants, edram_32bpp_tile_pitch_dwords_scaled),
+        type_uint_},
+       {"edram_depth_base_dwords_scaled",
+        offsetof(SystemConstants, edram_depth_base_dwords_scaled), type_uint_},
++      // LSW: declared in memory order (GLSL cannot express out-of-order offsets).
++      {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
+       {"color_exp_bias", offsetof(SystemConstants, color_exp_bias),
+        type_float4_},
+       {"edram_poly_offset_front_scale",
+@@ -3320,11 +3321,27 @@ spv::Id SpirvShaderTranslator::EndianSwap32Uint(spv::Id value, spv::Id endian) {
+           static_cast<unsigned int>(xenos::Endian::k8in32)));
+   spv::Id is_8in16_or_8in32 =
+       builder_->createBinOp(spv::OpLogicalOr, type_bool_, is_8in16, is_8in32);
+-  SpirvBuilder::IfBuilder if_8in16(is_8in16_or_8in32,
+-                                   spv::SelectionControlMaskNone, *builder_);
+-  spv::Id swapped_8in16;
++  // LSWTCS: branch-free (select a mask, then merge with XOR) instead of an if
++  // per swap - every vertex fetch dword had two if blocks, a large share of
++  // the GLSL Mesa has to compile on the Switch.
++  auto select_merge = [&](spv::Id condition, spv::Id swapped) {
++    spv::Id mask = builder_->createTriOp(
++        spv::OpSelect, type_uint_, condition,
++        builder_->makeUintConstant(UINT32_MAX), const_uint_0_);
++    if (num_components > 1) {
++      id_vector_temp_.clear();
++      id_vector_temp_.insert(id_vector_temp_.cend(), num_components, mask);
++      mask = builder_->createCompositeConstruct(type, id_vector_temp_);
++    }
++    return builder_->createBinOp(
++        spv::OpBitwiseXor, type, value,
++        builder_->createBinOp(
++            spv::OpBitwiseAnd, type,
++            builder_->createBinOp(spv::OpBitwiseXor, type, swapped, value),
++            mask));
++  };
+   {
+-    swapped_8in16 = builder_->createBinOp(
++    spv::Id swapped_8in16 = builder_->createBinOp(
+         spv::OpBitwiseOr, type,
+         builder_->createBinOp(
+             spv::OpBitwiseAnd, type,
+@@ -3336,9 +3353,8 @@ spv::Id SpirvShaderTranslator::EndianSwap32Uint(spv::Id value, spv::Id endian) {
+             builder_->createBinOp(spv::OpBitwiseAnd, type, value,
+                                   const_uint_00ff00ff_typed),
+             const_uint_8_typed));
++    value = select_merge(is_8in16_or_8in32, swapped_8in16);
+   }
+-  if_8in16.makeEndIf();
+-  value = if_8in16.createMergePhi(swapped_8in16, value);
+ 
+   // 16-in-32 or another half of 8-in-32 (doing 16-in-32 swap).
+   spv::Id is_16in32 = builder_->createBinOp(
+@@ -3347,18 +3363,14 @@ spv::Id SpirvShaderTranslator::EndianSwap32Uint(spv::Id value, spv::Id endian) {
+           static_cast<unsigned int>(xenos::Endian::k16in32)));
+   spv::Id is_8in32_or_16in32 =
+       builder_->createBinOp(spv::OpLogicalOr, type_bool_, is_8in32, is_16in32);
+-  SpirvBuilder::IfBuilder if_16in32(is_8in32_or_16in32,
+-                                    spv::SelectionControlMaskNone, *builder_);
+-  spv::Id swapped_16in32;
+   {
+-    swapped_16in32 = builder_->createQuadOp(
++    spv::Id swapped_16in32 = builder_->createQuadOp(
+         spv::OpBitFieldInsert, type,
+         builder_->createBinOp(spv::OpShiftRightLogical, type, value,
+                               const_uint_16_typed),
+         value, builder_->makeIntConstant(16), builder_->makeIntConstant(16));
++    value = select_merge(is_8in32_or_16in32, swapped_16in32);
+   }
+-  if_16in32.makeEndIf();
+-  value = if_16in32.createMergePhi(swapped_16in32, value);
+ 
+   return value;
+ }
+diff --git a/src/xenia/gpu/spirv_shader_translator.h b/src/xenia/gpu/spirv_shader_translator.h
+index db73653..a9adb6d 100644
+--- a/src/xenia/gpu/spirv_shader_translator.h
++++ b/src/xenia/gpu/spirv_shader_translator.h
+@@ -36,6 +36,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     // incremental counter).
+     static constexpr uint32_t kVersion = 8;
+ 
++    // LSWTCS: bit 63 (unused by both the vertex and the pixel layout) = every
++    // texture this draw fetches has all components unsigned
++    // (TextureSign::kUnsigned), as the host checked at draw time. Texture
++    // fetches then sample only the unsigned binding and skip the per-component
++    // sign selection and the biased / gamma conversion: far less code for the
++    // Switch's GLSL compiler. Draws with other signs use the generic
++    // translation.
++    static constexpr uint64_t kLswTexturesUnsigned = UINT64_C(1) << 63;
++
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+       // Early fragment tests - enable if alpha test and alpha to coverage are
+@@ -224,6 +233,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     // If alpha to mask is enabled, bits 0:7 are sample offsets, and bit 8 must
+     // be 1.
+     uint32_t alpha_to_mask;
++    // LSW: std140 for OpenGL - vec4 color_exp_bias must start on a 16-byte boundary.
++    uint32_t lsw_padding_std140[3];
+ 
+     float color_exp_bias[4];
+ 
+@@ -384,6 +395,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     bool fragment_shader_sample_interlock;
+ 
+     bool demote_to_helper_invocation;
++
++    // LSWTCS: the host compiler makes every float multiplication follow the
++    // Xenos rule 0 * anything = 0 (switch-mesa with the nouveau FMZ multiply,
++    // switch/mesa/mesa_fmz_edits.py), so the translator emits plain
++    // multiplications instead of ZeroIfAnyOperandIsZero selects.
++    bool lsw_host_mul_zero_wins = false;
+   };
+ 
+   SpirvShaderTranslator(const Features& features,
+@@ -516,6 +533,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     return Modification(current_translation().modification());
+   }
+ 
++  // LSWTCS: see Modification::kLswTexturesUnsigned.
++  bool LswTexturesUnsigned() const {
++    return (current_translation().modification() &
++            Modification::kLswTexturesUnsigned) != 0;
++  }
++
+   bool IsSpirvVertexShader() const {
+     return is_vertex_shader() &&
+            !Shader::IsHostVertexShaderTypeDomain(
+@@ -878,9 +901,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     kSystemConstantTextureSwizzles,
+     kSystemConstantTexturesResolved,
+     kSystemConstantAlphaTestReference,
+-    kSystemConstantAlphaToMask,
+     kSystemConstantEdram32bppTilePitchDwordsScaled,
+     kSystemConstantEdramDepthBaseDwordsScaled,
++    kSystemConstantAlphaToMask,
+     kSystemConstantColorExpBias,
+     kSystemConstantEdramPolyOffsetFrontScale,
+     kSystemConstantEdramPolyOffsetBackScale,
+diff --git a/src/xenia/gpu/spirv_shader_translator_alu.cc b/src/xenia/gpu/spirv_shader_translator_alu.cc
+index ad8414e..ad8d92b 100644
+--- a/src/xenia/gpu/spirv_shader_translator_alu.cc
++++ b/src/xenia/gpu/spirv_shader_translator_alu.cc
+@@ -25,6 +25,9 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
+                                                       spv::Id operand_0_abs,
+                                                       spv::Id operand_1_abs) {
+   EnsureBuildPointAvailable();
++  if (features_.lsw_host_mul_zero_wins) {
++    return value;
++  }
+   int num_components = builder_->getNumComponents(value);
+   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
+   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
+@@ -200,7 +203,7 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
+           used_result_components &
+           ~instr.vector_operands[0].GetIdenticalComponents(
+               instr.vector_operands[1]);
+-      if (multiplicands_different) {
++      if (multiplicands_different && !features_.lsw_host_mul_zero_wins) {
+         // Shader Model 3: +0 or denormal * anything = +-0.
+         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
+         spv::Id different_result = result;
+diff --git a/src/xenia/gpu/spirv_shader_translator_fetch.cc b/src/xenia/gpu/spirv_shader_translator_fetch.cc
+index e0f5192..2cf548a 100644
+--- a/src/xenia/gpu/spirv_shader_translator_fetch.cc
++++ b/src/xenia/gpu/spirv_shader_translator_fetch.cc
+@@ -694,11 +694,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+               : instr.dimension;
+       size_t image_2d_array_or_cube_unsigned_index = FindOrAddTextureBinding(
+           fetch_constant_index, dimension_2d_array_or_cube, false);
+-      size_t image_2d_array_or_cube_signed_index = FindOrAddTextureBinding(
+-          fetch_constant_index, dimension_2d_array_or_cube, true);
++      size_t image_2d_array_or_cube_signed_index =
++          LswTexturesUnsigned()
++              ? SIZE_MAX
++              : FindOrAddTextureBinding(fetch_constant_index,
++                                        dimension_2d_array_or_cube, true);
+       if (sampler_index == SIZE_MAX ||
+           image_2d_array_or_cube_unsigned_index == SIZE_MAX ||
+-          image_2d_array_or_cube_signed_index == SIZE_MAX) {
++          (image_2d_array_or_cube_signed_index == SIZE_MAX &&
++           !LswTexturesUnsigned())) {
+         bindings_set_up = false;
+       }
+       size_t image_3d_unsigned_index = SIZE_MAX;
+@@ -706,10 +710,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
+         image_3d_unsigned_index = FindOrAddTextureBinding(
+             fetch_constant_index, xenos::FetchOpDimension::k3DOrStacked, false);
+-        image_3d_signed_index = FindOrAddTextureBinding(
+-            fetch_constant_index, xenos::FetchOpDimension::k3DOrStacked, true);
++        if (!LswTexturesUnsigned()) {
++          image_3d_signed_index = FindOrAddTextureBinding(
++              fetch_constant_index, xenos::FetchOpDimension::k3DOrStacked,
++              true);
++        }
+         if (image_3d_unsigned_index == SIZE_MAX ||
+-            image_3d_signed_index == SIZE_MAX) {
++            (image_3d_signed_index == SIZE_MAX && !LswTexturesUnsigned())) {
+           bindings_set_up = false;
+         }
+       }
+@@ -725,10 +732,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           texture_bindings_[image_2d_array_or_cube_unsigned_index];
+       image_2d_array_or_cube_unsigned = builder_->createLoad(
+           image_2d_array_or_cube_unsigned_binding.variable, spv::NoPrecision);
+-      const TextureBinding& image_2d_array_or_cube_signed_binding =
+-          texture_bindings_[image_2d_array_or_cube_signed_index];
+-      image_2d_array_or_cube_signed = builder_->createLoad(
+-          image_2d_array_or_cube_signed_binding.variable, spv::NoPrecision);
++      if (image_2d_array_or_cube_signed_index != SIZE_MAX) {
++        const TextureBinding& image_2d_array_or_cube_signed_binding =
++            texture_bindings_[image_2d_array_or_cube_signed_index];
++        image_2d_array_or_cube_signed = builder_->createLoad(
++            image_2d_array_or_cube_signed_binding.variable, spv::NoPrecision);
++      }
+       if (image_3d_unsigned_index != SIZE_MAX) {
+         const TextureBinding& image_3d_unsigned_binding =
+             texture_bindings_[image_3d_unsigned_index];
+@@ -1540,7 +1549,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         spv::Id const_uint_sign_signed =
+             builder_->makeUintConstant(uint32_t(xenos::TextureSign::kSigned));
+         {
+-          uint32_t result_remaining_components = used_result_nonzero_components;
++          uint32_t result_remaining_components =
++              LswTexturesUnsigned() ? 0 : used_result_nonzero_components;
+           uint32_t result_component_index;
+           while (xe::bit_scan_forward(result_remaining_components,
+                                       &result_component_index)) {
+@@ -1572,8 +1582,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+             }
+           }
+         }
+-        spv::Id is_any_unsigned = builder_->createUnaryOp(
+-            spv::OpLogicalNot, type_bool_, is_all_signed);
++        spv::Id is_any_unsigned =
++            LswTexturesUnsigned()
++                ? spv::NoResult
++                : builder_->createUnaryOp(spv::OpLogicalNot, type_bool_,
++                                          is_all_signed);
+ 
+         // Load the fetch constant word 3, needed for result exponent biasing.
+         // exp_adjust is in word 3, bits 13:18 (6-bit signed).
+@@ -2161,12 +2174,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+               // Fetched components.
+               // Select whether the result is signed or unsigned (or biased or
+               // gamma-corrected) based on the post-swizzle signedness.
+-              spv::Id swizzle_sample_result = builder_->createTriOp(
+-                  spv::OpSelect, type_float4_,
+-                  builder_->smearScalar(
+-                      spv::NoPrecision,
+-                      result_is_signed[result_component_index], type_bool4_),
+-                  sample_result_signed, sample_result_unsigned);
++              spv::Id swizzle_sample_result =
++                  LswTexturesUnsigned()
++                      ? sample_result_unsigned
++                      : builder_->createTriOp(
++                            spv::OpSelect, type_float4_,
++                            builder_->smearScalar(
++                                spv::NoPrecision,
++                                result_is_signed[result_component_index],
++                                type_bool4_),
++                            sample_result_signed, sample_result_unsigned);
+               // Bit 0 - X or Y, Z or W, 0 or 1.
+               spv::Id swizzle_x_or_y = builder_->createTriOp(
+                   spv::OpSelect, type_float_, swizzle_bit_0,
+@@ -2211,6 +2228,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                                       &result_component_index)) {
+             result_remaining_components &=
+                 ~(UINT32_C(1) << result_component_index);
++            if (LswTexturesUnsigned()) {
++              if (features_.image_view_format_swizzle) {
++                result[result_component_index] =
++                    builder_->createCompositeExtract(sample_result_unsigned,
++                                                     type_float_,
++                                                     result_component_index);
++              }
++              continue;
++            }
+             spv::Id sample_result_component_unsigned =
+                 features_.image_view_format_swizzle
+                     ? builder_->createCompositeExtract(sample_result_unsigned,
+@@ -2477,6 +2503,29 @@ void SpirvShaderTranslator::SampleTexture(
+     spv::Id is_any_signed, spv::Id& result_unsigned_out,
+     spv::Id& result_signed_out, spv::Id lerp_factor,
+     spv::Id lerp_first_unsigned, spv::Id lerp_first_signed) {
++  if (LswTexturesUnsigned()) {
++    texture_parameters.sampler = builder_->createBinOp(
++        spv::OpSampledImage,
++        builder_->makeSampledImageType(builder_->getTypeId(image_unsigned)),
++        image_unsigned, sampler);
++    spv::Id result = builder_->createTextureCall(
++        spv::NoPrecision, type_float4_, false, false, false, false, false,
++        texture_parameters, image_operands_mask);
++    if (lerp_factor != spv::NoResult && lerp_first_unsigned != spv::NoResult) {
++      spv::Id lerp_difference = builder_->createNoContractionBinOp(
++          spv::OpVectorTimesScalar, type_float4_,
++          builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, result,
++                                             lerp_first_unsigned),
++          lerp_factor);
++      result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_,
++                                                  result, lerp_difference);
++    }
++    // The signed result is never selected; the same value keeps the callers'
++    // phis valid.
++    result_unsigned_out = result;
++    result_signed_out = result;
++    return;
++  }
+   for (uint32_t i = 0; i < 2; ++i) {
+     SpirvBuilder::IfBuilder sign_if(i ? is_any_signed : is_any_unsigned,
+                                     spv::SelectionControlDontFlattenMask,
+@@ -2516,6 +2565,16 @@ void SpirvShaderTranslator::SampleTexture(
+ spv::Id SpirvShaderTranslator::QueryTextureLod(
+     spv::Builder::TextureParameters& texture_parameters, spv::Id image_unsigned,
+     spv::Id image_signed, spv::Id sampler, spv::Id is_all_signed) {
++  if (LswTexturesUnsigned()) {
++    texture_parameters.sampler = builder_->createBinOp(
++        spv::OpSampledImage,
++        builder_->makeSampledImageType(builder_->getTypeId(image_unsigned)),
++        image_unsigned, sampler);
++    return builder_->createCompositeExtract(
++        builder_->createTextureQueryCall(spv::OpImageQueryLod,
++                                         texture_parameters, false),
++        type_float_, 1);
++  }
+   // OpSampledImage must be in the same block as where its result is used.
+   SpirvBuilder::IfBuilder if_signed(
+       is_all_signed, spv::SelectionControlDontFlattenMask, *builder_);

@@ -13,6 +13,7 @@
 !/ghidra_scripts/
 !/patches/
 !/switch/
+/switch/scratch/
 *.elf
 *.nro
 *.nacp

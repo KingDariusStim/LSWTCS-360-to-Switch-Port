@@ -86,6 +86,8 @@ int lsw_gpu_texture_info(const uint32_t* fetch6, uint32_t* base, uint32_t* forma
 uint64_t lsw_gpu_texture_key(const uint32_t* fetch6, const uint8_t* phys_membase);
 // Decodes the base level (untile + endian swap). Returns 1 on success.
 int lsw_gpu_decode_texture(const uint32_t* fetch6, const uint8_t* phys_membase, LswGpuTexDesc* out);
+// Component mapping alone (12 bits, 3 per output: 0-3 component, 4 = 0, 5 = 1), from the fetch constant.
+uint32_t lsw_gpu_texture_mapping(const uint32_t* fetch6);
 void lsw_gpu_sampler(const uint32_t* fetch6, const LswGpuSamplerBinding* binding, LswGpuSamplerDesc* out);
 
 // Xenia-generated DXBC geometry shader: gs_type 1 = point sprites, 2 = rectangle list

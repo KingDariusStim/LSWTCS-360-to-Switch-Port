@@ -123,6 +123,19 @@ extern "C" uint64_t lsw_gpu_texture_key(const uint32_t* fetch6, const uint8_t* p
   return h;
 }
 
+// Component mapping: fetch swizzle (3 bits per output: 0-3 = component, 4 = 0, 5 = 1), remapped
+// through the host format's component order. D3D12's Shader4ComponentMapping and the SPIR-V
+// translator's texture_swizzles both use this 0-5 encoding.
+static uint32_t component_mapping(const xenos::xe_gpu_texture_fetch_t& fetch, const HostFormat& hf) {
+  uint32_t map = 0;
+  for (int c = 0; c < 4; ++c) {
+    uint32_t s = (fetch.swizzle >> (3 * c)) & 7;
+    if (s < 4) s = hf.comp_map[s]; else if (s > 5) s = 4;
+    map |= s << (3 * c);
+  }
+  return map;
+}
+
 extern "C" int lsw_gpu_decode_texture(const uint32_t* fetch6, const uint8_t* phys_membase,
                                       LswGpuTexDesc* out) {
   std::memset(out, 0, sizeof(*out));
@@ -214,16 +227,16 @@ extern "C" int lsw_gpu_decode_texture(const uint32_t* fetch6, const uint8_t* phy
   out->row_bytes = out->mip_row_bytes[0]; out->rows = out->mip_rows[0];
   out->mips = mips; out->layer_bytes = layer_bytes;
   out->data = dst.data(); out->data_size = uint32_t(dst.size());
-  // SRV component mapping: fetch swizzle (3 bits per output: 0-3 = component, 4 = 0, 5 = 1),
-  // remapped through the host format's component order; D3D12 encoding matches 0-5 directly.
-  uint32_t map = 0;
-  for (int c = 0; c < 4; ++c) {
-    uint32_t s = (fetch.swizzle >> (3 * c)) & 7;
-    if (s < 4) s = hf.comp_map[s]; else if (s > 5) s = 4;
-    map |= s << (3 * c);
-  }
-  out->component_mapping = map | (1u << 12);   // D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
+  out->component_mapping = component_mapping(fetch, hf) | (1u << 12);   // D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
   return 1;
+}
+
+extern "C" uint32_t lsw_gpu_texture_mapping(const uint32_t* fetch6) {
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, fetch6, sizeof(fetch));
+  HostFormat hf;
+  if (fetch.type != xenos::FetchConstantType::kTexture || !host_format(fetch.format, hf)) return 0x688;   // RGBA identity
+  return component_mapping(fetch, hf);
 }
 
 extern "C" void lsw_gpu_sampler(const uint32_t* fetch6, const LswGpuSamplerBinding* b,

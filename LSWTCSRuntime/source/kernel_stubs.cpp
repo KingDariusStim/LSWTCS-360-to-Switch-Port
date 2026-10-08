@@ -2,6 +2,10 @@
 #ifndef LSW_ROOT_DIR
 #define LSW_ROOT_DIR ".."
 #endif
+// Game files (Switch: sdmc:/lswtcs, set by switch/CMakeLists.txt).
+#ifndef LSW_DATA_DIR
+#define LSW_DATA_DIR LSW_ROOT_DIR "/Convert 360/LSWTCS"
+#endif
 #include <set>
 #include "../../Convert 360/LSWTCS/output/ppc_context.h"
 #include <cstdio>
@@ -1335,7 +1339,7 @@ static std::string fileio_translate(const std::string& xbox) {
     if (!path.empty() && GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         static std::string root = [] {
             const char* e = getenv("LSWTCS_GAMEROOT");
-            std::string r = e ? e : LSW_ROOT_DIR "/Convert 360/LSWTCS/";
+            std::string r = e ? e : LSW_DATA_DIR "/";
             if (!r.empty() && r.back() != '/' && r.back() != '\\') r += '/';
             return r;
         }();
@@ -1348,7 +1352,7 @@ static std::string fileio_translate(const std::string& xbox) {
         if (_strnicmp(path.c_str(), "audio/", 6) == 0) {
             static std::string aroot = [] {
                 const char* e = getenv("LSWTCS_AUDIOROOT");
-                std::string r = e ? e : LSW_ROOT_DIR "/Convert 360/LSWTCS/";
+                std::string r = e ? e : LSW_DATA_DIR "/";
                 if (!r.empty() && r.back() != '/' && r.back() != '\\') r += '/';
                 return r;
             }();
@@ -2793,9 +2797,49 @@ static void ucfind_poll() {
     }
     fflush(stdout);
 }
+// DIAG (PC only): file "memscan_now" -> list the guest 1 MB blocks that hold touched (resident) pages,
+// read from the OS working set, so nothing is read and no page gets committed by the scan. Blocks
+// outside the Switch build's backed ranges (switch/source/platform_switch.cpp) are flagged
+// "NOT BACKED ON SWITCH": Eden returns zeros there instead of faulting.
+static void memscan_poll() {
+#ifdef _WIN32
+    if (!LSW_TRIGGER_DUE() || GetFileAttributesA("memscan_now") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("memscan_now");
+    typedef union { struct { uint64_t Valid : 1; uint64_t rest : 63; }; uint64_t Flags; } WsBlock;
+    typedef struct { void* VirtualAddress; WsBlock VirtualAttributes; } WsInfo;
+    typedef BOOL (WINAPI *PFN_QWSE)(HANDLE, void*, DWORD);
+    static PFN_QWSE qwse = (PFN_QWSE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32QueryWorkingSetEx");
+    if (!qwse) { printf("[MEMSCAN] K32QueryWorkingSetEx unavailable\n"); return; }
+    const uint64_t kWin = PPC_FUNC_TABLE_BASE + 0x4000000ull, kPages = kWin >> 12, kBatch = 65536;
+    std::vector<WsInfo> buf(kBatch);
+    std::vector<uint32_t> per_mb((size_t)(kWin >> 20), 0);
+    for (uint64_t p0 = 0; p0 < kPages; p0 += kBatch) {
+        uint64_t n = std::min<uint64_t>(kBatch, kPages - p0);
+        for (uint64_t i = 0; i < n; ++i) { buf[i].VirtualAddress = g_base + ((p0 + i) << 12); buf[i].VirtualAttributes.Flags = 0; }
+        if (!qwse(GetCurrentProcess(), buf.data(), (DWORD)(n * sizeof(WsInfo)))) continue;
+        for (uint64_t i = 0; i < n; ++i) if (buf[i].VirtualAttributes.Valid) ++per_mb[(size_t)((p0 + i) >> 8)];
+    }
+    auto backed = [](uint64_t mb) {
+        uint64_t a = mb << 20;
+        return (a >= 0x7F000000ull && a < 0xA0000000ull) || (a >= 0xE0000000ull && a < 0xF0000000ull) ||
+               (a >= 0x100000000ull && a < 0x104000000ull);
+    };
+    printf("[MEMSCAN] touched guest ranges (1 MB blocks, resident pages):\n");
+    for (size_t mb = 0; mb < per_mb.size();) {
+        if (!per_mb[mb]) { ++mb; continue; }
+        size_t e = mb; uint64_t pages = 0; bool all_backed = true;
+        while (e < per_mb.size() && per_mb[e]) { pages += per_mb[e]; all_backed &= backed(e); ++e; }
+        printf("[MEMSCAN]   0x%09llX-0x%09llX %6llu KB touched%s\n", (unsigned long long)mb << 20,
+               (unsigned long long)e << 20, (unsigned long long)pages * 4, all_backed ? "" : "  NOT BACKED ON SWITCH");
+        mb = e;
+    }
+    fflush(stdout);
+#endif
+}
 static void imlog_vs(const char* kind, uint32_t addr, uint32_t size) {
     imlog_poll();
     ucfind_poll();
+    memscan_poll();
     if (g_imlog_left <= 0 || addr < 0x80000000u || addr >= 0xA0000000u || !size || size >= 0x4000) return;
     --g_imlog_left;
     const uint8_t* p = g_base + addr; uint64_t h = 1469598103934665603ull;
