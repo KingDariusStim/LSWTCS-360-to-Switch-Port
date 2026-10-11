@@ -89,6 +89,6 @@ Keep Xenia sessions short; tell the user before memory dumps.
   before each commit). A recompiler regen needs the passes re-run in order (HANDOFF_2026-10-09_regen.md §6, then
   `tools/fix_switch_error_returns.py`, `tools/fix_switch_midjumps.py`, `tools/fix_switch_gate.py`, and the two hand
   patches in ppc_recomp.154.cpp at 0x821CAF08 / 0x821CAF5C).
-- Before committing: `git grep --cached -i julian` must be empty (no local paths in tracked files).
+- Before committing: grep the staged files for the local user name (`git grep --cached -i <name>`, see memory `github_repo.md`); it must find nothing (no local paths in tracked files).
 - The PC build (`LSWTCSRuntime/build/LSWTCSRuntime.exe`) is the 10-08 archive build: it lacks the switch repairs
   and the resolve-swap fix. Rebuild it (native mingw64 cmake) before using it to judge game logic.
