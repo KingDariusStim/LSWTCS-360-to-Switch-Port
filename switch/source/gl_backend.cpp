@@ -1608,10 +1608,16 @@ void plan_dead_work(const LswGpuFrame& f, std::vector<uint8_t>& dead) {
     const size_t n = f.draws.size();
     dead.assign(n, 0);
     if (!deadskip_on()) return;
+    // Full-frame copies are never skipped: in a level the game copies the scene into a full-frame buffer every frame
+    // (0x0DE9A000) that nothing samples, and the pause menu shows that buffer while the scene is no longer drawn, so
+    // there is no later copy to resume (dest_dead): the pause screen showed the last cutscene frame (console
+    // 2026-10-11). The chains worth skipping (hub blur passes) are smaller. LSWTCS_GLDEADFULL=1 = skip them too (old).
+    static const bool skip_full = [] { const char* e = getenv("LSWTCS_GLDEADFULL"); return e && e[0] == '1'; }();
     bool any = false;
     for (size_t i = 0; i < n; ++i) {
         const LswGpuDrawRec& r = f.draws[i];
-        if (r.kind == 1 && r.rs_copy_cmd <= 1 && r.rs_dest && dest_dead(r.rs_dest)) { dead[i] = 2; any = true; }
+        const bool full = r.rs_dest_pitch >= 1280 && r.rs_dest_height >= 704;
+        if (r.kind == 1 && r.rs_copy_cmd <= 1 && r.rs_dest && (skip_full || !full) && dest_dead(r.rs_dest)) { dead[i] = 2; any = true; }
     }
     // After the decisions: every resolve of this replay counts as "recent" for the next ones (dest_dead), so all
     // tile resolves of a one-shot copy in this replay get the same answer.
