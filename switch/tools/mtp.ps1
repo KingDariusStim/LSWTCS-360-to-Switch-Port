@@ -3,6 +3,7 @@
 #   mtp.ps1 pull <sd-dir> <local-dir> <name>...   e.g.  mtp.ps1 pull lswtcs switch/hwlogs/run stdout.log trace.log
 #   mtp.ps1 push <local-file> <sd-dir>            e.g.  mtp.ps1 push switch/build/lswtcs.nro lswtcs
 #   mtp.ps1 ls <sd-dir>
+#   mtp.ps1 ren <sd-dir> <old-name> <new-name>    e.g.  mtp.ps1 ren lswtcs lswtcs.nro lswtcs_B_arglocal.nro
 # <sd-dir> is relative to the SD root, '/'-separated. MTP has no overwrite-in-place: push renames an existing file of
 # the same name to <name>_prev_<time><ext> first (the user deletes old copies). Never use this to delete anything on
 # the SD card. Verify a push by pulling it back and comparing hashes.
@@ -69,5 +70,17 @@ switch ($Cmd) {
         Wait-Copy { $i = $dstF.Items() | Where-Object { $_.Name -eq $name }; if ($i) { Get-Size $i } } $want $name
         "pushed $file -> $B/$name ($want bytes)"
     }
-    default { throw "unknown command $Cmd (pull, push, ls)" }
+    'ren' {
+        # mtp.ps1 ren <sd-dir> <old-name> <new-name>: refuses if <new-name> exists (never overwrite or delete)
+        $f = Get-SdFolder $A
+        $new = $Names[0]
+        $item = $f.Items() | Where-Object { $_.Name -eq $B }
+        if (-not $item) { throw "missing on SD: $A/$B" }
+        if ($f.Items() | Where-Object { $_.Name -eq $new }) { throw "already exists on SD: $A/$new" }
+        $item.Name = $new
+        Start-Sleep -Milliseconds 500
+        if (-not ($f.Items() | Where-Object { $_.Name -eq $new })) { throw "rename $A/$B -> $new did not take" }
+        "renamed $A/$B -> $A/$new"
+    }
+    default { throw "unknown command $Cmd (pull, push, ls, ren)" }
 }

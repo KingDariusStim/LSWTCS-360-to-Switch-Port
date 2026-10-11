@@ -25,6 +25,36 @@ locals), 969470b (pause-menu stale frame fix).
 
 ## 1. Argument / stack registers as locals (biggest lever, game-wide guest CPU)
 
+**STATUS (2026-10-11 s6): APPLIED, uncommitted; Eden OK, console test pending, PC not run (user chose Eden).**
+`tools/pass_arg_locals.py` promotes r1, r3-r10, f1-f13: 2.09 M of 2.10 M references in 37,993 functions,
+584 k dirty-only write-backs (forward dataflow over lines + goto edges; sync points nested in `{}` don't clear the
+dirty set; everything is reloaded after a call, incl. r1, dead reloads are dropped by the compiler). Skips: gain 130,
+braceless 52, stmt 18 (multi-line statement at a call), loop 4, brace 3, unsafe 2. Report
+`Convert 360/LSWTCS/arglocal_report.txt`; pre-pass copy `output_pre_arglocal/`. **Build step now:** apply
+`patches/recomp_output_edits.patch`, then `python tools/pass_vec_locals.py "Convert 360/LSWTCS/output" --min-gain 1`,
+then `python tools/pass_arg_locals.py "Convert 360/LSWTCS/output"`. First attempt broke on `ctx` inside a dbg_ram
+string literal (fixed: sites are detected on string-stripped code). PC build: 0 errors. NRO 110.1 -> 108.6 MB.
+Eden hub A/B, alternating (p50/p90/p99 ms, main-thread busy): arg 18.5/21.4/25.8 63.9 %, 18.5/21.4/27.3 64.0 %;
+base (969470b NRO, `switch/build/lswtcs_base969470b.nro`) 18.8/21.6/26.4 66.3 %, 18.9/21.7/28.1 67.3 %: ~2 %
+frame, ~3 points of main-thread time, consistent; underruns unchanged; no crash. Eden JIT-translates ARM code, so
+(as with the vector pass) hardware may show more. Not yet done: lr kept in ctx (155 k stores, as planned).
+Console run 1 (logs `switch/hwlogs/2026-10-11_console_s6_arglocal/`, same env.txt as s4): INCONCLUSIVE / possibly
+worse. Same spot (Negotiations start, ~2,910 draws, 10 s): ft p50 32.7 (s4) -> 36.8 ms, but render replay (host
+code the pass does not touch) also 18.8 -> 22.3 ms, so run conditions (dock/handheld = GPU clock, unknown) likely
+differ. Main-thread busy per frame by draw band also higher (9.4 -> 10.9 ms at 1000-1700 draws), which fence
+spin-waits would inflate if the GPU side is slower. Pending: controlled back-to-back console A/B (old
+`lswtcs_prev_20261011_173503.nro` = 969470b vs new), same mode, ~30 s at the Negotiations start. If the new build
+loses there, keep the pass out of the default build (user rule).
+**Controlled console A/B DONE (same session, same mode, standing at one Negotiations spot, ~1,870 draws; logs
+`switch/hwlogs/2026-10-11_console_ab_{A_old,B_new}/`): KEEP.** Frame time identical (p50 38.0 / p90 43.3 ms both;
+replay 22.9 vs 23.0 ms): this spot is GPU / render-replay bound, so a guest-CPU gain cannot show in fps there. Main
+guest thread busy (SCHEDPROF, steady state) 37.3 % -> 34.8 % of wall time = ~14.2 -> ~13.2 ms per frame (-7 %);
+GPU-command thread unchanged (26.6 / 26.5 %); idle 30.0 -> 32.7 %. No crash in either run. Run 1's "regression"
+was the different spot / conditions. SD card now: `lswtcs/lswtcs.nro` = new (arg locals), old parked as
+`lswtcs_A_old_969470b.nro` (`mtp.ps1 ren` added for A/B swaps; the forwarder only launches `lswtcs.nro`).
+Takeaway for what's next: heavy level spots are GPU-side bound (~23 ms replay + GPU), so §3 / §6 GPU items now pay
+more than further guest-CPU passes at those spots; CPU passes still help CPU-bound scenes (hub, Eden).
+
 Remaining `ctx.` register references in the generated code (`Convert 360/LSWTCS/output`, comments excluded):
 r3-r10 ~1.62 M (r10 441 k, r3 284 k, r9 242 k, r8 166 k, r4 156 k, r5 114 k, r7 108 k, r6 100 k), r1 323 k,
 lr 155 k, f1-f13 ~170 k (f13 56 k, f12 27 k), fpscr 40 k. That is ~14x what the vector pass covered (133 k). Each is
