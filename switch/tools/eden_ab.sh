@@ -10,7 +10,7 @@ LABEL=$1; shift
 OUT="$ROOT/switch/hwlogs/eden_ab/$LABEL"; mkdir -p "$OUT"
 cp "$SD/env.txt" "$OUT/env_orig.txt"
 for kv in "$@"; do printf '%s\n' "$kv" >> "$SD/env.txt"; done
-"$ROOT/switch/tools/eden_hub.sh" 45 > "$OUT/eden_hub.out" 2>&1
+"$ROOT/switch/tools/eden_hub.sh" 45 $NRO > "$OUT/eden_hub.out" 2>&1   # NRO=<path> runs another build
 cp "$OUT/env_orig.txt" "$SD/env.txt"
 cp "$SD/frames.log" "$SD/stdout.log" "$SD/trace.log" "$OUT/" 2>/dev/null
 grep "eden_hub" "$OUT/eden_hub.out" | tr '\n' ' '; echo

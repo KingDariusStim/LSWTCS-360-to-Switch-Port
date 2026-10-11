@@ -49,7 +49,18 @@ and for anything past that minimum.
   output byte store could alias the decoder state, so the bit reader is a value-type copy held in locals.
   Remaining cost: per-symbol Huffman decode (~5 ns/symbol PC) and block headers (~18 %, 5.5 us each); next step
   would be multi-symbol tables.
-- Eden hub A/B (eden_ab.sh): both on p50 19.4 / p90 22.6 ms vs 22.4-23.2 / 25.8-26.5 in today's earlier runs;
+- **2.3 DONE (applied, console test pending)**, `tools/pass_vec_locals.py`: v0-v13 promoted to locals per function,
+  written back to ctx before every call / indirect call / host helper taking ctx / return, reloaded after calls
+  (ctx-mode semantics, no ABI change, no liveness needed). Applied with `--min-gain 1`: 133k of 140k `ctx.v`
+  references in 2479 functions (report `Convert 360/LSWTCS/veclocal_report.txt`; pre-pass copy
+  `output_pre_veclocal/`). **Build step:** `patches/recomp_output_edits.patch` = output BEFORE this pass (the pass
+  output would make it 27.7 MB); to reproduce `output/`, apply the patch, then run
+  `python tools/pass_vec_locals.py "Convert 360/LSWTCS/output" --min-gain 1`. PC: builds and plays (user: >250 fps
+  uncapped, timing fine). Eden hub, back to back: vec 17.8/20.6/27.2 and 18.7/22.9/30.2 vs items 1-2 build
+  18.2/22.6/28.7 (and a noisy 22.1/27.7/41.0): no loss, gain within Eden's noise (Eden JIT-translates the ARM code,
+  so register-allocation gains may only show on hardware). `eden_ab.sh` takes `NRO=<path>` for the other build.
+- **2.4 SKIPPED** (user, 2026-10-11): smaller win than other work.
+- Eden hub A/B (eden_ab.sh): items 1-2 both on p50 19.4 / p90 22.6 ms vs 22.4-23.2 / 25.8-26.5 in today's earlier runs;
   `LSWTCS_NATIVECRT=0` gives 19.7 / 23.4. Fewer underruns in the loading windows. Console test pending.
 
 ### 2.1 Native C-library routines (main thread FPS, loading) — do first
