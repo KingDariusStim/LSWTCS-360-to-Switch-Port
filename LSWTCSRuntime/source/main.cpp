@@ -45,6 +45,7 @@ extern "C" uint32_t ppc_alloc_main_thread_pcr();
 // toggled for A/B testing.
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 #include <mutex>
 // Pool placement: default high (0xE0M, definitely-free) but the game's pointer guards
 // (addr<0x94000000) reject high addrs for LARGER introspected blocks. LSWTCS_POOL_LOW=1
@@ -277,6 +278,168 @@ static void objlog_install() {
     if (e && e[0] == '0') return;
     objlog_install_all(std::make_integer_sequence<int, 28>{});
     printf("[OBJQ] logging state queries / activations of 28 object classes (LSWTCS_OBJLOG=0 turns it off)\n");
+}
+
+// DIAG (LSWTCS_FNLOG, off by default): logs calls to the guest functions in FNLOG_LIST below as [FNLOG] lines (r3-r7
+// and lr on entry, r3 on return; first LSWTCS_FNLOG_MAX calls each, default 200, then every 1000th).
+// LSWTCS_FNLOG=1 logs all of them, LSWTCS_FNLOG=<hex>[,<hex>...] only those. Each entry is a strong definition of the
+// recompiled weak sub_X (like native_lz2k.cpp), so direct calls are caught too, not only calls through the table;
+// adding an address needs a rebuild. Added 2026-10-11 for the missing Cantina NPCs: script command CreateCreatures
+// (0x821AEFB0) / CreateSplineCreatures (0x8219CE28), the .ai2 creature-file loader (0x824D1988),
+// GameObjectHelper::CreateObject (0x824596F8) and the object create it calls (0x823F1338).
+#define FNLOG_LIST(X) X(821AEFB0) X(8219CE28) X(824D1988) X(824596F8) X(823F1338) X(82134AE0) X(82133800) X(8218FF78) \
+    X(824218C0) X(82421E58) X(82423F58) X(82420F78) \
+    X(8230CE10) X(8230CF38) X(823C0C20) X(823EFA88) X(823EFE40) X(823F0628) \
+    X(821680C0) X(821F1F00) X(8241AB08) X(82508C20)
+#define FNLOG_DECL_IMP(A) extern "C" PPC_FUNC(__imp__sub_##A);
+FNLOG_LIST(FNLOG_DECL_IMP)
+static void dbgprint_guest_str(uint8_t* base, uint32_t a, char* out, size_t n);
+static int g_fnlog_mode = -1;   // -1 = not read yet, 0 = off, 1 = all, 2 = listed addresses
+static std::vector<uint32_t> g_fnlog_only;
+static uint64_t g_fnlog_max = 200;
+static void fnlog_read_env() {
+    const char* e = getenv("LSWTCS_FNLOG");
+    if (const char* m = getenv("LSWTCS_FNLOG_MAX")) g_fnlog_max = strtoull(m, nullptr, 10);
+    if (!e || !*e || (e[0] == '0' && !e[1])) { g_fnlog_mode = 0; return; }
+    if (e[0] == '1' && !e[1]) { g_fnlog_mode = 1; return; }
+    for (const char* p = e; *p;) {
+        char* end = nullptr;
+        const unsigned long v = strtoul(p, &end, 16);
+        if (end == p) break;
+        g_fnlog_only.push_back(uint32_t(v));
+        p = end;
+        while (*p == ',' || *p == ' ') ++p;
+    }
+    g_fnlog_mode = 2;
+}
+static void fnlog_call(uint32_t addr, uint64_t& calls, int& on, PPCFunc* imp, PPCContext& ctx, uint8_t* base) {
+    if (on < 0) {
+        if (g_fnlog_mode < 0) fnlog_read_env();
+        on = g_fnlog_mode == 1 ||
+             (g_fnlog_mode == 2 && std::find(g_fnlog_only.begin(), g_fnlog_only.end(), addr) != g_fnlog_only.end());
+    }
+    if (!on) { imp(ctx, base); return; }
+    extern uint64_t g_geom_swaps_pub;
+    const uint64_t n = ++calls;
+    const bool log = n <= g_fnlog_max || n % 1000 == 0;
+    if (log)
+        printf("[FNLOG] swap %llu sub_%08X #%llu r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X lr=%08X\n",
+               (unsigned long long)g_geom_swaps_pub, addr, (unsigned long long)n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+               ctx.r6.u32, ctx.r7.u32, uint32_t(ctx.lr));
+    if (log && addr == 0x821AEFB0u && ctx.r6.u32 >= 0x80000000u && ctx.r7.u32 <= 32) {   // script command: argv r6, argc r7
+        printf("[FNLOG]   CreateCreatures r8=%08X args:", ctx.r8.u32);
+        for (uint32_t i = 0; i < ctx.r7.u32; ++i) {
+            char s[96];
+            dbgprint_guest_str(base, PPC_LOAD_U32(ctx.r6.u32 + 4 * i), s, sizeof s);
+            printf(" \"%s\"", s);
+        }
+        printf(" | [831A0D8C]=%08X [831A0D9C]=%08X\n", PPC_LOAD_U32(0x831A0D8Cu), PPC_LOAD_U32(0x831A0D9Cu));
+    }
+    if (log && (addr == 0x8230CE10u || addr == 0x8230CF38u)) {   // .gsc / character loaders: name strings in r3-r6
+        char s3[64], s4[64], s5[64], s6[64];
+        dbgprint_guest_str(base, ctx.r3.u32, s3, sizeof s3);
+        dbgprint_guest_str(base, ctx.r4.u32, s4, sizeof s4);
+        dbgprint_guest_str(base, ctx.r5.u32, s5, sizeof s5);
+        dbgprint_guest_str(base, ctx.r6.u32, s6, sizeof s6);
+        printf("[FNLOG]   strings r3=\"%s\" r4=\"%s\" r5=\"%s\" r6=\"%s\"\n", s3, s4, s5, s6);
+    }
+    if (log && (addr == 0x823C0C20u || addr == 0x823EFA88u || addr == 0x823EFE40u || addr == 0x823F0628u) &&
+        ctx.r3.u32 >= 0x80000000u) {   // character list: (int16 id, int16 flag) pairs up to id -1
+        printf("[FNLOG]   char list %08X:", ctx.r3.u32);
+        for (uint32_t p = ctx.r3.u32, k = 0; k < 64; ++k, p += 4) {
+            const int16_t id = int16_t(PPC_LOAD_U16(p));
+            if (id == -1) break;
+            printf(" %d/%u", id, PPC_LOAD_U16(p + 2));
+        }
+        printf("\n");
+    }
+    if (log && addr == 0x821680C0u) {   // hub character streamer: the globals it gates on (needed value in comment)
+        const uint32_t ent = PPC_LOAD_U32(0x830CBB50u);
+        printf("[FNLOG]   streamer gates: FCD16C=%u(0) E7EF5C=%u(!0) E76834=%d(-1) E76838=%d(-1) FF5818=%d(<=253) "
+               "0B7908=%u(0) 0BCF90=%u(10 or next<=0) [[0CBB50]+156]=%d F9FE48=%u(0) pool free=%d(>=0xA00000)\n",
+               PPC_LOAD_U32(0x82FCD16Cu), PPC_LOAD_U32(0x82E7EF5Cu), int32_t(PPC_LOAD_U32(0x82E76834u)),
+               int32_t(PPC_LOAD_U32(0x82E76838u)), int32_t(PPC_LOAD_U32(0x82FF5818u)), PPC_LOAD_U32(0x830B7908u),
+               PPC_LOAD_U32(0x830BCF90u), ent >= 0x80000000u ? int32_t(PPC_LOAD_U32(ent + 156)) : -999,
+               PPC_LOAD_U32(0x82F9FE48u), int32_t(PPC_LOAD_U32(0x830C1588u) - PPC_LOAD_U32(0x830C1584u)));
+    }
+    if (n == 1 && addr == 0x82134AE0u) {   // RandomMap pick: per character, the flag byte and the loaded-model slot
+        const uint32_t count = PPC_LOAD_U32(0x8309BAECu), tbl = PPC_LOAD_U32(PPC_LOAD_U32(0x83074438u) + 28);
+        printf("[FNLOG]   RandomMap: %u characters, slot table %08X; flag!=0 or slot!=FFFF:", count, tbl);
+        for (uint32_t i = 0; i < count && i < 1024; ++i) {
+            const uint8_t flag = PPC_LOAD_U8(0x830B77B0u + i);
+            const uint16_t slot = tbl ? PPC_LOAD_U16(tbl + 2 * i) : 0xFFFF;
+            if (flag || slot != 0xFFFF) printf(" %u:%u/%04X", i, flag, slot);
+        }
+        printf("\n");
+        // character manager [0x83074438]: +4 slot capacity, +12/+16 slots used, +32 definitions (76 bytes, +8 name)
+        const uint32_t mgr = PPC_LOAD_U32(0x83074438u), defs = PPC_LOAD_U32(mgr + 32);
+        printf("[FNLOG]   char manager %08X: +4=%u +8=%u +12=%u +16=%u +20=%u; names:", mgr, PPC_LOAD_U32(mgr + 4),
+               PPC_LOAD_U32(mgr + 8), PPC_LOAD_U32(mgr + 12), PPC_LOAD_U32(mgr + 16), PPC_LOAD_U32(mgr + 20));
+        for (uint32_t i = 0; i < count && i < 1024; ++i) {
+            const uint16_t slot = tbl ? PPC_LOAD_U16(tbl + 2 * i) : 0xFFFF;
+            if (slot == 0xFFFF && i != 170 && i != 202) continue;
+            char s[48];
+            dbgprint_guest_str(base, PPC_LOAD_U32(defs + 76 * i + 8), s, sizeof s);
+            printf(" %u=%s%s", i, s, slot == 0xFFFF ? "(not loaded)" : "");
+        }
+        printf("\n");
+    }
+    imp(ctx, base);
+    if (log) printf("[FNLOG]   sub_%08X #%llu returned r3=%08X\n", addr, (unsigned long long)n, ctx.r3.u32);
+}
+#define FNLOG_DEF(A)                                                                \
+    PPC_FUNC(sub_##A) {                                                             \
+        static uint64_t calls = 0;                                                  \
+        static int on = -1;                                                         \
+        fnlog_call(0x##A##u, calls, on, __imp__sub_##A, ctx, base);                  \
+    }
+FNLOG_LIST(FNLOG_DEF)
+
+// DIAG (LSWTCS_DBGPRINT, default on): sub_824541D0 is the game's debug printf, compiled to an empty function in the
+// retail image (9 callers, e.g. "GameObjectHelper::CreateObject - Failed!! creature id=%d, player=%d, flags=0x%x").
+// Prints the format string with up to 5 integer arguments (r4-r8; %s when the argument points at guest text) as
+// [DBGPRINT] lines, first 5000.
+extern "C" PPC_FUNC(__imp__sub_824541D0);
+static void dbgprint_guest_str(uint8_t* base, uint32_t a, char* out, size_t n) {
+    size_t k = 0;
+    if (a >= 0x80000000u && a < 0x9FFFFF00u)
+        for (; k + 1 < n; ++k) {
+            const uint8_t c = PPC_LOAD_U8(a + uint32_t(k));
+            if (!c || c == '\n') break;
+            out[k] = (c >= 32 && c <= 126) ? char(c) : '?';
+        }
+    out[k] = 0;
+}
+PPC_FUNC(sub_824541D0) {
+    static int on = -1;
+    static uint64_t n = 0;
+    if (on < 0) { const char* e = getenv("LSWTCS_DBGPRINT"); on = !(e && e[0] == '0'); }
+    if (on && ++n <= 5000) {
+        char fmt[200], out[400];
+        dbgprint_guest_str(base, ctx.r3.u32, fmt, sizeof fmt);
+        const uint32_t a[5] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32};
+        size_t o = 0;
+        int ai = 0;
+        for (const char* p = fmt; *p && o + 1 < sizeof out; ++p) {
+            if (*p != '%' || !p[1]) { out[o++] = *p; continue; }
+            const char* q = p + 1;
+            while (*q && strchr("0123456789.-+ #lh", *q)) ++q;
+            if (!*q) break;
+            p = q;
+            if (*q == '%') { out[o++] = '%'; continue; }
+            char s[96];
+            const uint32_t v = ai < 5 ? a[ai++] : 0;
+            if (*q == 's') dbgprint_guest_str(base, v, s, sizeof s);
+            else if (*q == 'x' || *q == 'X') snprintf(s, sizeof s, "%x", v);
+            else if (*q == 'f' || *q == 'g') snprintf(s, sizeof s, "<float>");
+            else snprintf(s, sizeof s, "%d", int32_t(v));
+            o += size_t(snprintf(out + o, sizeof out - o, "%s", s));
+            if (o >= sizeof out) o = sizeof out - 1;
+        }
+        out[o] = 0;
+        printf("[DBGPRINT] %s (lr=%08X)\n", out, uint32_t(ctx.lr));
+    }
+    __imp__sub_824541D0(ctx, base);
 }
 
 static void camcmd_log_install() {
@@ -983,10 +1146,16 @@ int main() {
     // off the titles level / menu-scene load) when this is 0. The Xenia dump was taken
     // from a running instance, so it ships =1 and the frontend init is skipped forever
     // (the long-standing "menu scene never requested" blocker). Zero it so the first
-    // main-loop iteration performs the game's real init. LSWTCS_FRONTINIT=0 disables.
+    // main-loop iteration performs the game's real init.
+    // 2026-10-11: OFF by default (LSWTCS_FRONTINIT=1 turns it back on). The pristine image
+    // (Default.xex) also has 1 here, and the boot no longer needs the patch (the other
+    // kickoff gates were fixed since). With the flag left at 1 the game behaves like Xenia:
+    // the developer intro card plays at boot, and the hub character streamer sub_821680C0
+    // (which requires this flag != 0) loads "moseisleycitizen", so the Cantina's
+    // type=RandomMap creatures (the non-playable NPCs) spawn; with it zeroed they never did.
     {
         const char* e = getenv("LSWTCS_FRONTINIT");
-        if (!e || e[0] != '0') {
+        if (e && e[0] == '1') {
             uint32_t* p = (uint32_t*)(g_base + 0x82E7EF5C);
             printf("[PATCH] frontend-init flag 0x82E7EF5C = 0x%08X -> 0x00000000 (main loop will run sub_82264240 init)\n",
                    __builtin_bswap32(*p));

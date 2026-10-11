@@ -1,5 +1,31 @@
 # HANDOFF 2026-10-11: why do NPCs not appear in the main hub (Mos Eisley Cantina)?
 
+## RESOLVED (2026-10-11, same day)
+
+The user confirmed in Xenia that non-playable NPCs are present in the original game with the same save. Cause, traced
+in Eden with the console's current save (`savegame_78_4c`):
+
+1. The hub's `.ai2` file (`Levels\Map\Map\ai\Map.ai2`) loads, and the script command `CreateCreatures`
+   (`sub_821AEFB0`) runs repeatedly with `locator_set=MainRoomIdle|MainRoomDoor type=RandomMap script=party`.
+2. `type=RandomMap` (`sub_82134AE0` → `sub_82213BD0`) picks a random character that has a loaded model and is not a
+   player; the fallback is `moseisleycitizen` (ids 170 / 202, globals 0x82E75D60/64). In the port only Obi-Wan,
+   Qui-Gon and mapcar were loaded, so every pick returned -1 and nothing spawned.
+3. The citizens are loaded by the hub character streamer `sub_821680C0` (per frame, from `sub_821F1F00`), which
+   requires `[0x82E7EF5C] != 0`. Xenia hub snapshot: 1. Port: 0, because the boot patch `LSWTCS_FRONTINIT` in
+   main.cpp zeroed that word (an early-2026 fix for the "menu scene never requested" boot hang).
+4. The pristine image (Default.xex) has 1 there as well, and the game now boots without the patch. **Fix:** the
+   patch is OFF by default (`LSWTCS_FRONTINIT=1` turns it back on). Side effect: the developer intro card now plays
+   at boot as in Xenia (the title level appears at about 74 s in Eden instead of 20 s).
+
+Verified in Eden: RandomMap picks return 170/202 and the user saw the NPCs in the Cantina. Not yet re-checked:
+the Episode 2 disco ball, the Kamino camera and the colours (§3 step 4), and the PC build (still the 10-08 archive
+build).
+
+New diagnostics in main.cpp: `LSWTCS_FNLOG` (`=1` for all entries, or a comma list of hex addresses) logs calls to the
+functions in `FNLOG_LIST` (strong overrides of the recompiled weak `sub_X`, so direct calls are caught; adding
+an address needs a rebuild), with extra dumps for CreateCreatures, RandomMap, character lists and the streamer
+gates. `LSWTCS_DBGPRINT` (default on) prints the game's own debug printf (`sub_824541D0`) as `[DBGPRINT]`.
+
 Audience: the next agent. Task: find out why the Cantina hub has no wandering NPC characters in the port (PC build,
 Switch build in Eden and on the console), fix it, and verify against the original game in Xenia. Read the standing
 rules in `HANDOFF_2026-10-08_switch.md` §4–§6 (ask before every SD-card copy, never delete on the SD card, ask
