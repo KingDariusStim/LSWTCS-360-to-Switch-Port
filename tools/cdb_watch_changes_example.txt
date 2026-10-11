@@ -1,0 +1,14 @@
+$$ cdb script (PC build, attach with: cdb -p <pid> -pd -cf this.txt). Watches one guest word for VALUE CHANGES only and
+$$ logs the new value + host call stack (resolve frames with the build map: LSWTCSRuntime.map .text$__imp__sub_X ranges).
+$$ g_base = poi(LSWTCSRuntime+0x752aea8) is the 10-08 PC exe; take the offset of g_base from the current map.
+$$ Stays attached (bc * ; gc at the limit): detaching from inside a breakpoint handler crashed the game twice.
+$$ Example target: 0x94ADD588 = DiscoBall_spin state word (Episode 2 hub, 2026-10-10).
+.echo BEGIN
+r $t0 = poi(LSWTCSRuntime+0x752aea8)
+r $t2 = @$t0 + 0x94ADD588
+r $t1 = 0
+r $t4 = dwo(@$t2)
+? @$t0
+dd @$t2 L1
+ba w4 @$t2 "r $t5 = dwo(@$t2); .if (@$t5 == @$t4) { gc } .else { r $t1 = @$t1 + 1; .printf \"CHANGE %d: %08x -> %08x\\n\", @$t1, @$t4, @$t5; r $t4 = @$t5; kn 30; .if (@$t1 >= 10) { .echo LIMIT; bc *; gc } .else { gc } }"
+g
