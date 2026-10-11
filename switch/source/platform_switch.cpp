@@ -96,6 +96,33 @@ extern "C" int __wrap_pthread_create(pthread_t* t, const pthread_attr_t* attr, v
     return rc;
 }
 
+// Host-only bursts of work by a guest thread that has left the scheduler rotation (native_reverb.cpp,
+// LSWTCS_REVERBOFF): every guest thread is on core 0, so the work moves to core 2 at the audio output thread's
+// priority (0x2B: ahead of the glthread worker 0x2C and the compile worker 0x2D, which would otherwise keep the core;
+// Horizon does not time-slice equal priorities) and comes back afterwards.
+static thread_local s32 g_offcore_prev_core = -1;
+static thread_local u64 g_offcore_prev_mask = 0;
+static thread_local s32 g_offcore_prev_prio = -1;
+extern "C" void lsw_offcore_begin_prio(int prio);
+extern "C" void lsw_offcore_begin() { lsw_offcore_begin_prio(0x2B); }
+// Same with a chosen priority (the PM4 walk, kernel_stubs.cpp LSWTCS_WALKOFF: its multi-ms bursts at 0x2B starved the
+// glthread worker on core 2 and with it the render thread).
+extern "C" void lsw_offcore_begin_prio(int new_prio) {
+    s32 core = 0; u64 mask = 0;
+    if (R_FAILED(svcGetThreadCoreMask(&core, &mask, CUR_THREAD_HANDLE))) { g_offcore_prev_core = -1; return; }
+    s32 prio = 0;
+    g_offcore_prev_prio = R_SUCCEEDED(svcGetThreadPriority(&prio, CUR_THREAD_HANDLE)) ? prio : -1;
+    g_offcore_prev_core = core; g_offcore_prev_mask = mask;
+    svcSetThreadPriority(CUR_THREAD_HANDLE, new_prio);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, 2, 1u << 2);
+}
+extern "C" void lsw_offcore_end() {
+    if (g_offcore_prev_core < 0) return;
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_offcore_prev_core, g_offcore_prev_mask);
+    if (g_offcore_prev_prio >= 0) svcSetThreadPriority(CUR_THREAD_HANDLE, g_offcore_prev_prio);
+    g_offcore_prev_core = -1;
+}
+
 // C11 thrd_create for Mesa: newlib defines thrd_success = 4, but switch-mesa 20.1's u_thread_create() does
 // `if (ret) return 0;` (assumes thrd_success == 0), so every Mesa worker thread was created and then reported as
 // failed: util_queue_init() returned false -> glthread never enabled, Mesa's other queues (e.g. the shader disk-cache

@@ -59,6 +59,9 @@ int lsw_gpu_prepare(const uint32_t* regs, const uint32_t* vs_ucode_be, uint32_t 
                     uint32_t rt_width, uint32_t rt_height, LswGpuDraw* out);
 // Only the viewport and scissor of lsw_gpu_prepare (same values) for a draw whose shaders are known (Switch bridge).
 void lsw_gpu_viewport_scissor(const uint32_t* regs, uint32_t ps_writes_depth, float viewport[6], uint32_t scissor[4]);
+// Same, and patches the viewport-dependent system constants (NDC scale / offset, point radius) of a copy of another
+// tile's system-constant block (sys, lsw_gpu_system_constants_size() bytes) for these registers (Switch bridge).
+void lsw_gpu_tile_state(const uint32_t* regs, uint32_t ps_writes_depth, float viewport[6], uint32_t scissor[4], void* sys);
 
 // ── Textures ──
 struct LswGpuTexDesc {

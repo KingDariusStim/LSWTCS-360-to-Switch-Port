@@ -2003,13 +2003,12 @@ PresentSrc replay() {
             continue;
         }
         if (r.tile_repeat) {
-            // A walk-time copy (kernel_stubs.cpp tile skipping) outside an untiled group: it carries tile 0's system
-            // constants, so drawing it would put tile 0's picture into this tile. Dropped and counted ([GLUNTILE]);
-            // it means the walk's repeat check and plan_untile disagree.
-            ++draw_i;
+            // A walk-time copy (kernel_stubs.cpp tile skipping) outside an untiled group: drawn like any record (it has
+            // its own tile's viewport, scissor and system constants, lsw_gpu_tile_state). Until 2026-10-11 these were
+            // dropped, and everything below tile 0 that only those tiles drew went missing (characters cut off at row
+            // 320 in an Episode I level). Counted: it means the walk's repeat check and plan_untile disagree.
             static uint64_t n = 0;
-            if ((++n % 1000) == 1) printf("[GLUNTILE] %llu walk-time tile copies outside an untiled group dropped\n", (unsigned long long)n);
-            continue;
+            if ((++n % 1000) == 1) printf("[GLUNTILE] %llu walk-time tile copies outside an untiled group drawn\n", (unsigned long long)n);
         }
         if (r.kind == 1) {   // EDRAM resolve
             if (g_capture_frame)
@@ -2038,8 +2037,9 @@ PresentSrc replay() {
             continue;
         }
         ++draw_i;
-        // 1. Vertex data into shared memory (every recorded draw: residency tracking assumed it).
-        for (uint32_t k = 0; k < r.range_count; ++k) upload(f.ranges[r.first_range + k]);
+        // 1. Vertex data into shared memory (every recorded draw: residency tracking assumed it). A walk-time tile copy
+        //    shares tile 0's ranges, uploaded with tile 0's record.
+        if (!r.tile_repeat) for (uint32_t k = 0; k < r.range_count; ++k) upload(f.ranges[r.first_range + k]);
         if (dead[rec_i] == 1) { ++dead_draws; continue; }   // output only feeds a skipped resolve
         const auto* vs = static_cast<const LswGlShader*>(r.vs_dxbc);
         const auto* ps = static_cast<const LswGlShader*>(r.ps_dxbc);

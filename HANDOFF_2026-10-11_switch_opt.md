@@ -10,6 +10,14 @@ scripts (no sed/heredoc on C).
 
 ## 0. First thing to do: read the console's `[CVTEST]` line
 
+**RESULT (2026-10-11, console, `switch/hwlogs/2026-10-11_cvtest/`): timed waits are ACCURATE on hardware**:
+`cv.wait_for(2ms) took us: 2012 2002 2003 2005 2002 | sleep_for(1ms) took 1003 us`. The instant-return theory below
+is ruled out; no libnx-wait rewrite is needed. With the current build (IOWAKE with its own deadline) the level-load
+peak was **21,493 switches / 5 s** (was 73,890), in line with Eden's ~28k, so the storm is gone either way. In-level
+steady state on the console: IDLE ≈ 0 %, core 0 split main 54–57 % / GPU-command thread (6) 24–28 % / audio (1)
+15–16 %, so work-list items 2–3 (reverb, GPU-command copying) are next. (The 61 s frame at t=214.9 s is the console
+being suspended to the HOME menu, not a hang.)
+
 The last build on the console (`sdmc:/lswtcs/lswtcs.nro`, sha256 C8036B69…, commit of this handoff) runs a one-time
 self-test at the first frame and prints:
 
@@ -41,6 +49,64 @@ followed a garbage pointer, `0x3CDAF63D`, from the just-loaded `captainpanaka_36
 was overclocked). Handshake order of the read-ahead double buffer was checked and is unchanged by IOWAKE. If it
 recurs at stock clocks, suspect a race the switch storm made more likely: diff the loaded file bytes against the
 archive (`LSWTCS_LZ2KCHECK=1` checks decompression only).
+
+## 0b. DONE 2026-10-11 (s3): reverb off core 0 + IRQL depth leak (pushed to the console SD, sha256 1CBEA489…)
+
+- **Native reverb, fast path**: generated code now uses a per-call local copy of the address map (`Fast F`) and a
+  template `S` for the diagnostic path, so byte stores no longer force reloads (`-fno-strict-aliasing`). Eden: native
+  0.65 -> 0.452 ms/block (guest 0.439). `LSWTCS_REVERBCHECK=1` now checks the *shipping* instance (runs it on the real
+  memory with the shadow state swapped in, then restores the guest's result): 0 mismatches / 10,000 blocks with
+  `LSWTCS_REVERBTEST=1`. **Default now native** (`LSWTCS_REVERB=0` = guest).
+- **Off the rotation** (`LSWTCS_REVERBOFF`, default 1): the audio thread runs the native reverb via
+  `lswtcs_gil_blocking_urgent` (kernel_stubs.cpp: leaves the rotation, on return takes the next handoff and pokes
+  `lswtcs_gil_ctr` so the holder yields at its next function entry); on Switch it also moves to core 2 at priority
+  0x2B (`lsw_offcore_begin/end`, platform_switch.cpp; move ~8 us each way).
+- **IRQL depth leak** (`LSWTCS_IRQLFIX`, default 1): `KeRaiseIrqlToDpcLevel` counted as a spinlock section but the game
+  lowers IRQL mostly without `KfLowerIrql` (main: 2137 raises / 1511 lowers -> depth 626 forever), so main and the
+  GPU-command thread yielded only every 9th quantum (~1.3 ms turns). Bare raises are no longer counted (spinlock
+  acquire/release pairs still are; they balance).
+- Eden hub, back to back (PC slower than this morning after a restart, compare within the set): default before
+  p50/p90 24.9/31.2 ms, hub underruns 744-1712 per 10 s; IRQLFIX 23.9/28.1, 0-6; IRQLFIX+REVERBOFF 21.4/25.0, 3-6;
+  final defaults 22.4/26.9, 1-4. Audio thread on core 0: 16 % -> 7 %. Switches/5 s 5.3k -> 11k (shorter turns).
+- Diagnostics left in: `[GILURGENT]` (rejoin wait by holder; GPU-command thread still ~1.4 ms, it holds the turn in
+  host work), `[SPINDBG]` (per-thread lock-call counts), `[AUDIO] ... peak` (output level; 2026-10-11 the user's
+  "no audio in Eden" was Windows outputting to Steam Streaming Speakers, not the game).
+- Console test needed: underruns/choppiness by ear, fps in a level, any crash (IRQLFIX removes the old atomicity of
+  bare raised-IRQL sections). Item 2 (GPU-command thread) not started.
+
+## 0c. GPU-command thread, 2026-10-11 (s3) — small win; off-core walking is a loss
+
+- Per-draw profile (`LSWTCS_PREPPROF=1`: `[PREPPROF]` stages of the Switch `lsw_gpu_prepare`, `[RECPROF]` recorder; Eden
+  hub, us per draw, ~800 draws/frame): shader lookup 0.80 (incl. clearing the 2.9 KB LswGpuDraw), constant blocks into
+  the arena 0.93-1.35, record build 0.74, float packing 0.68, system constants 0.38, viewport 0.35, modifications 0.30,
+  GLSL lookup 0.23. Block reuse from the previous draw: sys 85 %, VS floats 40 %, PS floats 80 %, bool 99 %, fetch 34 %.
+- Done: prepare clears only the scalar fields; the draw record is built in place in `f.draws` (was a 1760 B local,
+  zeroed and copied); bool/loop and fetch constants are passed straight from the register file. Record time per frame
+  4.69 -> 4.49 ms, prepare 2.02 -> 1.87 ms.
+- Tried, no gain: masking the fetch block to the slots the shaders use (reuse stays 34 %: the used vertex-fetch slots
+  are what changes, every mesh has its own buffer). Removed.
+- Tried, LOSS: `LSWTCS_WALKOFF=1` (opt-in, default off) walks large ring-level IBs (>= `LSWTCS_WALKOFF_MIN`, 4096 dwords)
+  off the rotation on core 2 (`WalkNeedsTurn` around interrupts / waits; other walkers wait in `walk_wait_other`).
+  Eden hub p50 23.1 ms -> 39.4 (prio 0x2B: starves the glthread worker, replay 8 -> 38 ms), 35.7 (0x2C), 43.1 (0x2D):
+  the game waits on GPU fences every frame, so the walk's latency is in the frame, and on shared core 2 it ran 3-4x
+  slower. Revisit only if a core has real spare time on hardware.
+- Left: vertex hashing 1.15 ms/frame (~1060 pages hashed per frame; needs write tracking to skip), constants (fetch
+  block new 66 % of draws), viewport/system constants recomputed per draw (could be memoised on register generations).
+
+## 0d. 2026-10-11 (s3): characters cut off below row 320 (console, Episode I palace) — FIXED; controls swapped
+
+- Captures `switch/hwlogs/2026-10-11_charglitch/` (shot_15031 + resdump of that frame): character colour and depth end
+  at row 320 (tile 0's bottom); shadows complete. stdout: `[GLUNTILE] 388001 walk-time tile copies outside an untiled
+  group dropped`. Walk-time tile skipping records later tiles' draws as copies of tile 0's; when the replay's
+  plan_untile rejects the group (levels with characters: different segment structure), the copies were DROPPED (they
+  carried tile 0's system constants), so nothing below tile 0 that the later tiles drew appeared.
+- Fix: the copy gets its own system constants — tile 0's block with the viewport-derived fields (NDC scale/offset,
+  point radius) patched by `lsw_gpu_tile_state` (gl_bridge.cc; every other register equals tile 0's by the walk's
+  check) — and the replay draws such copies like any record (residency upload skipped: tile 0 uploaded the shared
+  ranges). Log now says "... outside an untiled group drawn". Eden Ep I Ch 1: characters complete; the palace scene
+  itself still needs a console check. Open question: why plan_untile rejects those groups (LSWTCS_GLUNTILEDBG lines).
+- Controls (win32_switch.cpp, user request): Switch A/B -> 360 B/A, X/Y -> Y/X (bottom button = 360 A), right stick
+  Y inverted.
 
 ## 1. Where the time goes now (Eden, Cantina hub, standing still)
 

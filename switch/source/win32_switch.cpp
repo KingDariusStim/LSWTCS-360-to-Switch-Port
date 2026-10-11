@@ -496,9 +496,10 @@ DWORD WINAPI nx_xinput_get_state(DWORD slot, void* out) {
         {HidNpadButton_Right, 0x0008}, {HidNpadButton_Plus, 0x0010}, {HidNpadButton_Minus, 0x0020},
         {HidNpadButton_StickL, 0x0040}, {HidNpadButton_StickR, 0x0080}, {HidNpadButton_L, 0x0100},
         {HidNpadButton_R, 0x0200},
-        // Face buttons by label (Nintendo convention: A confirms/jumps), not by position.
-        {HidNpadButton_A, 0x1000}, {HidNpadButton_B, 0x2000}, {HidNpadButton_X, 0x4000},
-        {HidNpadButton_Y, 0x8000}};
+        // Face buttons by position (user's choice 2026-10-11): Switch A/B/X/Y act as the 360 pad's B/A/Y/X, i.e. the
+        // bottom button (Switch B) is the 360's A. (Was by label: Switch A = 360 A.)
+        {HidNpadButton_A, 0x2000}, {HidNpadButton_B, 0x1000}, {HidNpadButton_X, 0x8000},
+        {HidNpadButton_Y, 0x4000}};
     for (auto& m : kMap) if (b & m.nx) st.buttons |= m.xi;
     // Capture combo (LSWTCS_CAPCOMBO, default on): hold ZL + ZR and click the right stick -> screenshot +
     // per-draw [GLDRAWCAP] log in stdout.log (shot_now) + every resolve/render target as PNG (resdump_now), for
@@ -519,7 +520,8 @@ DWORD WINAPI nx_xinput_get_state(DWORD slot, void* out) {
     st.lt = (b & HidNpadButton_ZL) ? 255 : 0;
     st.rt = (b & HidNpadButton_ZR) ? 255 : 0;
     const HidAnalogStickState l = padGetStickPos(&g_pad, 0), r = padGetStickPos(&g_pad, 1);
-    st.lx = SHORT(l.x); st.ly = SHORT(l.y); st.rx = SHORT(r.x); st.ry = SHORT(r.y);
+    // Right stick pitch inverted (user's choice 2026-10-11). Clamped so -(-32768) cannot overflow.
+    st.lx = SHORT(l.x); st.ly = SHORT(l.y); st.rx = SHORT(r.x); st.ry = SHORT(-(r.y < -32767 ? -32767 : int32_t(r.y)));
     memcpy(out, &st, sizeof st);
     return ERROR_SUCCESS;
 }

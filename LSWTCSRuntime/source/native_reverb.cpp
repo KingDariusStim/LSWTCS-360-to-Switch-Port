@@ -20,7 +20,14 @@
 // instructions with the recompiled code's exact arithmetic, so its output is bit-identical to the guest's; it is
 // faster because registers are locals, memory is not volatile and the 17 KB stack frame is a native buffer.
 //
-// LSWTCS_REVERB (default 0 = guest code): 1 = run the native code.
+// LSWTCS_REVERB (default 1 = native code): 0 = the guest code.
+// LSWTCS_REVERBOFF (default 1, with the native code): run it off the guest scheduler's rotation (lswtcs_gil_blocking_urgent),
+//   so other guest threads run while it computes, as they did next to the 360's audio hardware thread; on the
+//   Switch the calling thread also moves to core 2 for the call (lsw_offcore_begin/end, platform_switch.cpp), since
+//   every guest thread shares core 0. The reverb reads and writes only its own state, its inputs and outputs, and
+//   the audio thread keeps whatever guest locks it holds, so the output is the same. Needs LSWTCS_IRQLFIX
+//   (kernel_stubs.cpp) to get the turn back quickly. Eden hub 2026-10-11, back to back: p50/p90 23.9/28.1 ms ->
+//   21.4/25.0 ms, audio thread on core 0 17.1 % -> 5.2 %, underruns unchanged. =0: native, in turn.
 // LSWTCS_REVERBTRACE=1 (diagnostic): log which guest memory the reverb reads and writes ([REVERB] ranges).
 // LSWTCS_REVERBCHECK=1 (diagnostic): the guest runs as usual; the native code runs on a shadow copy of the reverb
 //   state with the same input; outputs are compared every block ([REVERB] MISMATCH). LSWTCS_REVERBWAV=N also
@@ -45,6 +52,11 @@
 
 extern "C" void dbg_ram(const char* fmt, ...);
 extern "C" PPC_FUNC(__imp__sub_827E2208);
+extern "C" void lswtcs_gil_blocking_urgent(void (*fn)(void*), void* arg);   // kernel_stubs.cpp
+// Move the calling thread to a free core for a burst of host-only work and back. The Switch defines them
+// (platform_switch.cpp); elsewhere host threads are not pinned and these do nothing.
+extern "C" __attribute__((weak)) void lsw_offcore_begin() {}
+extern "C" __attribute__((weak)) void lsw_offcore_end() {}
 
 namespace {
 struct Vec { union { float f[4]; uint32_t u[4]; uint8_t b[16]; }; };   // host lane k = guest element 3 - k
@@ -81,30 +93,52 @@ __attribute__((noinline)) uint8_t* host_slow(Env& E, uint32_t a, bool write) {
     uint8_t* base = E.base;
     return PPC_HOST(a);
 }
-__attribute__((always_inline)) inline uint8_t* host(Env& E, uint32_t a, bool write) {
-    if (a - kFrameBase < kFrameSize) return E.frame + (a - kFrameBase);
-    if (__builtin_expect(E.slow, 0)) return host_slow(E, a, write);
-    uint8_t* base = E.base;
-    return PPC_HOST(a);
+// Per-call local copy of the address map. The generated functions build one at entry (fast_of); being a local whose
+// address never escapes, the compiler knows the reverb's byte stores cannot change it and keeps it in registers
+// (through Env& or the global ppc_view_base it was reloaded after every store: -fno-strict-aliasing).
+// S = slow path (redirects / tracing); only the diagnostic instance of the generated code has it.
+#if defined(LSW_ADDR_FOLD_CMOV) && LSW_ADDR_FOLD_CMOV
+#error "native_reverb: Fast assumes the table form of PPC_HOST"
+#endif
+struct Fast { uint8_t* frame; uint8_t* vb[8]; };
+__attribute__((always_inline)) inline Fast fast_of(const Env& E) {
+    Fast F{E.frame, {}};
+    for (int i = 0; i < 8; ++i) F.vb[i] = ppc_view_base[i];
+    return F;
 }
-__attribute__((always_inline)) inline uint32_t ld32(Env& E, uint32_t a) { uint32_t v; memcpy(&v, host(E, a, false), 4); return __builtin_bswap32(v); }
-__attribute__((always_inline)) inline void st32(Env& E, uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(host(E, a, true), &v, 4); }
-__attribute__((always_inline)) inline float ldf(Env& E, uint32_t a) { uint32_t v = ld32(E, a); float f; memcpy(&f, &v, 4); return f; }
-__attribute__((always_inline)) inline void stf(Env& E, uint32_t a, float f) { uint32_t v; memcpy(&v, &f, 4); st32(E, a, v); }
-inline void ldv(Env& E, uint32_t a, Vec& v) { const uint8_t* p = host(E, a, false); for (int i = 0; i < 16; ++i) v.b[15 - i] = p[i]; }
-inline void stv(Env& E, uint32_t a, const Vec& v) { uint8_t* p = host(E, a, true); for (int i = 0; i < 16; ++i) p[i] = v.b[15 - i]; }
-inline void lvlx(Env& E, uint32_t ea, Vec& v) {
+template <bool S> __attribute__((always_inline)) inline uint8_t* host(const Fast& F, Env& E, uint32_t a, bool write) {
+    if (a - kFrameBase < kFrameSize) return F.frame + (a - kFrameBase);
+    if (S) return host_slow(E, a, write);
+    return F.vb[a >> 29] + a;
+}
+template <bool S> __attribute__((always_inline)) inline uint32_t ld32(const Fast& F, Env& E, uint32_t a) { uint32_t v; memcpy(&v, host<S>(F, E, a, false), 4); return __builtin_bswap32(v); }
+template <bool S> __attribute__((always_inline)) inline void st32(const Fast& F, Env& E, uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(host<S>(F, E, a, true), &v, 4); }
+template <bool S> __attribute__((always_inline)) inline float ldf(const Fast& F, Env& E, uint32_t a) { uint32_t v = ld32<S>(F, E, a); float f; memcpy(&f, &v, 4); return f; }
+template <bool S> __attribute__((always_inline)) inline void stf(const Fast& F, Env& E, uint32_t a, float f) { uint32_t v; memcpy(&v, &f, 4); st32<S>(F, E, a, v); }
+template <bool S> inline void ldv(const Fast& F, Env& E, uint32_t a, Vec& v) { const uint8_t* p = host<S>(F, E, a, false); for (int i = 0; i < 16; ++i) v.b[15 - i] = p[i]; }
+template <bool S> inline void stv(const Fast& F, Env& E, uint32_t a, const Vec& v) { uint8_t* p = host<S>(F, E, a, true); for (int i = 0; i < 16; ++i) p[i] = v.b[15 - i]; }
+template <bool S> inline void lvlx(const Fast& F, Env& E, uint32_t ea, Vec& v) {
     memset(v.b, 0, 16);
     const uint32_t n = 16 - (ea & 15);
-    for (uint32_t i = 0; i < n; ++i) v.b[15 - i] = *host(E, ea + i, false);
+    for (uint32_t i = 0; i < n; ++i) v.b[15 - i] = *host<S>(F, E, ea + i, false);
 }
-inline void lvrx(Env& E, uint32_t ea, Vec& v) {
+template <bool S> inline void lvrx(const Fast& F, Env& E, uint32_t ea, Vec& v) {
     memset(v.b, 0, 16);
     const uint32_t n = ea & 15, b0 = ea & ~15u;
-    for (uint32_t j = 0; j < n; ++j) v.b[n - 1 - j] = *host(E, b0 + j, false);
+    for (uint32_t j = 0; j < n; ++j) v.b[n - 1 - j] = *host<S>(F, E, b0 + j, false);
 }
-inline void stvlx(Env& E, uint32_t ea, const Vec& v) { const uint32_t n = 16 - (ea & 15); for (uint32_t i = 0; i < n; ++i) *host(E, ea + i, true) = v.b[15 - i]; }
-inline void stvrx(Env& E, uint32_t ea, const Vec& v) { const uint32_t n = ea & 15; for (uint32_t i = 0; i < n; ++i) *host(E, ea - i - 1, true) = v.b[i]; }
+template <bool S> inline void stvlx(const Fast& F, Env& E, uint32_t ea, const Vec& v) { const uint32_t n = 16 - (ea & 15); for (uint32_t i = 0; i < n; ++i) *host<S>(F, E, ea + i, true) = v.b[15 - i]; }
+template <bool S> inline void stvrx(const Fast& F, Env& E, uint32_t ea, const Vec& v) { const uint32_t n = ea & 15; for (uint32_t i = 0; i < n; ++i) *host<S>(F, E, ea - i - 1, true) = v.b[i]; }
+#define LD32(a) ld32<S>(F, E, (a))
+#define ST32(a, v) st32<S>(F, E, (a), (v))
+#define LDF(a) ldf<S>(F, E, (a))
+#define STF(a, f) stf<S>(F, E, (a), (f))
+#define LDV(a, v) ldv<S>(F, E, (a), v)
+#define STV(a, v) stv<S>(F, E, (a), v)
+#define LVLX(a, v) lvlx<S>(F, E, (a), v)
+#define LVRX(a, v) lvrx<S>(F, E, (a), v)
+#define STVLX(a, v) stvlx<S>(F, E, (a), v)
+#define STVRX(a, v) stvrx<S>(F, E, (a), v)
 inline void vor(Vec& d, const Vec& a, const Vec& b) { for (int i = 0; i < 4; ++i) d.u[i] = a.u[i] | b.u[i]; }
 inline void vspltw(Vec& d, const Vec& s, int e) { const uint32_t x = s.u[3 - e]; for (int i = 0; i < 4; ++i) d.u[i] = x; }
 
@@ -112,10 +146,10 @@ inline void vspltw(Vec& d, const Vec& s, int e) { const uint32_t x = s.u[3 - e];
 
 int mode() {
     static const int m = [] {
-        // Default: guest code until the native version is faster (2026-10-09 Eden: native 0.65 ms vs guest 0.51 ms
-        // per block; bit-identical). LSWTCS_REVERB=1 runs the native code.
+        // Default: native (bit-identical; 2026-10-11 Eden 0.452 vs guest 0.439 ms per block in turn, and it can run
+        // off the rotation, see LSWTCS_REVERBOFF). LSWTCS_REVERB=0 runs the guest code.
         const char* e = getenv("LSWTCS_REVERB");
-        if (!(e && e[0] == '1')) {
+        if (e && e[0] == '0') {
             const char* t = getenv("LSWTCS_REVERBTRACE");
             const char* c = getenv("LSWTCS_REVERBCHECK");
             if (t && t[0] == '1') return 3;
@@ -129,10 +163,16 @@ int mode() {
     return m;
 }
 
+bool off_rotation() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_REVERBOFF"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 uint64_t now_ns() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 uint64_t g_calls = 0, g_ns = 0, g_guest_ns = 0, g_mismatch = 0;
+uint64_t g_off_move_ns = 0, g_off_dsp_ns = 0, g_off_back_ns = 0;   // LSWTCS_REVERBOFF: core move there, DSP, move back
 alignas(128) thread_local uint8_t g_frame[kFrameSize];   // per thread: the guest stack frame
 
 // ---- trace: which guest memory does the reverb touch? ----
@@ -194,12 +234,27 @@ PPC_FUNC(sub_827E2208) {
         Env E{base, ctx.fpscr, g_frame};
         if (m == 3) { E.rd_pages = &g_rd; E.wr_pages = &g_wr; E.slow = true; }
         const uint64_t t0 = now_ns();
-        rv_827E2208(E, kFrameSp, r3, r4, r5, r6, r7);
+        if (m == 3) rv_827E2208<true>(E, kFrameSp, r3, r4, r5, r6, r7);
+        else if (off_rotation()) {
+            struct Job { Env* E; uint32_t r3, r4, r5, r6, r7; } job{&E, r3, r4, r5, r6, r7};
+            lswtcs_gil_blocking_urgent([](void* p) {
+                const Job& j = *static_cast<const Job*>(p);
+                const uint64_t a = now_ns();
+                lsw_offcore_begin();
+                const uint64_t b = now_ns();
+                rv_827E2208<false>(*j.E, kFrameSp, j.r3, j.r4, j.r5, j.r6, j.r7);
+                const uint64_t c = now_ns();
+                lsw_offcore_end();
+                g_off_move_ns += b - a; g_off_dsp_ns += c - b; g_off_back_ns += now_ns() - c;
+            }, &job);
+        } else rv_827E2208<false>(E, kFrameSp, r3, r4, r5, r6, r7);
         g_ns += now_ns() - t0;
         ++g_calls;
         if (m == 3 && (g_calls == 200 || g_calls == 2000)) trace_report(r3);
         if (g_calls % 3000 == 0)
-            dbg_ram("[REVERB] native: %llu blocks, %.3f ms per block\n", (unsigned long long)g_calls, g_ns / 1e6 / g_calls);
+            dbg_ram("[REVERB] native: %llu blocks, %.3f ms per block (off rotation: move %.3f, dsp %.3f, move back %.3f)\n",
+                    (unsigned long long)g_calls, g_ns / 1e6 / g_calls, g_off_move_ns / 1e6 / g_calls,
+                    g_off_dsp_ns / 1e6 / g_calls, g_off_back_ns / 1e6 / g_calls);
         return;
     }
     // Check mode.
@@ -257,15 +312,25 @@ PPC_FUNC(sub_827E2208) {
     const uint64_t t0 = now_ns();
     __imp__sub_827E2208(ctx, base);
     const uint64_t t1 = now_ns();
-    // Native on the shadow.
-    Redirect rd[5] = {{r3, r3 + kStateSize, g_shadow.data()}};
-    for (int c = 0; c < 4; ++c) rd[1 + c] = {out[c], out[c] + kBlock * 4, &out_copy[c * kBlock * 4]};
-    Env E{base, ctx.fpscr, g_frame, rd, 5};
-    E.slow = true;
-    rv_827E2208(E, kFrameSp, r3, r4, r5, r6, r7);
+    // Native on the shadow, with the same instance LSWTCS_REVERB=1 runs (no redirects): the guest's results are set
+    // aside, the shadow state (DSP part; the wrapper's words stay real) and the outputs as they were before the call
+    // go into guest memory, the native code runs there, its results go back to the shadow / out_copy and the
+    // guest's results are put back, so the game only ever sees the guest's output.
+    static std::vector<uint8_t> guest_state(kStateSize), guest_out(4 * kBlock * 4);
+    memcpy(guest_state.data(), PPC_HOST(r3), kStateSize);
+    for (int c = 0; c < 4; ++c) memcpy(&guest_out[c * kBlock * 4], PPC_HOST(out[c]), kBlock * 4);
+    memcpy(PPC_HOST(r3), g_shadow.data(), kDspStateSize);
+    for (int c = 0; c < 4; ++c) memcpy(PPC_HOST(out[c]), &out_copy[c * kBlock * 4], kBlock * 4);
+    Env E{base, ctx.fpscr, g_frame};
+    const uint64_t t1n = now_ns();
+    rv_827E2208<false>(E, kFrameSp, r3, r4, r5, r6, r7);
     const uint64_t t2 = now_ns();
+    memcpy(g_shadow.data(), PPC_HOST(r3), kStateSize);
+    for (int c = 0; c < 4; ++c) memcpy(&out_copy[c * kBlock * 4], PPC_HOST(out[c]), kBlock * 4);
+    memcpy(PPC_HOST(r3), guest_state.data(), kStateSize);
+    for (int c = 0; c < 4; ++c) memcpy(PPC_HOST(out[c]), &guest_out[c * kBlock * 4], kBlock * 4);
     g_guest_ns += t1 - t0;
-    g_ns += t2 - t1;
+    g_ns += t2 - t1n;
     ++g_calls;
     bool same = true;
     for (int c = 0; c < 4; ++c) same &= memcmp(&out_copy[c * kBlock * 4], PPC_HOST(out[c]), kBlock * 4) == 0;
@@ -326,7 +391,7 @@ PPC_FUNC(sub_827E2208) {
                 for (int c = 0; c < 4; ++c) r2[3 + c] = {out[c], out[c] + kBlock * 4, &outb[c * kBlock * 4]};
                 Env E2{base, ctx.fpscr, g_frame, r2, 7};
                 E2.slow = true;
-                rv_827E2208(E2, kFrameSp, r3, r4, r5, r6, r7);
+                rv_827E2208<true>(E2, kFrameSp, r3, r4, r5, r6, r7);
                 for (uint32_t n = 0; n < kBlock; ++n)
                     for (int c = 0; c < 4; ++c) {
                         uint32_t u; memcpy(&u, &outb[c * kBlock * 4 + 4 * n], 4); u = __builtin_bswap32(u);

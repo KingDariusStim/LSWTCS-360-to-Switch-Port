@@ -282,6 +282,25 @@ void pack_floats(const RegisterFile& regs, const Shader::ConstantRegisterMap& ma
   }
 }
 
+// DIAG (LSWTCS_PREPPROF=1): time per stage of lsw_gpu_prepare, [PREPPROF] every 20000 draws (steady clock; reading cntvct_el0 directly hung Eden).
+inline uint64_t tick() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+bool prepprof_on() { static const bool on = [] { const char* e = getenv("LSWTCS_PREPPROF"); return e && e[0] == '1'; }(); return on; }
+enum { PP_SHADERS, PP_MODS, PP_GLSL, PP_VIEW, PP_SYS, PP_FLOAT, PP_REST, PP_N };
+uint64_t g_pp[PP_N], g_pp_draws;
+const char* const kPpNames[PP_N] = {"shaders", "mods", "glsl", "viewport", "sysconst", "floats", "rest"};
+struct PpMark {
+  uint64_t t = 0; bool on = prepprof_on();
+  PpMark() { if (on) t = tick(); }
+  void operator()(int k) { if (!on) return; const uint64_t n = tick(); g_pp[k] += n - t; t = n; }
+};
+void pp_report() {
+  if (!prepprof_on() || ++g_pp_draws % 20000) return;
+  char b[400]; int n = snprintf(b, sizeof b, "[PREPPROF] %llu draws, us per draw:", (unsigned long long)g_pp_draws);
+  for (int k = 0; k < PP_N; ++k) n += snprintf(b + n, sizeof b - n, " %s %.3f", kPpNames[k], g_pp[k] / 1e3 / 20000.0);
+  printf("%s\n", b); fflush(stdout);
+  for (auto& x : g_pp) x = 0;
+}
+
 }  // namespace
 
 extern "C" uint32_t lsw_gpu_system_constants_size(void) {
@@ -290,8 +309,19 @@ extern "C" uint32_t lsw_gpu_system_constants_size(void) {
 
 // Viewport and scissor exactly as lsw_gpu_prepare computes them (kernel_stubs.cpp walk-time tile skipping: a
 // repeated tile's draw reuses tile 0's record and only needs these for its own window offset).
+extern "C" void lsw_gpu_tile_state(const uint32_t* regs_in, uint32_t ps_writes_depth, float viewport[6],
+                                   uint32_t scissor_out[4], void* sys);
 extern "C" void lsw_gpu_viewport_scissor(const uint32_t* regs_in, uint32_t ps_writes_depth, float viewport[6],
                                          uint32_t scissor_out[4]) {
+  lsw_gpu_tile_state(regs_in, ps_writes_depth, viewport, scissor_out, nullptr);
+}
+// A later tile's draw recorded as a copy of tile 0's (kernel_stubs.cpp walk-time tile skipping): the walk checked that
+// every register but the tile's window offset / scissor and resolve destination equals tile 0's, so of the system
+// constants only what lsw_gpu_prepare derives from the viewport differs: NDC scale and offset, and the point-sprite
+// radius (point lists). Patched here into the copy of tile 0's block, the copy draws this tile exactly as a full
+// record would (needed when the replay does not untile the group, gl_backend.cpp).
+extern "C" void lsw_gpu_tile_state(const uint32_t* regs_in, uint32_t ps_writes_depth, float viewport[6],
+                                   uint32_t scissor_out[4], void* sys) {
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(regs_in);
   draw_util::ViewportInfo viewport_info;
   draw_util::GetViewportInfoArgs gviargs{};
@@ -309,6 +339,17 @@ extern "C" void lsw_gpu_viewport_scissor(const uint32_t* regs_in, uint32_t ps_wr
   draw_util::GetScissor(regs, scissor);
   scissor_out[0] = scissor.offset[0]; scissor_out[1] = scissor.offset[1];
   scissor_out[2] = scissor.extent[0]; scissor_out[3] = scissor.extent[1];
+  if (sys) {
+    SysConst& sc = *static_cast<SysConst*>(sys);
+    for (uint32_t i = 0; i < 3; ++i) {
+      sc.ndc_scale[i] = viewport_info.ndc_scale[i];
+      sc.ndc_offset[i] = viewport_info.ndc_offset[i];
+    }
+    if (regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList) {
+      sc.point_screen_diameter_to_ndc_radius[0] = 1.0f / std::max(viewport_info.xy_extent[0], uint32_t(1));
+      sc.point_screen_diameter_to_ndc_radius[1] = 1.0f / std::max(viewport_info.xy_extent[1], uint32_t(1));
+    }
+  }
 }
 
 extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode_be, uint32_t vs_dwords,
@@ -321,7 +362,13 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
                     sizeof(RegisterFile) == sizeof(uint32_t) * RegisterFile::kRegisterCount,
                 "RegisterFile must be a plain register array");
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(regs_in);
-  std::memset(out, 0, sizeof(*out));
+  PpMark pm;
+  // Only the scalar fields are cleared: the arrays (vertex fetch ranges, texture / sampler bindings, ~2.5 KB of the
+  // ~2.9 KB struct) are filled up to their counts and read only that far, and clearing them on every draw was a
+  // measurable part of the GPU-command thread's record time.
+  std::memset(out, 0, offsetof(LswGpuDraw, vfetch_addr));
+  out->vs_tex_count = out->ps_tex_count = out->vs_smp_count = out->ps_smp_count = 0;
+  std::memset(&out->viewport, 0, sizeof(*out) - offsetof(LswGpuDraw, viewport));
 
   SpirvShader* vs = get_shader(xenos::ShaderType::kVertex, vs_ucode_be, vs_dwords);
   if (!vs || !vs->is_ucode_analyzed()) return 0;
@@ -331,6 +378,7 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
     ps = get_shader(xenos::ShaderType::kPixel, ps_ucode_be, ps_dwords);
     if (ps && !draw_util::IsPixelShaderNeededWithRasterization(*ps, regs)) ps = nullptr;
   }
+  pm(PP_SHADERS);
   const reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
   const auto prim_type = regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type;
 
@@ -393,6 +441,7 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
   if (textures_unsigned(*vs)) vs_mod.value |= SpirvShaderTranslator::Modification::kLswTexturesUnsigned;
   if (ps && textures_unsigned(*ps)) ps_mod.value |= SpirvShaderTranslator::Modification::kLswTexturesUnsigned;
 
+  pm(PP_MODS);
   const LswGlShader* vs_gl = get_glsl(*vs, vs_mod.value, kLswGlVertex);
   if (!vs_gl) return 0;
   const LswGlShader* ps_gl = ps ? get_glsl(*ps, ps_mod.value, kLswGlPixel) : nullptr;
@@ -414,6 +463,7 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
                      uint32_t(vs_mod.vertex.output_point_parameters) << 10 |
                      uint32_t(ps ? ps_mod.pixel.param_gen_point : 0) << 11;
 
+  pm(PP_GLSL);
   // ── Viewport / scissor (same arguments as the PC bridge: GL with upper-left clip control behaves
   //    like D3D) ──
   draw_util::ViewportInfo viewport_info;
@@ -433,6 +483,7 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
   out->scissor[0] = scissor.offset[0]; out->scissor[1] = scissor.offset[1];
   out->scissor[2] = scissor.extent[0]; out->scissor[3] = scissor.extent[1];
 
+  pm(PP_VIEW);
   // ── System constants (VulkanCommandProcessor::UpdateSystemConstantValues, host RT subset) ──
   std::memset(b.sys_block, 0, sizeof(b.sys_block));
   SysConst& sc = *reinterpret_cast<SysConst*>(b.sys_block);
@@ -520,17 +571,21 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
   out->system_constants = b.sys_block;
   out->system_constants_size = uint32_t(sizeof(b.sys_block));
 
+  pm(PP_SYS);
   // ── Float / bool+loop / fetch constants ──
   pack_floats(regs, vs->constant_register_map(), XE_GPU_REG_SHADER_CONSTANT_000_X, b.vs_float);
   if (ps) pack_floats(regs, ps->constant_register_map(), XE_GPU_REG_SHADER_CONSTANT_256_X, b.ps_float);
   else b.ps_float.assign(4, 0.0f);
   out->vs_float = b.vs_float.data(); out->vs_float_count = uint32_t(b.vs_float.size() / 4);
   out->ps_float = b.ps_float.data(); out->ps_float_count = uint32_t(b.ps_float.size() / 4);
-  std::memcpy(b.bool_loop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(b.bool_loop));
-  std::memcpy(b.fetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(b.fetch));
-  out->bool_loop = b.bool_loop;
-  out->fetch = b.fetch;
+  // Bool / loop constants straight from the register file (the recorder copies them into the frame right away).
+  out->bool_loop = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
+  // Fetch constants straight from the register file too. (Masking the slots the shaders do not read changed nothing,
+  // Eden hub 2026-10-11: the previous draw's block was reused 34 % of the time either way, since the slots that change
+  // between draws are the used vertex fetches: every mesh has its own vertex buffer.)
+  out->fetch = &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
 
+  pm(PP_FLOAT);
   // ── Vertex buffer ranges the VS fetches from shared memory ──
   const auto& cmv = vs->constant_register_map();
   for (uint32_t i = 0; i < xe::countof(cmv.vertex_fetch_bitmap); ++i) {
@@ -560,6 +615,8 @@ extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode
   };
   fill(*vs, out->vs_tex, out->vs_tex_count, out->vs_smp, out->vs_smp_count);
   if (ps) fill(*ps, out->ps_tex, out->ps_tex_count, out->ps_smp, out->ps_smp_count);
+  pm(PP_REST);
+  pp_report();
   return 1;
 }
 

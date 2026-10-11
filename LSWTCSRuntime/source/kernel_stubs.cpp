@@ -778,9 +778,14 @@ static int sched_prio_waiting(int self) {
     }
     return -1;
 }
+// A thread coming back from a short host-only burst (lswtcs_gil_blocking_urgent) that must not wait out a full round:
+// it gets the next handoff. -1 = none.
+static int g_sched_urgent = -1;   // guarded by g_sched_mtx
+static uint64_t g_urg_q = 0, g_urg_qspin = 0, g_urg_qcomp = 0;   // DIAG: quantum calls while a rejoin is pending (racy)
 // next runnable id strictly after 'from' (round-robin); -1 if none runnable anywhere.
 static int sched_next_locked(int from) {
     if (g_sched_count <= 0) return -1;
+    if (const int u = g_sched_urgent; u >= 0 && u != from && g_sched_alive[u] && g_sched_runnable[u]) { g_sched_urgent = -1; return u; }
     if (const int p = sched_prio_waiting(from); p >= 0) return p;
     for (int i = 1; i <= g_sched_count; i++) {
         int c = (from + i) % g_sched_count;
@@ -994,6 +999,111 @@ struct GilMutexGuard {
     GilMutexGuard& operator=(const GilMutexGuard&) = delete;
 };
 
+// Like lswtcs_gil_blocking, for a short host-only burst whose thread is waited on in real time (the native reverb on
+// the audio thread, native_reverb.cpp LSWTCS_REVERBOFF): on return it takes the next handoff, and the thread holding
+// the turn is made to reach its quantum at its next guest function entry (lswtcs_gil_ctr) instead of the returning
+// thread waiting out the rest of that quantum and a round of the other threads (Eden 2026-10-11 without this: 0.49
+// -> 1.46 ms of wall time per reverb block, audio underruns).
+extern "C" unsigned lswtcs_gil_ctr;
+static void sched_leave_turn(int id) {   // off the rotation (the turn goes to the next runnable thread)
+    std::unique_lock<std::mutex> lk(g_sched_mtx);
+    g_sched_runnable[id] = false;
+    if (g_sched_turn == id) { int n = sched_next_locked(id); sched_turn_set(n); sched_notify_all(); }
+}
+static void sched_rejoin_urgent(int id);
+extern "C" void lswtcs_gil_blocking_urgent(void (*fn)(void*), void* arg) {
+    const int id = g_sched_id;
+    if (!gil_on() || id < 0) { fn(arg); return; }
+    sched_leave_turn(id);
+    fn(arg);
+    sched_rejoin_urgent(id);
+}
+static void sched_rejoin_urgent(int id) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(g_sched_mtx);
+    g_sched_runnable[id] = true;
+    const int holder = g_sched_turn;
+    if (g_sched_turn == -1) sched_turn_set(id);
+    else if (g_sched_turn != id) {
+        g_sched_urgent = id;
+        lswtcs_gil_ctr |= 0x3FFu;   // racy on purpose: losing it to the holder's own increment only costs one quantum
+    }
+    sched_wait_turn(lk, id);
+    if (g_sched_urgent == id) g_sched_urgent = -1;   // got the turn another way
+    {   // DIAG: rejoin wait by the thread that held the turn
+        static uint64_t ns[LSW_SCHED_MAX + 1], cnt[LSW_SCHED_MAX + 1], calls = 0;
+        const int k = holder < 0 ? LSW_SCHED_MAX : holder;
+        ns[k] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        ++cnt[k];
+        if (++calls % 3000 == 0) {
+            char b[600]; int n = snprintf(b, sizeof b, "[GILURGENT] %llu rejoins (quantum calls while pending %llu, spin-skip %llu, compile-skip %llu), wait by holder:",
+                                          (unsigned long long)calls, (unsigned long long)g_urg_q, (unsigned long long)g_urg_qspin, (unsigned long long)g_urg_qcomp);
+            for (int i = 0; i <= LSW_SCHED_MAX && n < 540; ++i)
+                if (cnt[i]) n += snprintf(b + n, sizeof b - n, " %d:%llux%.3fms", i == LSW_SCHED_MAX ? -1 : i, (unsigned long long)cnt[i], ns[i] / 1e6 / cnt[i]);
+            dbg_ram("%s\n", b);
+            for (auto& x : ns) x = 0;
+            for (auto& x : cnt) x = 0;
+        }
+    }
+}
+
+// ── Walk off the rotation (LSWTCS_WALKOFF) ────────────────────────────────────────────────────────────────────
+// The PM4 walk (pm4_extract_ib: register writes, draw records with shader lookup, constant and vertex snapshots) is
+// host code a guest thread (mostly the GPU-command thread 0x822D2AB0) ran holding the turn: ~6.8 ms per Eden hub
+// frame of core 0. Around a large ring-level IB the walker now leaves the rotation (and, on the Switch, moves to
+// core 2: lsw_offcore_begin), so the game's threads keep core 0, as they ran beside the 360's GPU. Whatever runs
+// guest code or waits on guest threads takes the turn back for its duration (WalkNeedsTurn: interrupts, the tile
+// drain, wait-reg-mem polls). Other threads that want the ring walked (fence / ring-space waits, VdSwap) wait for
+// the walk to finish (walk_wait_other) instead of claiming the GPU caught up while it is still reading.
+extern "C" __attribute__((weak)) void lsw_offcore_begin_prio(int) {}   // Switch: platform_switch.cpp
+extern "C" void lsw_offcore_end();
+static bool walkoff_on() { static const bool on = [] { const char* e = getenv("LSWTCS_WALKOFF"); return e && e[0] == '1'; }(); return on; }
+static thread_local bool t_walk_off = false;      // this thread is walking off the rotation right now
+static std::atomic<int> g_walk_off_sid{-1};       // scheduler id of the thread with an off-rotation walk in progress
+static std::mutex g_walk_mtx;
+static std::condition_variable g_walk_cv;
+static void walk_off_enter() {
+    if (t_walk_off || !gil_on() || g_sched_id < 0) return;
+    sched_leave_turn(g_sched_id);
+    static const int prio = [] { const char* e = getenv("LSWTCS_WALKOFF_PRIO"); return e ? int(strtol(e, nullptr, 0)) : 0x2D; }();
+    lsw_offcore_begin_prio(prio);
+    t_walk_off = true;
+}
+static void walk_off_leave() {
+    if (!t_walk_off) return;
+    t_walk_off = false;
+    lsw_offcore_end();
+    sched_rejoin_urgent(g_sched_id);
+}
+struct WalkNeedsTurn {   // guest code / guest waits inside an off-rotation walk: hold the turn meanwhile
+    bool was = t_walk_off;
+    WalkNeedsTurn() { if (was) walk_off_leave(); }
+    ~WalkNeedsTurn() { if (was) walk_off_enter(); }
+};
+// Ring-level IB of `len` dwords about to be walked by this thread: go off the rotation if it is worth it.
+static bool walk_off_ib_begin(uint32_t len) {
+    static const uint32_t min_len = [] { const char* e = getenv("LSWTCS_WALKOFF_MIN"); return e ? uint32_t(atoi(e)) : 4096u; }();
+    if (!walkoff_on() || len < min_len || t_walk_off || !gil_on() || g_sched_id < 0) return false;
+    g_walk_off_sid.store(g_sched_id);
+    walk_off_enter();
+    return true;
+}
+static void walk_off_ib_end(bool began) {
+    if (!began) return;
+    walk_off_leave();
+    { std::lock_guard<std::mutex> lk(g_walk_mtx); g_walk_off_sid.store(-1); }
+    g_walk_cv.notify_all();
+}
+// Called by any thread before it walks the ring or relies on it being walked: if another thread's walk is off the
+// rotation, wait (off the rotation too) until it is done.
+static void walk_wait_other() {
+    const int w = g_walk_off_sid.load();
+    if (w < 0 || w == g_sched_id) return;
+    GilYield y;
+    std::unique_lock<std::mutex> lk(g_walk_mtx);
+    g_walk_cv.wait(lk, [] { const int v = g_walk_off_sid.load(); return v < 0 || v == g_sched_id; });
+}
+
 // DIAG: one-line scheduler snapshot (turn holder, alive/runnable ids), called from a host thread.
 extern "C" void lswtcs_sched_snapshot() {
     if (!gil_on()) return;
@@ -1032,6 +1142,7 @@ extern "C" volatile int g_compile_active;
 // suppressed); OTHER threads preempt normally — so a lock-holder that yields on a wait can be
 // resumed (a GLOBAL counter deadlocks: it suppresses everyone while any lock is held).
 thread_local int g_spinlock_depth = 0;
+thread_local unsigned g_spin_dbg[8];   // DIAG: calls per site (0 KfAcq 1 KfRel 2 AcqRaised 3 Raise 4 RelRaised 5 TryAcq 6 Lower)
 static int spinguard_on() { static int s=-1; if(s<0){ const char* e=getenv("LSWTCS_SPINGUARD"); s=(e&&e[0]=='0')?0:1; } return s; }
 extern "C" void lswtcs_spin_enter() { if (spinguard_on()) g_spinlock_depth++; }
 extern "C" void lswtcs_spin_leave() { if (spinguard_on() && g_spinlock_depth > 0) g_spinlock_depth--; }
@@ -1049,10 +1160,18 @@ extern "C" void lswtcs_gil_quantum() {
     // fence). Suppressing its yield deadlocks (the thread that would satisfy the wait can't run).
     // So: suppress for the first few boundaries (protect short sections), then force a PERIODIC
     // yield (break the spin-wait). This makes determinism (atomic spinlocks) + liveness coexist.
+    {   // DIAG: per-thread spinlock depth and lock-call counts, every 30000 quantum calls of this thread
+        static thread_local unsigned qn = 0;
+        if (++qn % 30000 == 0)
+            dbg_ram("[SPINDBG] sid=%d depth=%d KfAcq=%u KfRel=%u AcqRaised=%u Raise=%u RelRaised=%u TryAcq=%u Lower=%u\n", g_sched_id,
+                    g_spinlock_depth, g_spin_dbg[0], g_spin_dbg[1], g_spin_dbg[2], g_spin_dbg[3], g_spin_dbg[4], g_spin_dbg[5], g_spin_dbg[6]);
+    }
+    const bool urg = g_sched_urgent >= 0;   // DIAG (racy read)
+    if (urg) ++g_urg_q;
     {
         static thread_local int held = 0;
         if (g_spinlock_depth > 0) {
-            if (++held <= 8) return;   // short critical section: atomic
+            if (++held <= 8) { if (urg) ++g_urg_qspin; return; }   // short critical section: atomic
             held = 0;                  // held too long = spin-wait → fall through and yield
         } else {
             held = 0;
@@ -1068,7 +1187,7 @@ extern "C" void lswtcs_gil_quantum() {
     if (g_compile_active) {
         static int allow = -1;
         if (allow < 0) { const char* e = getenv("LSWTCS_COMPILE_YIELD"); allow = (e && e[0] != '0') ? 1 : 0; }
-        if (!allow) return;   // compile runs to completion without yielding the turn
+        if (!allow) { if (urg) ++g_urg_qcomp; return; }   // compile runs to completion without yielding the turn
     }
     // LSWTCS_QDIV=N: only actually yield every Nth quantum boundary (default 1 = every 1024
     // guest-fn entries). Coarser quanta = fewer yield points = fewer chances for a host-event-
@@ -1186,8 +1305,8 @@ PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount) {
 
 // ── Spinlocks ─────────────────────────────────────────────────────────────────
 extern "C" void lswtcs_spin_enter(); extern "C" void lswtcs_spin_leave();
-PPC_FUNC(__imp__KfAcquireSpinLock) { PPC_FUNC_PROLOGUE(); lswtcs_spin_enter(); ctx.r3.u32 = 0; }  // returns old IRQL
-PPC_FUNC(__imp__KfReleaseSpinLock) { PPC_FUNC_PROLOGUE(); lswtcs_spin_leave(); }
+PPC_FUNC(__imp__KfAcquireSpinLock) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[0]; lswtcs_spin_enter(); ctx.r3.u32 = 0; }  // returns old IRQL
+PPC_FUNC(__imp__KfReleaseSpinLock) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[1]; lswtcs_spin_leave(); }
 
 // ── TLS ───────────────────────────────────────────────────────────────────────
 // Per-thread (correct: KeTls* is thread-local on the 360). This is now SAFE because
@@ -3766,11 +3885,23 @@ static bool tile_skip_copy(uint32_t initiator) {
     if (g_tskip_q >= r.draws.size()) { ++g_tskip_q; return false; }   // counted as a mismatch at the end
     const uint32_t idx = r.draws[g_tskip_q++];
     if (idx == UINT32_MAX) return false;   // tile 0 did not record this draw either
-    LswGpuDrawRec c = g_gpu_frame_build.draws[idx];
+    LswGpuFrame& f = g_gpu_frame_build;
+    LswGpuDrawRec c = f.draws[idx];
     g_xe_regs[0x21FC] = initiator;          // as gpu_record_draw_impl, for the viewport calculation
-    lsw_gpu_viewport_scissor(g_xe_regs, c.ps_writes_depth, c.viewport, c.scissor);
+    // This tile's viewport and scissor, and its own system constants (tile 0's with the viewport-derived fields
+    // patched), so the copy also draws correctly when the replay does not untile its group: it used to be dropped
+    // there, and whatever only this tile showed was never drawn (Switch 2026-10-11, Episode I palace: characters cut
+    // off at row 320, tile 0's bottom; 388k copies dropped in one session).
+    alignas(16) uint8_t sys[2048];
+    if (c.cb_sys_size && c.cb_sys_size <= sizeof sys && size_t(c.cb_sys_off) + c.cb_sys_size <= f.arena.size()) {
+        memcpy(sys, f.arena.data() + c.cb_sys_off, c.cb_sys_size);
+        lsw_gpu_tile_state(g_xe_regs, c.ps_writes_depth, c.viewport, c.scissor, sys);
+        c.cb_sys_off = f.put_block(0, c.cb_sys_size, sys, c.cb_sys_size, nullptr, 0, true);
+    } else {
+        lsw_gpu_viewport_scissor(g_xe_regs, c.ps_writes_depth, c.viewport, c.scissor);
+    }
     c.tile_repeat = idx + 1;
-    g_gpu_frame_build.draws.push_back(c);
+    f.draws.push_back(c);
     ++g_tskip_copies;
     return true;
 }
@@ -3895,7 +4026,11 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
         }
     }
     LswGpuFrame& f = g_gpu_frame_build;
-    LswGpuDrawRec r{};
+    // DIAG (LSWTCS_PREPPROF=1, with gl_bridge.cc [PREPPROF]): record time after prepare, [RECPROF] every 20000 draws.
+    static const bool recprof = [] { const char* e = getenv("LSWTCS_PREPPROF"); return e && e[0] == '1'; }();
+    static uint64_t rp_consts = 0, rp_tail = 0, rp_n = 0;
+    uint64_t rp0 = recprof ? gp_now() : 0;
+    LswGpuDrawRec& r = f.draws.emplace_back();   // built in place (zeroed once): a local copied in was 2 x 1760 B per draw
     r.kind = 0; r.edram_mode = edram_mode;
     if (g_imlog_left > 0) { printf("[IMLOG]   draw mode=%u prim=%u n=%u vs=0x%08X key=%016llX ps=0x%08X/%u ps_ok=%d pskey=%016llX cmask=0x%X\n", edram_mode, initiator & 0x3F, initiator >> 16,
                                    g_vs_addr, (unsigned long long)d.vs_key, g_ps_addr, g_ps_size, ps_ok ? 1 : 0, (unsigned long long)d.ps_key, g_xe_regs[0x2104]); fflush(stdout); }
@@ -3934,6 +4069,14 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     put_float(2, d.ps_float, d.ps_float_count, nullptr, r.cb_psf_size, r.cb_psf_off);
     put_cb(3, d.bool_loop, 40 * 4, r.cb_bool_off);
     put_cb(4, d.fetch, 192 * 4, r.cb_fetch_off);
+    static uint64_t rp_hit[5], rp_vsf_bytes = 0, rp_vsf_big = 0;
+    if (recprof) {
+        const uint64_t t = gp_now(); rp_consts += t - rp0; rp0 = t;
+        static uint32_t prev[5] = {~0u, ~0u, ~0u, ~0u, ~0u};
+        const uint32_t cur[5] = {r.cb_sys_off, r.cb_vsf_off, r.cb_psf_off, r.cb_bool_off, r.cb_fetch_off};
+        for (int k = 0; k < 5; ++k) { rp_hit[k] += cur[k] == prev[k]; prev[k] = cur[k]; }
+        rp_vsf_bytes += r.cb_vsf_size; rp_vsf_big += d.vs_float_count >= 256;
+    }
     // Vertex data snapshot (guest physical ranges -> shared memory at replay).
     r.first_range = uint32_t(f.ranges.size());
     gp0 = gp_now();
@@ -3944,6 +4087,7 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     }
     g_gpuprof[GP_VCOPY] += gp_now() - gp0;
     r.range_count = uint32_t(f.ranges.size()) - r.first_range;
+    if (recprof) rp0 = gp_now();
     // DIAG: quad-list draws inside the imlog_now window -> vertex ranges and first guest dwords at record time.
     if (g_imlog_left > 0 && (initiator & 0x3F) == 13) {
         printf("[QUADVTX] n=%u vfetch_count=%u fetch0=%08X %08X %08X %08X %08X %08X\n", initiator >> 16, d.vfetch_count, g_xe_regs[0x4800], g_xe_regs[0x4801], g_xe_regs[0x4802], g_xe_regs[0x4803], g_xe_regs[0x4804], g_xe_regs[0x4805]);
@@ -4049,7 +4193,17 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     for (uint32_t i = 0; i < d.vs_tex_count && i < 32; ++i) { r.vs_tex_fetch[i] = uint8_t(d.vs_tex[i].fetch_constant); r.vs_tex_dim[i] = uint8_t(d.vs_tex[i].dimension); }
     for (uint32_t i = 0; i < d.ps_smp_count && i < 32; ++i) r.ps_smp[i] = d.ps_smp[i];
     for (uint32_t i = 0; i < d.vs_smp_count && i < 32; ++i) r.vs_smp[i] = d.vs_smp[i];
-    f.draws.push_back(r);
+    // (r was built in place in f.draws)
+    if (recprof) {
+        rp_tail += gp_now() - rp0;
+        if (++rp_n % 20000 == 0) {
+            printf("[RECPROF] %llu draws, us per draw: consts %.3f, indices+record %.3f (record %zu B)\n", (unsigned long long)rp_n,
+                   rp_consts / 1e3 / 20000, rp_tail / 1e3 / 20000, sizeof(LswGpuDrawRec));
+            printf("[RECPROF]   reused from the previous draw (%%): sys %.0f vsf %.0f psf %.0f bool %.0f fetch %.0f; VS floats %.0f B avg, %.0f%% with 256 (8 KB block)\n",
+                   rp_hit[0] / 200.0, rp_hit[1] / 200.0, rp_hit[2] / 200.0, rp_hit[3] / 200.0, rp_hit[4] / 200.0, rp_vsf_bytes / 20000.0, rp_vsf_big / 200.0);
+            fflush(stdout); rp_consts = rp_tail = 0; for (auto& x : rp_hit) x = 0; rp_vsf_bytes = rp_vsf_big = 0;
+        }
+    }
     static uint64_t nrec = 0; if (++nrec <= 5 || (nrec % 5000) == 0)
         dbg_ram("[GPUDRAW] rec #%llu prim=%u n=%u ib=%u ranges=%u vsf=%u psf=%u tex=%u VS=%zuB PS=%zuB\n", (unsigned long long)nrec, prim, nidx, r.ib_count, r.range_count, d.vs_float_count, d.ps_float_count, d.ps_tex_count, d.vs_dxbc_size, d.ps_dxbc_size);
     return true;
@@ -4345,7 +4499,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                           return ((bits >> (wi & 7)) & 1) != 0;
                       };
                       int it = 0;
-                      while (!match(value()) && it < 4000) { sched_yield_turn(); ++it; }
+                      if (!match(value())) { WalkNeedsTurn nt; while (!match(value()) && it < 4000) { sched_yield_turn(); ++it; } }
                       static uint64_t nw = 0, nfail = 0; ++nw;
                       bool ok = match(value()); if (!ok) ++nfail;
                       if (nw <= 12 || (it && nw <= 200) || (!ok && nfail <= 20) || (nw % 50000) == 0)
@@ -4699,6 +4853,7 @@ static void pm4_dump_state() {
 // g_interrupt_ctx must be set by the caller (VdSwap sets it around pm4_process_ring).
 static void pm4_fire_interrupt(uint32_t cpu_mask) {
     if (!g_interrupt_ctx || !g_gfx_interrupt_callback) return;
+    WalkNeedsTurn need_turn;   // runs the guest ISR (and may drain tile lists)
     PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, g_gfx_interrupt_callback);
     if (!fn) return;
     uint32_t fired_cb = 0;
@@ -5006,6 +5161,7 @@ static void pm4_process_ring_flat() { pm4_process_ring_flat_impl(true); }
 // Re-entrant calls (the walker itself is running) fall back to the old "caught up" claim.
 static void pm4_walk_now(void* ctxp) {
     static int on = -1; if (on < 0) { const char* e = getenv("LSWTCS_REALGET"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (on) walk_wait_other();
     if (!on || g_pm4_walking || !g_rb_base || !g_rb_size || !ctxp) return;
     PPCContext* saved = g_interrupt_ctx;
     if (!g_interrupt_ctx) g_interrupt_ctx = static_cast<PPCContext*>(ctxp);
@@ -5014,6 +5170,7 @@ static void pm4_walk_now(void* ctxp) {
 }
 static void pm4_process_ring_flat_impl(bool allow_drain) {
     if (!g_rb_base || !g_rb_size) return;
+    walk_wait_other();
     const uint32_t rbd = g_rb_size >> 2;        // 8192 dwords
     // ── Exact consumption up to the real write pointer (LSWTCS_RINGWPTR=1) ─────────────
     // Xenia ExecutePrimaryBuffer(read_ptr, write_ptr): every ring packet is executed exactly
@@ -5069,7 +5226,9 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
                     const uint32_t iba = rb_read(pos + 1), ibl = rb_read(pos + 2) & 0xFFFFF;
                     const size_t tl_d0 = tile_ib_log_begin(iba, ibl);
                     tile_skip_begin(iba, ibl);
+                    const bool off = walk_off_ib_begin(ibl);
                     pm4_extract_ib(iba, ibl, 0);
+                    walk_off_ib_end(off);
                     tile_skip_end(iba, ibl);
                     if (g_pm4_exec_ibs) pm4_process_ib(iba, ibl, 0);
                     tile_ib_log_end(tl_d0);
@@ -6026,7 +6185,7 @@ PPC_FUNC(__imp__NetDll_select) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__NetDll_send) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__NetDll_sendto) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__ExRegisterTitleTerminateNotification) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__KeAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); lswtcs_spin_enter(); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__KeAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[2]; lswtcs_spin_enter(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__KeInitializeSemaphore) {
     PPC_FUNC_PROLOGUE();
     // r3=*KSEMAPHORE, r4=count, r5=limit. X_KSEMAPHORE = DISPATCHER_HEADER(16) + limit(+16).
@@ -6054,7 +6213,14 @@ PPC_FUNC(__imp__KeQueryPerformanceFrequency) {
     // scribbled 8 bytes wherever r3 happened to point.
     ctx.r3.u64 = 50000000ull;
 }
-PPC_FUNC(__imp__KeRaiseIrqlToDpcLevel) { PPC_FUNC_PROLOGUE(); lswtcs_spin_enter(); ctx.r3.u32 = 0; }  // DPC level disables preemption
+// LSWTCS_IRQLFIX (2026-10-11): KeRaiseIrqlToDpcLevel counted as a spinlock section, but the game lowers IRQL mostly
+// without KfLowerIrql (Eden hub, main thread: 2137 raises, 1511 KfLowerIrql calls), so every thread that ever raised
+// IRQL kept g_spinlock_depth > 0 for good (main: 626) and its quantum yielded only every 9th boundary (main and
+// GPU-command threads: ~1.3 ms turns, 80 % of their quantum calls skipped). Spinlock sections proper are counted by
+// the acquire/release pairs, which balance. Default 1: bare IRQL raises are not counted (Eden hub, back to back:
+// p50/p90 24.9/31.2 -> 23.9/28.1 ms, audio underruns in the hub 744-1712 -> 0-6 per 10 s). =0: the old behaviour.
+static bool irqlfix_on() { static const bool on = [] { const char* e = getenv("LSWTCS_IRQLFIX"); return !(e && e[0] == '0'); }(); return on; }
+PPC_FUNC(__imp__KeRaiseIrqlToDpcLevel) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[3]; if (!irqlfix_on()) lswtcs_spin_enter(); ctx.r3.u32 = 0; }  // DPC level disables preemption
 PPC_FUNC(__imp__KeReleaseSemaphore) {
     PPC_FUNC_PROLOGUE();
     // r3=*KSEMAPHORE, r4=increment (priority boost), r5=adjustment, r6=wait. Returns the
@@ -6067,9 +6233,9 @@ PPC_FUNC(__imp__KeReleaseSemaphore) {
     kw_notify();
     ctx.r3.u32 = prev;
 }
-PPC_FUNC(__imp__KeReleaseSpinLockFromRaisedIrql) { PPC_FUNC_PROLOGUE(); lswtcs_spin_leave(); }
-PPC_FUNC(__imp__KeTryToAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); lswtcs_spin_enter(); ctx.r3.u32 = 1; }  // always "acquires" under the GIL
-PPC_FUNC(__imp__KfLowerIrql) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }  // not counted (see KeRaiseIrqlToDpcLevel)
+PPC_FUNC(__imp__KeReleaseSpinLockFromRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[4]; lswtcs_spin_leave(); }
+PPC_FUNC(__imp__KeTryToAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[5]; lswtcs_spin_enter(); ctx.r3.u32 = 1; }  // always "acquires" under the GIL
+PPC_FUNC(__imp__KfLowerIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[6]; ctx.r3.u32 = 0; }  // not counted (see KeRaiseIrqlToDpcLevel)
 PPC_FUNC(__imp__MmGetPhysicalAddress) { PPC_FUNC_PROLOGUE(); /* virt == phys in our port */ }
 PPC_FUNC(__imp__NetDll_WSAWaitForMultipleEvents) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__NetDll___WSAFDIsSet) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }

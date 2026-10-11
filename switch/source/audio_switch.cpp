@@ -7,6 +7,7 @@
 // LSWTCS_AUDIO_OUT=0 disables output (kernel_stubs then paces frames with its 5.33 ms timer).
 #include <switch.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -58,6 +59,7 @@ int g_state = -1;                                  // -1 untried, 0 failed/disab
 std::atomic<bool> g_hold{false};
 std::atomic<uint64_t> g_hold_ns{0};
 uint64_t g_hold_count = 0;
+float g_peak = 0;   // largest |sample| sent to the device since the last [AUDIO] line (output thread only)
 
 // Mixes one frame from every client that has one into slot s; returns false if no client had a frame.
 bool fill_slot(Slot& s) {
@@ -85,7 +87,8 @@ bool fill_slot(Slot& s) {
     if (!who) return false;
     int16_t* out = static_cast<int16_t*>(s.buf.buffer);
     for (int n = 0; n < kSamples; ++n) {
-        out[2 * n] = int16_t(std::clamp(l[n], -1.0f, 1.0f) * 32767.0f);
+        g_peak = std::max(g_peak, std::max(std::fabs(l[n]), std::fabs(r[n])));
+        out[2 * n] =int16_t(std::clamp(l[n], -1.0f, 1.0f) * 32767.0f);
         out[2 * n + 1] = int16_t(std::clamp(r[n], -1.0f, 1.0f) * 32767.0f);
     }
     s.buf.data_size = kDataBytes;
@@ -149,9 +152,10 @@ void output_thread() {
         static uint64_t next_log = 1875;   // ~10 s of buffers
         if (played >= next_log) {
             next_log = played + 1875;
-            printf("[AUDIO] %llu buffers played, %llu idle waits, A/V holds %llu (%llu ms)\n", (unsigned long long)played,
+            printf("[AUDIO] %llu buffers played, %llu idle waits, A/V holds %llu (%llu ms), peak %.4f\n", (unsigned long long)played,
                    (unsigned long long)underruns, (unsigned long long)g_hold_count,
-                   (unsigned long long)(g_hold_ns.load() / 1000000ull));
+                   (unsigned long long)(g_hold_ns.load() / 1000000ull), double(g_peak));
+            g_peak = 0;
             fflush(stdout);
         }
     }
