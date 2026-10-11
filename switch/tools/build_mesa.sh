@@ -27,7 +27,11 @@ if [ ! -d pkgs ]; then
 fi
 git -C pkgs checkout -q "$PKG_COMMIT"
 P=$B/dl/pkgs/switch/mesa
-rm -rf "$B/src" && mkdir -p "$B/src" && cd "$B/src"
+# Separate commands so set -e stops here: on Windows rm fails if any shell's cwd is inside src, and an &&-chain
+# would then carry on extracting into dl/ (happened 2026-10-09).
+rm -rf "$B/src"
+mkdir -p "$B/src"
+cd "$B/src"
 tar --force-local -xf "$B/dl/mesa-20.1.0-rc3.tar.xz"
 cd mesa-20.1.0-rc3
 patch -p1 -s -i "$P/switch-mesa-20.1.0-5.patch"
@@ -36,6 +40,10 @@ patch -p1 -s -i "$P/glX_XML.py.patch"
 python "$ROOT/switch/mesa/mesa_cache_edits.py" "$PWD"
 python "$ROOT/switch/mesa/mesa_nir_edits.py" "$PWD"
 python "$ROOT/switch/mesa/mesa_fmz_edits.py" "$PWD"
+python "$ROOT/switch/mesa/mesa_egl_share_edits.py" "$PWD"
+python "$ROOT/switch/mesa/mesa_glthread_edits.py" "$PWD"
+python "$ROOT/switch/mesa/mesa_cache_race_edits.py" "$PWD"
+python "$ROOT/switch/mesa/mesa_pushbuf_edits.py" "$PWD"
 W=$(pwd -W)
 # MSYSTEM=MSYS: meson rejects the MSYS python inside devkitPro's default (MinGW-flavoured) shell.
 MSYSTEM=MSYS /c/devkitPro/msys2/usr/bin/bash.exe -lc "cd \"\$(cygpath -u '$W')\" && \

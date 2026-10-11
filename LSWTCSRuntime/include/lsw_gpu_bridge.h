@@ -57,6 +57,8 @@ struct LswGpuDraw {
 int lsw_gpu_prepare(const uint32_t* regs, const uint32_t* vs_ucode_be, uint32_t vs_dwords,
                     const uint32_t* ps_ucode_be, uint32_t ps_dwords, uint32_t index_endian,
                     uint32_t rt_width, uint32_t rt_height, LswGpuDraw* out);
+// Only the viewport and scissor of lsw_gpu_prepare (same values) for a draw whose shaders are known (Switch bridge).
+void lsw_gpu_viewport_scissor(const uint32_t* regs, uint32_t ps_writes_depth, float viewport[6], uint32_t scissor[4]);
 
 // ── Textures ──
 struct LswGpuTexDesc {

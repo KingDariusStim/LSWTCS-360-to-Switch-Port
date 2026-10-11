@@ -17,6 +17,83 @@ Read first, in this order:
    guide applies here unchanged. The PC render thread was cut from 6.0 ms to 3.0 ms there; most of
    those ideas are not yet ported to the GL backend.
 
+## 0. Progress 2026-10-08 (uncommitted; base commit 5a7f02a = all 2026-10-07 work)
+
+User end-game goal: Switch rendering in Eden nearly as fast as, or faster than, the PC build.
+
+**Instrumentation (switch/source/gl_backend.cpp):** `g_rp[]` leaf stages of a replay (upload, shm, fwait,
+program, texsrc, texkey, decode, texup, sampler, rt, bind, state, draw, resolve, present, swap, evict).
+`[GLSTALL]` now prints the split of each stalled replay + programs/textures built in it; `[GLPROF]`
+averages per replay every 60 replays. `[GLARENA]`/`[GLUPLOAD]` (every 300 replays): arena bytes by block
+kind and the map/memcpy/unmap split.
+
+**Findings (Eden, hub):**
+- First cold split: shader programs ~19.7 s, buffer uploads ~7.6 s, textures ~0.3 s (texture decode is NOT a
+  load-time problem; drop §4.2 item 5).
+- Any synchronised CPU write into a buffer the GPU used recently = submit + wait for the GPU:
+  switch-libdrm `nouveau_bo_wait` kicks the pushbuffer if the bo is in it, then blocks on its fence.
+  The 3 per-frame `glBufferSubData` into the 512 MB shared-memory buffer cost 11.3 ms.
+- Bytes written into GPU-visible memory are slow in Eden (~155 MB/s at 2 MB/frame: memcpy 13.5 ms;
+  map/unmap ~0). Index data was 1 MB of the 2.1 MB arena.
+- `glBufferStorage` persistent mapping: its CPU mapping is unmapped memory in Eden (20k "Unmapped Write8",
+  render thread crawls). Kept as opt-in `LSWTCS_GLUPMODE=2` only, untested on hardware.
+
+**Fixes (each has a kill switch for A/B):**
+- `LSWTCS_GLSHMCOPY` (default 1): shared-memory ranges via `glCopyBufferSubData` from the arena (GPU copy).
+- `LSWTCS_GLUPMODE` (default 1): arena written via unsynchronised map + own `glFenceSync` per ring slot
+  (`fwait` stage). 0 = old glBufferSubData.
+- `LSWTCS_IBSHM` (default 1 on Switch, compiled off on PC): guest index buffers tracked through
+  shared-memory residency (`gpu_shm_track`, kernel_stubs.cpp), drawn with `g_shm` as the element buffer
+  (`LswGpuDrawRec::ib_shm`). Arena 2.1 MB → 1.0 MB, upload 13 → 1.6 ms.
+- `LSWTCS_GLSTATECACHE` (default 1): `GlStateCache` skips unchanged program/FBO/UBO ranges/texture/sampler/
+  swizzle binds and the whole `apply_state` when its inputs are unchanged; reset by `g_gl_epoch`, which every
+  state-changing helper bumps (blit, clears, texture/RT/FBO create/delete, arena realloc, each replay).
+
+**Result (back-to-back A/B, laptop ON BATTERY so absolute numbers are low):** replay 39.9 → 15.2 ms,
+displayed ~25 → ~37.5 fps; cold hub first frame 8.2 → ~5 s. Screenshots match. Now guest-bound (~26 ms
+guest frame: main 57%, GPU submit 22%, XAudio 16-17% — XAudio was 3.8% in the 10-07 numbers, check).
+Remaining render thread: draw 4.4, bind 2.0, upload 1.6-2.0, sampler 1.5 (get_sampler hashes a std::string
+key per unit per draw: cache per fetch constant), resolve 1.2-1.4, other 1.9.
+
+### 0b. Later 2026-10-08 (hardware-driven; all uncommitted)
+
+Switch hardware findings and fixes, in order (each kill switch in env.txt):
+- **Title text / menu / HUD missing + red wedge (HW only):** `fileio_open` opened game files read-write
+  first; Horizon locks a file open for write, so the game's 2nd open of each `D:\SHADERS\0X*` UI shader
+  failed. Fixed: plain opens read-only first (kernel_stubs.cpp). Verified on HW.
+- **switch-mesa EGL ignored share_context** → worker GL contexts never shared objects (black). Fixed in
+  `switch/mesa/mesa_egl_share_edits.py` (hooked into build_mesa.sh).
+- **newlib's single malloc lock** serialised parallel shader builds (20x slower). rpmalloc is now the
+  process allocator (`switch/third_party/rpmalloc/rpmalloc_switch.c`, CMake `LSW_RPMALLOC`, wraps
+  `_malloc_r` etc.; spans from the real `_malloc_r`, NOT `_memalign_r`, which recursed). Builds also 2x
+  faster single-threaded. `LSWTCS_GLWORKERS` default 2 (render thread + core 2 + low-prio core 0).
+- **One frame in flight** (`LSWTCS_RTSYNC`): guest waits for the renderer as on PC; restores the Cantina
+  wipe transition. **GPU queue cap** (`LSWTCS_GLMAXQUEUE`): fence per frame, fixes HW input lag.
+- **1x MSAA** (`LSWTCS_MSAA1X`, default on; `=0` = 2x sample space): only 2x surfaces drop the vertical
+  sample factor; 4x surfaces stay full (the game clears 2x world and 1x screens through 4x 640-pitch
+  surfaces — any other mapping breaks the clears: black world / streaky title).
+- **Dead work** (`LSWTCS_GLDEADSKIP`): resolves whose destination is unsampled for 120 replays skip their
+  copy; draws whose only output feeds such a resolve are skipped (hub: 9 draws + 9 resolves/frame, an
+  unused blur chain).
+- **Trace flush** wrote the whole trace.log under the logger mutex every second → 80-115 ms freezes every
+  1-2 s on the SD card; now appends incrementally outside the mutex.
+- **#4:** `LSWTCS_GLTEXBIAS` (pixel-shader computed-LOD fetches = implicit LOD + bias instead of
+  textureGrad; Maxwell's gradient path is slow) and `LSWTCS_GLFWDCF` (forward-jump-only shaders without
+  the switch dispatcher: `skip` variable + `if (skip == 0)` per exec; DOF shader 4477E1B1 193→49 KB).
+  Both in xenia-canary spirv_shader_translator*.cc (regenerate patches/xenia-canary.patch).
+- HW numbers (partly overclocked mid-run): hub GPU 48 → ~20.6 ms/frame, 12 → ~27-31 fps.
+- Diagnostics: `[GLGPU]` (LSWTCS_GLGPUPROF=N, GPU timestamps), `[GSPIKE]` (LSWTCS_SPIKEMS), `[GLSTALL]`
+  threshold (LSWTCS_GLSTALLMS), LSWTCS_SHOTAT / RESDUMPAT / STALLSHOTS(+OFFS), capture logs shader ids and
+  dumps GLSL to sdmc:/lswtcs/capglsl.
+- Later: forward-jump mode also handles properly nested guest loops (`loop`/`endloop` as
+  `if (count) loop {}`) and do-while loops made of a predicated backward jump (label = loop header;
+  hub corpus + captured hub shaders: 0 dispatchers left). #3 stage reuse (`LSWTCS_GLSTAGEREUSE`):
+  compiled VS/PS/GS objects kept per session by GLSL hash (hub: 32 of 119 stage compiles saved).
+  spirv_glsl_test now writes `<out>.spv.dis` (ucode disassembly).
+- Open: **no audio output on Switch** (null backend, audren not implemented; XMA still decoded: 12-15 ms
+  per frame of audio-thread time on HW). 4 hub vertex shaders with real Xenos loops still use the
+  dispatcher. Game thread ~19 ms + GPU-command thread ~10 ms per frame on HW (pre-overclock).
+
 ---
 
 ## 1. Rules (from the user, mandatory)

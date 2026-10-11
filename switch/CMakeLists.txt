@@ -144,9 +144,9 @@ target_compile_options(lsw_spirv PRIVATE ${LSW_ARCH_FLAGS} ${LSW_COMPAT} -O2 -g 
 # ---- runtime ------------------------------------------------------------------------------
 set(RT "${LSW_ROOT}/LSWTCSRuntime/source")
 add_executable(lswtcs
-    "${RT}/main.cpp" "${RT}/kernel_stubs.cpp" "${RT}/gpu_ringbuf.cpp"
+    "${RT}/main.cpp" "${RT}/kernel_stubs.cpp" "${RT}/gpu_ringbuf.cpp" "${RT}/native_lz2k.cpp" "${RT}/native_reverb.cpp"
     source/platform_switch.cpp source/win32_switch.cpp source/null_backends.cpp source/linux_shim.cpp
-    source/gl_backend.cpp source/mesa_shim.cpp)
+    source/gl_backend.cpp source/mesa_shim.cpp source/audio_switch.cpp)
 # The runtime's main() runs on a 16 MB thread started by platform_switch.cpp.
 set_source_files_properties("${RT}/main.cpp" PROPERTIES COMPILE_DEFINITIONS "main=lsw_runtime_main")
 target_include_directories(lswtcs PRIVATE
@@ -175,7 +175,22 @@ target_link_options(lswtcs PRIVATE
     -Wl,--wrap=pthread_detach              # libnx cannot detach; std::thread::detach would throw
     -Wl,--wrap=exit -Wl,--wrap=abort       # log the caller (platform_switch.cpp)
     -Wl,--wrap=__cxa_throw                 # log libstdc++ throws (no EH in the runtime)
+    -Wl,--wrap=__malloc_lock               # DIAG: malloc lock contention (platform_switch.cpp)
+    -Wl,--wrap=thrd_create                 # newlib thrd_success = 4, Mesa expects 0 (platform_switch.cpp)
     -Wl,-Map=lswtcs.map)
+# rpmalloc as the process allocator (third_party/rpmalloc/rpmalloc_switch.c): per-thread caches instead
+# of newlib's single malloc lock, which serialised parallel shader builds. -DLSW_RPMALLOC=OFF = newlib.
+option(LSW_RPMALLOC "Use rpmalloc for malloc/free" ON)
+if(LSW_RPMALLOC)
+    # Own object library: the runtime target's Win32 shim headers and flags must not reach rpmalloc.
+    add_library(lsw_rpmalloc OBJECT third_party/rpmalloc/rpmalloc_switch.c)
+    target_include_directories(lsw_rpmalloc PRIVATE third_party/rpmalloc/shim third_party/rpmalloc)
+    target_compile_options(lsw_rpmalloc PRIVATE ${LSW_ARCH_FLAGS} -O2 -w)
+    target_sources(lswtcs PRIVATE $<TARGET_OBJECTS:lsw_rpmalloc>)
+    target_link_options(lswtcs PRIVATE
+        -Wl,--wrap=_malloc_r -Wl,--wrap=_free_r -Wl,--wrap=_realloc_r -Wl,--wrap=_calloc_r
+        -Wl,--wrap=_memalign_r -Wl,--wrap=_malloc_usable_size_r)
+endif()
 
 nx_generate_nacp(lswtcs.nacp NAME "LSWTCS" AUTHOR "LSWTCS port" VERSION "0.0.1")
 nx_create_nro(lswtcs NACP lswtcs.nacp)

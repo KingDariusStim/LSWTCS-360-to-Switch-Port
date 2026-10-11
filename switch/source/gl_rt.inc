@@ -67,6 +67,7 @@ bool gpurt_on() {
 uint64_t g_rt_bytes = 0;   // GPU memory held by render targets, resolve targets, views and composites
 struct HostTex { GLuint tex = 0; uint32_t w = 0, h = 0, fmt = 0; };
 HostTex host_tex_create(uint32_t w, uint32_t h, uint32_t fmt) {
+    ++g_gl_epoch;
     HostTex t{0, w, h, fmt};
     glGenTextures(1, &t.tex);
     glBindTexture(GL_TEXTURE_2D_ARRAY, t.tex);
@@ -78,7 +79,7 @@ HostTex host_tex_create(uint32_t w, uint32_t h, uint32_t fmt) {
     return t;
 }
 void host_tex_free(HostTex& t) {
-    if (t.tex) { glDeleteTextures(1, &t.tex); g_rt_bytes -= uint64_t(t.w) * t.h * rt_bytes_per_pixel(t.fmt); }
+    if (t.tex) { ++g_gl_epoch; glDeleteTextures(1, &t.tex); g_rt_bytes -= uint64_t(t.w) * t.h * rt_bytes_per_pixel(t.fmt); }
     t = HostTex{};
 }
 // Framebuffer with `tex` (colour or depth-stencil) alone, for clears and as a blit destination.
@@ -86,6 +87,7 @@ std::unordered_map<GLuint, GLuint> g_single_fbos;
 GLuint single_fbo(const HostTex& t) {
     GLuint& fbo = g_single_fbos[t.tex];
     if (!fbo) {
+        ++g_gl_epoch;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         if (t.fmt == kDxgiD32S8) {
@@ -105,10 +107,27 @@ void forget_fbos_of(GLuint tex);   // drops cached draw framebuffers using tex (
 constexpr uint32_t kRtH = 2048;
 struct Rt { HostTex t; bool depth = false; };
 std::unordered_map<uint64_t, Rt> g_rts;
+// LSWTCS_MSAA1X (default 1): 2x MSAA surfaces render at one sample per pixel (msaa_scale). 0 = 2x in
+// sample space as before (kept for a later optimised 2x path).
+bool msaa_one_x() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_MSAA1X"); return !(e && e[0] == '0'); }();
+    return on;
+}
 void msaa_scale(uint32_t surf_info, uint32_t& sx, uint32_t& sy) {
+    // LSWTCS_MSAA1X (default on): 2x MSAA surfaces render at one sample per pixel (no anti-aliasing). Sample-space
+    // rendering shades every sample: the hub's world draws are 2x MSAA, i.e. 1280x1440 shaded, on a GPU
+    // that needed ~48 ms per hub frame on the Switch (2026-10-08). Every sample-space size, viewport,
+    // scissor, clear and resolve goes through here, and the SPIR-V shaders do not read the sample count
+    // outside the interlock path the port does not use.
+    // Only 2x surfaces (the world) drop to one sample per pixel; 4x surfaces stay in full sample space.
+    // The game clears through 4x 640-pitch surfaces: the 2x world (1280 samples wide; making the 4x
+    // surface 640 wide made it a separate target, the world depth was never cleared, black world) and
+    // 1x screens such as the title (a 4x row covers two 1x rows; squeezing 4x vertically left the bottom
+    // half uncleared: streaks). With 4x untouched both still alias; the 4x clear of the squeezed 2x
+    // world simply covers extra rows. (Eden, 2026-10-08)
     const uint32_t msaa = (surf_info >> 16) & 3;   // 0 1x, 1 2x, 2 4x
     sx = msaa == 2 ? 2 : 1;
-    sy = msaa >= 1 ? 2 : 1;
+    sy = msaa == 2 ? 2 : (msaa == 1 && !msaa_one_x()) ? 2 : 1;
 }
 void clear_color_tex(const HostTex& t, const float* c, const int* rect);
 void clear_depth_tex(const HostTex& t, float z, int stencil, const int* rect);
@@ -155,6 +174,7 @@ GLuint draw_fbo(Rt* const* colors, uint32_t ncolor, Rt* depth) {
     k.d = depth ? depth->t.tex : 0;
     GLuint& fbo = g_draw_fbos[k];
     if (!fbo) {
+        ++g_gl_epoch;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         GLenum bufs[4] = {GL_NONE, GL_NONE, GL_NONE, GL_NONE};
@@ -183,6 +203,7 @@ void forget_fbos_of(GLuint tex) {
 // ---- clears -----------------------------------------------------------------------------------
 // rect: x0, y0, x1, y1 in texture pixels (nullptr = whole texture).
 void clear_color_tex(const HostTex& t, const float* c, const int* rect) {
+    ++g_gl_epoch;
     glBindFramebuffer(GL_FRAMEBUFFER, single_fbo(t));
     if (rect) { glEnable(GL_SCISSOR_TEST); glScissor(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]); }
     else glDisable(GL_SCISSOR_TEST);
@@ -190,6 +211,7 @@ void clear_color_tex(const HostTex& t, const float* c, const int* rect) {
     glClearBufferfv(GL_COLOR, 0, c);
 }
 void clear_depth_tex(const HostTex& t, float z, int stencil, const int* rect) {
+    ++g_gl_epoch;
     glBindFramebuffer(GL_FRAMEBUFFER, single_fbo(t));
     if (rect) { glEnable(GL_SCISSOR_TEST); glScissor(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]); }
     else glDisable(GL_SCISSOR_TEST);
@@ -204,23 +226,26 @@ void clear_depth_tex(const HostTex& t, float z, int stencil, const int* rect) {
 // Same shader as gpu_xedraw.inc xd_blit. Leaves program / framebuffer / state changed: callers
 // rebind before drawing (g_blit_count).
 uint64_t g_blit_count = 0;
-void blit(const HostTex& src, const HostTex& dst, int x, int y, int w, int h, int offx, int offy, int mode, int sx, int sy) {
+// swap_rb: exchange red and blue on the way (a resolve with RB_COPY_DEST_INFO.copy_dest_swap).
+void blit(const HostTex& src, const HostTex& dst, int x, int y, int w, int h, int offx, int offy, int mode, int sx, int sy,
+          bool swap_rb = false) {
     if (w <= 0 || h <= 0 || !src.tex || !dst.tex) return;
     static GLuint prog = 0;
-    static GLint u_off = -1, u_mode = -1;
+    static GLint u_off = -1, u_mode = -1, u_swap = -1;
     if (!prog) {
         static const char* const kVs =
             "#version 430\nvoid main() { vec2 t = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
             "  gl_Position = vec4(t * 2.0 - 1.0, 0.0, 1.0); }\n";
         static const char* const kFs =
-            "#version 430\nlayout(binding = 0) uniform sampler2DArray src;\nuniform ivec2 off;\nuniform ivec3 mode;\n"
+            "#version 430\nlayout(binding = 0) uniform sampler2DArray src;\nuniform ivec2 off;\nuniform ivec3 mode;\nuniform int swp;\n"
             "layout(location = 0) out vec4 o;\n"
             "vec4 ld(ivec2 p) { return texelFetch(src, ivec3(p, 0), 0); }\n"
             "void main() { ivec2 s = ivec2(gl_FragCoord.xy) + off;\n"
             "  if (mode.x == 1) { ivec2 b = s * 2; o = 0.25 * (ld(b) + ld(b + ivec2(1, 0)) + ld(b + ivec2(0, 1)) + ld(b + ivec2(1, 1))); }\n"
             "  else if (mode.x == 2) { ivec2 b = ivec2(s.x, s.y * 2); o = 0.5 * (ld(b) + ld(b + ivec2(0, 1))); }\n"
             "  else if (mode.x == 3) o = ld(s * mode.yz);\n"
-            "  else o = ld(s); }\n";
+            "  else o = ld(s);\n"
+            "  if (swp != 0) o = o.bgra; }\n";
         GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
         glShaderSource(v, 1, &kVs, nullptr); glCompileShader(v);
         glShaderSource(f, 1, &kFs, nullptr); glCompileShader(f);
@@ -230,12 +255,15 @@ void blit(const HostTex& src, const HostTex& dst, int x, int y, int w, int h, in
         if (!ok) { char log[512] = {}; glGetProgramInfoLog(prog, sizeof log, nullptr, log); printf("[GLRT] blit link failed: %s\n", log); fflush(stdout); }
         u_off = glGetUniformLocation(prog, "off");
         u_mode = glGetUniformLocation(prog, "mode");
+        u_swap = glGetUniformLocation(prog, "swp");
     }
     ++g_blit_count;
+    ++g_gl_epoch;
     glBindFramebuffer(GL_FRAMEBUFFER, single_fbo(dst));
     glUseProgram(prog);
     glUniform2i(u_off, offx, offy);
     glUniform3i(u_mode, mode, sx, sy);
+    glUniform1i(u_swap, swap_rb ? 1 : 0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D_ARRAY, src.tex);
     glBindSampler(0, 0);
@@ -254,8 +282,31 @@ void blit(const HostTex& src, const HostTex& dst, int x, int y, int w, int h, in
 struct Resolved {
     HostTex t; uint32_t tfmt = 0; uint64_t frame = 0; uint64_t probe = 0; uint32_t probe_bytes = 0;
     bool composite = false; uint32_t vy0 = 0xFFFFFFFFu, vy1 = 0;
+    bool swap = false;   // last resolve into it had copy_dest_swap (red/blue exchanged in guest memory)
 };
 std::unordered_map<uint32_t, Resolved> g_resolved;
+
+// ---- dead work (LSWTCS_GLDEADSKIP, default on) ------------------------------------------------
+// A resolve whose destination nothing has sampled for kDeadReplays replays copies for nobody: the hub
+// renders a blur chain (a downsample + 8 passes into 0x0B499000 / 0x0B4D9000 / 0x0B4E9000, 9 resolves)
+// whose results no draw samples (Eden capture 2026-10-08). The copy of such a resolve is skipped (its
+// clears still run), and so is a draw whose only output feeds it (plan_dead_work). If a skipped
+// destination is sampled again its resolves resume from the next replay (one stale frame at worst).
+constexpr uint64_t kDeadReplays = 120;
+std::unordered_map<uint32_t, uint64_t> g_dest_first, g_dest_used;   // replay first resolved / last sampled
+void note_dest_used(uint32_t dest) { g_dest_used[dest] = g_replays; }
+bool deadskip_on() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_GLDEADSKIP"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool dest_dead(uint32_t dest) {
+    if (!deadskip_on()) return false;
+    auto fi = g_dest_first.find(dest);
+    if (fi == g_dest_first.end() || g_replays < fi->second + kDeadReplays) return false;
+    auto ui = g_dest_used.find(dest);
+    const uint64_t last = ui == g_dest_used.end() ? fi->second : ui->second;
+    return g_replays > last + kDeadReplays;
+}
 uint64_t g_resolve_seq = 0;   // bumps on every resolve write
 uint64_t g_src_epoch = 0;     // bumps when a target is dropped or replaced
 uint64_t guest_probe(uint32_t phys, uint32_t bytes) {
@@ -302,11 +353,12 @@ float unorm(uint32_t v, uint32_t bits) { return float(v & ((1u << bits) - 1)) / 
 
 // One recorded resolve: copy the source rectangle into the destination texture, then the clears.
 uint32_t g_resolves_done = 0;
-void do_resolve(const LswGpuDrawRec& r) {
+void do_resolve(const LswGpuDrawRec& r, bool copy = true, bool clears = true) {
     uint32_t sx, sy; msaa_scale(r.surf_info, sx, sy);
     const bool depth_src = r.rs_src >= 4;
     const int32_t x0 = r.rs_rect[0], y0 = r.rs_rect[1], x1 = r.rs_rect[2], y1 = r.rs_rect[3];
-    if (r.rs_copy_cmd <= 1 && x1 > x0 && y1 > y0 && r.rs_dest) {
+    if (copy && r.rs_copy_cmd <= 1 && x1 > x0 && y1 > y0 && r.rs_dest) {
+        g_dest_first.emplace(r.rs_dest, g_replays);
         Rt* src = depth_src ? rt_depth(r.surf_info, r.depth_info) : rt_color(r.surf_info, r.color_info);
         if (src) {
             const int32_t w = x1 - x0, h = y1 - y0;
@@ -318,11 +370,15 @@ void do_resolve(const LswGpuDrawRec& r) {
                 int32_t mode = 0;
                 if (sx > 1 || sy > 1) {
                     const uint32_t ss = r.rs_sample;
-                    if (!depth_src && sx == 2 && ss == 6) mode = 1;        // k0123 average
-                    else if (!depth_src && sx == 1 && ss == 4) mode = 2;   // k01 average (2x)
-                    else mode = 3;                                          // single sample
+                    if (!depth_src && sx == 2 && sy == 2 && ss == 6) mode = 1;        // k0123 average
+                    else if (!depth_src && sx == 1 && sy == 2 && ss == 4) mode = 2;   // k01 average (2x)
+                    else mode = 3;   // single sample (also 4x under LSWTCS_MSAA1X: sx 2, sy 1)
                 }
+                // Copied unswapped: the host texture keeps the render target's channel order, and copy_dest_swap is
+                // applied where the copy is sampled (resolved_swizzle), as the guest's fetch swizzle undoes it there.
+                // Swapping here turned the HUD (presented straight from the resolved front buffer) blue (2026-10-11).
                 blit(src->t, dst->t, r.rs_dest_x, r.rs_dest_y, w, h, x0 - r.rs_dest_x, y0 - r.rs_dest_y, mode, int32_t(sx), int32_t(sy));
+                dst->swap = r.rs_dest_swap != 0;
                 dst->frame = ++g_resolve_seq;
                 dst->vy0 = std::min<uint32_t>(dst->vy0, uint32_t(r.rs_dest_y));
                 dst->vy1 = std::max<uint32_t>(dst->vy1, uint32_t(r.rs_dest_y + h));
@@ -333,7 +389,7 @@ void do_resolve(const LswGpuDrawRec& r) {
         }
     }
     const int cr[4] = {int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy)};
-    if (cr[2] <= cr[0] || cr[3] <= cr[1]) return;
+    if (!clears || cr[2] <= cr[0] || cr[3] <= cr[1]) return;
     if (r.rs_clear_depth) {
         if (Rt* d = rt_depth(r.surf_info, r.depth_info)) {
             const uint32_t v = (r.rs_depth_clear >> 8) & 0xFFFFFF;
@@ -390,8 +446,10 @@ const HostTex* resolved_view(uint32_t base, Resolved& src, uint32_t w, uint32_t 
     return &v.t;
 }
 std::unordered_map<uint32_t, Resolved> g_composed;
-bool texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, const HostTex*& out) {
+// *swap (optional): the source's resolve had copy_dest_swap (for a stitched source: its first piece).
+bool texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, const HostTex*& out, bool* swap = nullptr) {
     auto ex = g_resolved.find(base);
+    if (ex != g_resolved.end()) note_dest_used(base);
     if (ex != g_resolved.end() && (!ex->second.t.tex || ex->second.composite)) ex = g_resolved.end();
     if (ex != g_resolved.end() && ex->second.probe_bytes && guest_probe(base, ex->second.probe_bytes) != ex->second.probe) {
         forget_fbos_of(ex->second.t.tex);   // stale: the CPU reused the memory
@@ -410,6 +468,7 @@ bool texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, const 
             if (kv.first > base && kv.first < end && kv.second.t.tex && !kv.second.composite && ((kv.first - base) % row_bytes) == 0)
                 subs.push_back({kv.first, &kv.second});
     }
+    if (swap) *swap = ex != g_resolved.end() ? ex->second.swap : !subs.empty() && subs[0].second->swap;
     if (subs.empty()) {
         if (ex == g_resolved.end()) return false;
         Resolved& rr = ex->second;
@@ -430,16 +489,23 @@ bool texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, const 
     }
     if (c.frame != seq) {
         c.frame = seq;
-        if (ex != g_resolved.end() && ex->second.t.fmt == c.t.fmt) {
-            Resolved& s = ex->second;
-            const uint32_t y0 = s.vy0 == 0xFFFFFFFFu ? 0 : s.vy0, y1 = std::min(s.vy1 ? s.vy1 : s.t.h, std::min(s.t.h, c.t.h));
-            if (y1 > y0) blit(s.t, c.t, 0, int(y0), int(std::min(s.t.w, c.t.w)), int(y1 - y0), 0, 0, 0, 1, 1);
-        }
+        // Blit in resolve order, newest last: on the 360 all of these share one piece of memory, so whichever resolve
+        // wrote a row most recently is what the texture holds. The old order (base first, then every sub-range) let
+        // the per-tile colour resolves of tiles 2/3 (written before the shadow composite) paste their unshadowed rows
+        // over the later full-screen resolve of the shadowed image: hardware "band" below the first tile seam
+        // (row 320 of 704), shadows only in the top part of the screen (2026-10-09).
+        std::vector<std::pair<uint64_t, std::pair<Resolved*, uint32_t>>> order;   // (resolve seq, (source, row offset))
+        if (ex != g_resolved.end() && ex->second.t.fmt == c.t.fmt) order.push_back({ex->second.frame, {&ex->second, 0u}});
         for (auto& sp : subs) {
-            Resolved& s = *sp.second;
-            if (s.t.fmt != c.t.fmt) continue;
+            note_dest_used(sp.first);
+            if (sp.second->t.fmt != c.t.fmt) continue;
             const uint32_t yoff = uint32_t((sp.first - base) / row_bytes);
-            if (yoff >= c.t.h) continue;
+            if (yoff < c.t.h) order.push_back({sp.second->frame, {sp.second, yoff}});
+        }
+        std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (auto& o : order) {
+            Resolved& s = *o.second.first;
+            const uint32_t yoff = o.second.second;
             uint32_t y0 = s.vy0 == 0xFFFFFFFFu ? 0 : s.vy0, y1 = s.vy1 ? s.vy1 : s.t.h;
             y1 = std::min<uint32_t>(y1, std::min<uint32_t>(s.t.h, c.t.h - yoff));
             if (y1 <= y0) continue;
@@ -452,12 +518,17 @@ bool texture_source(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, const 
 
 // Swizzle for a fetch bound to a resolved source (gpu_xedraw.inc tex_table): single-channel host
 // formats replicate channel 0, k_8 resolves keep RGBA (sampled as-is), constants 0/1 pass through.
-uint32_t resolved_swizzle(uint32_t guest_swizzle, uint32_t tfmt, uint32_t host_fmt) {
+// swap: the resolve that wrote the source had copy_dest_swap. On the console guest memory then holds red and blue
+// exchanged and the fetch swizzle (e.g. A8R8G8B8's) maps them back; the host texture holds the render target's own
+// order, so the swizzle's red/blue sources are exchanged instead. Until 2026-10-11 the game's render-target format
+// switch (sub_8231B770) was broken and its surfaces arrived as format 2 with no swizzle, sampled as identity.
+uint32_t resolved_swizzle(uint32_t guest_swizzle, uint32_t tfmt, uint32_t host_fmt, bool swap = false) {
     const bool single = host_fmt == kDxgiR8 || host_fmt == kDxgiR32F;
     if (tfmt == 2 && !single) return 0x688;   // RGBA identity
     uint32_t map = 0;
     for (int c = 0; c < 4; ++c) {
         uint32_t s = (guest_swizzle >> (3 * c)) & 7;
+        if (swap && !single && (s == 0 || s == 2)) s ^= 2;
         if (s < 4 && single) s = 0; else if (s > 5) s = 4;
         map |= s << (3 * c);
     }

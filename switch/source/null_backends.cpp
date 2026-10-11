@@ -1,4 +1,4 @@
-// Backends not implemented on Switch yet: audio output (audren in M4) and the diagnostic CPU
+// Backends not implemented on Switch yet: the diagnostic CPU
 // vertex-shader interpreter. The GPU entry points live in gl_backend.cpp (M3).
 #include <switch.h>
 #include <cstddef>
@@ -12,8 +12,4 @@ void lswtcs_xvs_set_ps(const uint32_t*, uint32_t) {}
 uint32_t lswtcs_xvs_run_draw(const uint32_t*, uint8_t*, const uint32_t*, uint32_t, uint32_t, uint32_t, uint32_t,
                              LswXvsVertex*, uint32_t) { return 0; }
 
-// ---- audio output (host_audio.cpp) ------------------------------------------------------------
-// false = no host voice: kernel_stubs' audio worker then paces frames on its own timer (PC path).
-bool host_audio_open(int, void (*)(int)) { return false; }
-void host_audio_submit(int, const uint8_t*) {}
-void host_audio_close(int) {}
+// Audio output: audio_switch.cpp (libnx audout).

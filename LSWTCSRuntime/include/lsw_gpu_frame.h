@@ -42,6 +42,8 @@ struct LswGpuDrawRec {
   uint32_t first_range, range_count;
   // Index buffer (raw guest bytes in the arena; the VS applies the endian swap itself).
   uint32_t ib_off, ib_count, ib_32bit;   // ib_count == 0: non-indexed (vertex_count used)
+  uint32_t ib_shm;                       // 1: ib_off is a guest physical offset into shared memory
+                                         // (indices tracked like vertex ranges; Switch replay only)
   uint32_t vertex_count;
   uint32_t topology;                     // D3D_PRIMITIVE_TOPOLOGY
   const void* gs_dxbc; uint32_t gs_size; uint32_t gs_type;   // optional geometry shader
@@ -52,6 +54,13 @@ struct LswGpuDrawRec {
   // Texture bindings: fetch constant index + dimension per slot (resolved at replay).
   uint8_t ps_tex_fetch[32], ps_tex_dim[32], vs_tex_fetch[32], vs_tex_dim[32];
   LswGpuSamplerBinding ps_smp[32], vs_smp[32];
+  uint32_t ps_writes_depth;   // the pixel shader writes depth (viewport depth range, as lsw_gpu_prepare)
+  // Predicated-tiling repeat recorded as a copy (Switch walk-time tile skipping): 1 + index of the tile-0 draw
+  // whose data this record reuses; only viewport and scissor are this tile's own. 0 = an ordinary draw.
+  uint32_t tile_repeat;
+  // Resolve: RB_COPY_DEST_INFO.copy_dest_swap (bit 24), colour sources only: red and blue are exchanged on the way to
+  // memory (Xenia resolve.xesli dest_swap). The game's D3D sets it for A8R8G8B8 resolve destinations.
+  uint32_t rs_dest_swap;
 };
 
 // Vector allocator that leaves new elements uninitialised (resize() would zero-fill every byte of
@@ -74,6 +83,10 @@ struct LswGpuFrame {
   // residency tracking assumed them done, so they are issued before this frame's draws.
   std::vector<LswGpuRange> prelude;
   uint32_t swap_fb = 0;   // frontbuffer address in the PM4_XE_SWAP packet that ended this frame
+  // Frame log (Switch frames.log): the game's frame time [0x830AA97C] and the real time between the last two
+  // VdSwaps when this frame was published, and a serial that tells a re-replayed frame from a new one.
+  float game_ft = 0, swap_real = 0;
+  uint64_t serial = 0;
   // Last constant block written per kind (LswCbKind), for put_block's reuse check.
   uint32_t cb_last_off[5] = {~0u, ~0u, ~0u, ~0u, ~0u}, cb_last_total[5] = {}, cb_last_na[5] = {}, cb_last_nb[5] = {};
   void clear() { arena.clear(); ranges.clear(); draws.clear(); prelude.clear(); for (uint32_t& o : cb_last_off) o = ~0u; }

@@ -263,7 +263,25 @@ static void dbg_ram_do_init() {
     // leaves a recent trace.log. Interval via LSWTCS_TRACE_MS (default 1000ms).
     int ms = 1000;
     if (const char* s = getenv("LSWTCS_TRACE_MS")) { int v = atoi(s); if (v > 0) ms = v; }
-    std::thread([ms]{ for(;;){ std::this_thread::sleep_for(std::chrono::milliseconds(ms)); dbg_ram_dump(); } }).detach();
+    // Incremental: the buffer is append-only, so each flush appends only the bytes logged since the last
+    // one, and writes them WITHOUT holding g_dbg_mutex. Rewriting the whole file under the mutex every
+    // second (dbg_ram_dump) blocked every logging guest thread for the duration of the write while it
+    // held the GIL: on the Switch's SD card that froze the game 80-115 ms every 1-2 s, growing with the
+    // file (2026-10-08). dbg_ram_dump still rewrites everything (crash path).
+    std::thread([ms]{
+        size_t flushed = 0;
+        FILE* f = nullptr;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            size_t len;
+            { std::lock_guard<std::mutex> lk(g_dbg_mutex); len = g_dbg_len; }
+            if (!f) f = fopen("trace.log", "wb");
+            if (!f || len <= flushed) continue;
+            fwrite(g_dbg_buf + flushed, 1, len - flushed, f);   // bytes below len never change
+            fflush(f);
+            flushed = len;
+        }
+    }).detach();
 
     // WATCH: tight host-poll watch on a type-graph node's link offsets (+0 firstChild, +4 next,
     // +32 prev/parent, +36 next-sibling). Logs each value change into the SAME ordered trace buffer,
@@ -518,10 +536,15 @@ static uint32_t host_file_read(uint32_t fd, uint8_t* dst, uint32_t len,
     uint32_t total = 0;
     while (total < len) {
         if (!(rp >= r.cache_start && rp < r.cache_start + r.cache_len)) {
+            const auto t0 = std::chrono::steady_clock::now();   // DIAG: [GSPIKE] io_ms / reads
             LARGE_INTEGER li; li.QuadPart = (LONGLONG)rp;
             if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) break;
             DWORD got = 0;
-            if (!ReadFile(h, r.data.data(), kRahSize, &got, nullptr) || got == 0) break;
+            const bool ok = ReadFile(h, r.data.data(), kRahSize, &got, nullptr) && got != 0;
+            extern std::atomic<uint64_t> g_file_read_ns, g_file_reads;
+            g_file_read_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            ++g_file_reads;
+            if (!ok) break;
             r.cache_start = rp; r.cache_len = got;
         }
         uint32_t avail = (uint32_t)(r.cache_start + r.cache_len - rp);
@@ -534,6 +557,9 @@ static uint32_t host_file_read(uint32_t fd, uint8_t* dst, uint32_t len,
     return total;
 }
 std::atomic<uint64_t> g_file_bytes_read{0};
+// Time spent in the card reads that refill the read-ahead buffer (seek + read) and their count: [GSPIKE] io_ms /
+// reads separate waiting for the SD card from the game's own processing of what it read.
+std::atomic<uint64_t> g_file_read_ns{0}, g_file_reads{0};
 
 // Query the tracked current position for a kobj fd (for FilePositionInformation).
 static bool host_file_tell(uint32_t fd, uint64_t* out_pos) {
@@ -609,7 +635,9 @@ static void guest_thread_body(GuestThread* gt) {
     lswtcs_set_vtable_watch();  // arm vtable watchpoint on this guest thread
     PPCContext tctx{};
     tctx.r1.u32       = gt->stack_ptr;
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
     tctx.r2.u32       = gt->toc;
+#endif
     tctx.r13.u32      = gt->pcr_addr;
     // Seed fpscr.csr so enableFlushModeUnconditional() preserves exception masks.
     // With csr=0 (default), enableFlushModeUnconditional sets MXCSR=FlushMask only,
@@ -659,6 +687,7 @@ static std::atomic<int> g_sched_next_id{1};   // 0 reserved for the main thread
 static uint32_t g_sp_entry[LSW_SCHED_MAX];           // guest entry of each id (0 = main)
 static uint64_t g_sp_acc[LSW_SCHED_MAX + 1];         // [LSW_SCHED_MAX] = idle
 static uint64_t g_sp_cnt[LSW_SCHED_MAX + 1];
+static uint64_t g_sp_run[LSW_SCHED_MAX + 1];         // same, never reset (per-frame deltas: [GSPIKE])
 static uint64_t g_sp_last = 0, g_sp_lastdump = 0, g_sp_switches = 0;
 static int      g_sp_cur = -1;
 static int schedprof_on() { static int v = -1; if (v < 0) { const char* e = getenv("LSWTCS_SCHEDPROF"); v = (e && e[0] == '1') ? 1 : 0; } return v; }
@@ -667,7 +696,7 @@ static void sched_turn_set(int n) {   // caller holds g_sched_mtx
         static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
         uint64_t now = uint64_t(t.QuadPart);
-        if (g_sp_last) { int k = g_sched_turn < 0 ? LSW_SCHED_MAX : g_sched_turn; g_sp_acc[k] += now - g_sp_last; g_sp_cnt[k]++; }
+        if (g_sp_last) { int k = g_sched_turn < 0 ? LSW_SCHED_MAX : g_sched_turn; g_sp_acc[k] += now - g_sp_last; g_sp_cnt[k]++; g_sp_run[k] += now - g_sp_last; }
         g_sp_last = now; ++g_sp_switches;
         if (!g_sp_lastdump) g_sp_lastdump = now;
         if (now - g_sp_lastdump > uint64_t(f.QuadPart) * 5) {
@@ -728,11 +757,20 @@ static int sched_next_locked(int from) {
 // thread holds the scheduler turn, reads its RIP and resumes it (nothing is allocated while it is
 // suspended: it may hold the heap lock). Every 20 s writes sampleprof.txt: "<sched id> <rip hex> <count>"
 // sorted by count; build/sampleprof.py maps RIPs to functions with nm.
+// LSWTCS_SAMPLEPROF=2: sample only while the game is loading (game-file bytes read in the last 250 ms), to see where
+// scene/level load time goes (Switch 2026-10-09: ~80% of a 3.8 s level load is guest code on the main thread).
 static HANDLE g_sp_thread[LSW_SCHED_MAX] = {};
-static void sampleprof_loop() {
+extern std::atomic<uint64_t> g_file_bytes_read;
+static void sampleprof_loop(int mode) {
     std::unordered_map<uint64_t, uint32_t> hist; uint64_t samples = 0, idle = 0, t_dump = GetTickCount64();
+    uint64_t io_last = 0, t_io = 0;
     for (;;) {
         Sleep(1);
+        if (mode == 2) {
+            const uint64_t io = g_file_bytes_read.load(), now = GetTickCount64();
+            if (io != io_last) { io_last = io; t_io = now; }
+            if (now - t_io > 250) continue;   // not loading
+        }
         if (((samples + idle) & 1023) == 0 && GetFileAttributesA("sampleprof_reset") != INVALID_FILE_ATTRIBUTES) {
             DeleteFileA("sampleprof_reset"); hist.clear(); samples = idle = 0; t_dump = GetTickCount64();   // e.g. once the hub is up
         }
@@ -772,8 +810,8 @@ static void sampleprof_loop() {
 }
 static void sched_register(int id) {
     if (!gil_on() || id < 0) return;
-    { static int sp = -1; if (sp < 0) { const char* e = getenv("LSWTCS_SAMPLEPROF"); sp = (e && e[0] == '1') ? 1 : 0;
-                                         if (sp) std::thread(sampleprof_loop).detach(); }
+    { static int sp = -1; if (sp < 0) { const char* e = getenv("LSWTCS_SAMPLEPROF"); sp = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0;
+                                         if (sp) std::thread(sampleprof_loop, sp).detach(); }
       if (sp && id < LSW_SCHED_MAX && !g_sp_thread[id])
           g_sp_thread[id] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId()); }
     std::unique_lock<std::mutex> lk(g_sched_mtx);
@@ -952,15 +990,33 @@ extern "C" void lswtcs_gil_quantum() {
 // ── Critical Sections ─────────────────────────────────────────────────────────
 // Each guest RTL_CRITICAL_SECTION address maps to a real recursive_mutex.
 // recursive_mutex lets the same thread re-enter (Xbox 360 CS are recursive).
+// EXPERIMENTAL_REGEN diag (2026-10-09): each CS remembers its owner (scheduler id, guest lr of the
+// outermost Enter, recursion depth), written only by the thread holding it, so a blocked acquire can
+// name the holder. Fields are racy-read by the blocked thread (diagnostic only).
+struct LswCs : std::recursive_mutex {
+    volatile int      own_sid   = -2;
+    volatile uint32_t own_lr    = 0;
+    volatile int      own_depth = 0;
+};
 static std::mutex             g_cs_registry_lock;
-static std::unordered_map<uint32_t, std::recursive_mutex*> g_cs_registry;
+static std::unordered_map<uint32_t, LswCs*> g_cs_registry;
 
-static std::recursive_mutex* cs_get(uint32_t addr) {
+static LswCs* cs_get(uint32_t addr) {
     if (addr < 0x80000000u || addr >= 0x94000000u) return nullptr;
     std::lock_guard<std::mutex> lk(g_cs_registry_lock);
     auto& slot = g_cs_registry[addr];
-    if (!slot) slot = new std::recursive_mutex();
+    if (!slot) slot = new LswCs();
     return slot;
+}
+static inline void cs_took(LswCs* m, uint32_t lr) {
+    if (m->own_depth++ == 0) { m->own_sid = g_sched_id; m->own_lr = lr; }
+    else if (m->own_depth >= 3 && m->own_depth <= 12) {
+        static int n = 0; if (++n <= 200)
+            dbg_ram("[CSDEPTH] cs=%p depth=%d sid=%d enter lr=0x%08X (outer lr=0x%08X)\n", (void*)m, m->own_depth, g_sched_id, lr, m->own_lr);
+    }
+}
+static inline void cs_left(LswCs* m) {
+    if (m->own_depth > 0 && --m->own_depth == 0) { m->own_sid = -1; }
 }
 
 static void cs_init_guest(uint32_t cs, uint8_t* base) {
@@ -983,12 +1039,13 @@ PPC_FUNC(__imp__RtlEnterCriticalSection) {
     PPC_FUNC_PROLOGUE();
     auto* m = cs_get(ctx.r3.u32);
     if (m) {
-        if (m->try_lock()) return;       // uncontended: keep the turn, fast path
+        const uint32_t lr = (uint32_t)ctx.lr;
+        if (m->try_lock()) { cs_took(m, lr); return; }   // uncontended: keep the turn, fast path
         if (gil_on()) {
             // Cooperative: yield the turn to the holder (so it runs + releases), retry try_lock.
             // No host m->lock() block → acquisition order is guest-driven, not host-timed.
             bool got = false;
-            for (int i = 0; i < 100000; i++) { sched_yield_turn(); if (m->try_lock()) { got = true; break; } }
+            for (int i = 0; i < 100000; i++) { sched_yield_turn(); if (m->try_lock()) { got = true; cs_took(m, lr); break; } }
             if (!got) {
                 // NEVER return without the lock (it used to): when the holder is parked off the
                 // run queue (GilYield: FPS limiter, GilMutexGuard, host wait) the yields above are
@@ -998,25 +1055,29 @@ PPC_FUNC(__imp__RtlEnterCriticalSection) {
                 static int unsafe = -1; if (unsafe < 0) { const char* e = getenv("LSWTCS_CSUNSAFE"); unsafe = (e && e[0] == '1') ? 1 : 0; }
                 if (!unsafe) {
                     static uint64_t nblk = 0; if (++nblk <= 10 || (nblk % 1000) == 0)
-                        dbg_ram("[CS] contended CS 0x%08X: blocking acquire #%llu\n", ctx.r3.u32, (unsigned long long)nblk);
-                    GilYield y; m->lock();
+                        dbg_ram("[CS] contended CS 0x%08X: blocking acquire #%llu by sid=%d lr=0x%08X; held by sid=%d lr=0x%08X depth=%d\n",
+                                ctx.r3.u32, (unsigned long long)nblk, g_sched_id, lr, m->own_sid, m->own_lr, m->own_depth);
+                    { GilYield y; m->lock(); }
+                    cs_took(m, lr);
                 }
             }
         } else {
-            GilYield y;                   // (no GIL) drop turn so the holder can run + release
-            m->lock();
+            { GilYield y;                 // (no GIL) drop turn so the holder can run + release
+              m->lock(); }
+            cs_took(m, lr);
         }
     }
 }
 PPC_FUNC(__imp__RtlLeaveCriticalSection) {
     PPC_FUNC_PROLOGUE();
     auto* m = cs_get(ctx.r3.u32);
-    if (m) m->unlock();
+    if (m) { cs_left(m); m->unlock(); }
 }
 PPC_FUNC(__imp__RtlTryEnterCriticalSection) {
     PPC_FUNC_PROLOGUE();
     auto* m = cs_get(ctx.r3.u32);
-    ctx.r3.u32 = (!m || m->try_lock()) ? 1 : 0;
+    if (!m) { ctx.r3.u32 = 1; return; }
+    if (m->try_lock()) { cs_took(m, (uint32_t)ctx.lr); ctx.r3.u32 = 1; } else ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount) {
     PPC_FUNC_PROLOGUE();
@@ -1365,10 +1426,18 @@ static std::string fileio_translate(const std::string& xbox) {
 
 static uint32_t fileio_open(const char* host, bool allow_create) {
     DWORD disp = allow_create ? OPEN_ALWAYS : OPEN_EXISTING;
-    // Try read-write first, fall back to read-only
-    HANDLE h = CreateFileA(host, GENERIC_READ | GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Plain opens of existing game files: read-only first (the 360 disc is read-only). Read-write first
+    // took a write lock on Switch hardware, so the game's second open of the same file failed: the five
+    // D:\SHADERS UI shaders never loaded and the title text / menu options were invisible on the console
+    // (2026-10-08; Eden and Windows do not lock). Then read-write, then read-only as before.
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!allow_create)
+        h = CreateFileA(host, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        h = CreateFileA(host, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         h = CreateFileA(host, GENERIC_READ, FILE_SHARE_READ,
                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2147,7 +2216,11 @@ PPC_FUNC(__imp__ExCreateThread) {
         if (gt->sched_id >= 0 && gt->sched_id < LSW_SCHED_MAX) g_sp_entry[gt->sched_id] = entry;
         gt->arg         = arg;
         gt->api_startup = api_startup;
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
         gt->toc         = ctx.r2.u32;
+#else
+        gt->toc         = 0;
+#endif
         gt->stack_ptr = sp;
         gt->pcr_addr  = pcr;
         gt->resume_ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -2996,6 +3069,8 @@ static void geom_swap_packet(uint32_t swap_fb) {
       g_gpu_offscreen_drops = 0; }
     if (gpudraw_on() && !g_gpu_frame_build.draws.empty()) {
         g_gpu_frame_build.swap_fb = swap_fb;
+        { extern float g_ft_last_game, g_ft_last_real; static uint64_t serial = 0;
+          g_gpu_frame_build.game_ft = g_ft_last_game; g_gpu_frame_build.swap_real = g_ft_last_real; g_gpu_frame_build.serial = ++serial; }
         std::lock_guard<std::mutex> lk(g_gpu_frame_mtx);   // the render thread takes present under it
         if (g_gpu_frame_ready) gpu_shm_carry_uploads(g_gpu_frame_present, g_gpu_frame_build);
         std::swap(g_gpu_frame_build, g_gpu_frame_present); g_gpu_frame_build.clear(); g_gpu_frame_ready = true; ++g_shm_frame; }
@@ -3388,6 +3463,10 @@ static void gpu_record_resolve() {
     r.rs_dest = g_xe_regs[0x2319] & 0x1FFFFFFFu;
     r.rs_dest_pitch = dpitch & 0x3FFF; r.rs_dest_height = (dpitch >> 16) & 0x3FFF;
     r.rs_dest_fmt = (dinfo >> 7) & 0x3F;
+    // copy_dest_swap (bit 24): red/blue exchanged on colour resolves (depth: one component, never swapped; Xenia
+    // draw_util GetResolveInfo). Ignored until 2026-10-10, when the repaired texture-format switch sub_8231B770 made the
+    // game ask for real A8R8G8B8 resolve targets (with swap) instead of a garbage format: everything resolved turned blue.
+    r.rs_dest_swap = r.rs_src < 4 ? (dinfo >> 24) & 1 : 0;
     r.rs_dest_x = x0; r.rs_dest_y = y0;                        // Xenia: the rectangle lands at (x0, y0) in the destination
     g_gpu_frame_build.draws.push_back(r);
     static std::unordered_map<uint32_t, int> per_dest; static int n = 0; ++n;
@@ -3408,7 +3487,7 @@ static void gpu_record_resolve() {
 // A published frame that is replaced before it was replayed hands its uploads to the next frame
 // (gpu_shm_carry_uploads). DIAG LSWTCS_SHMALWAYS=1: upload every page of every range every draw.
 static constexpr uint32_t kShmPageShift = 12, kShmPageSize = 1u << kShmPageShift, kShmPages = 0x20000000u >> kShmPageShift;
-struct GpuShmPage { uint64_t hash; uint32_t epoch; uint32_t valid; uint32_t frame; };
+struct GpuShmPage { uint64_t hash; uint32_t epoch; uint32_t valid; uint32_t frame; uint32_t stable; };
 static std::vector<GpuShmPage> g_shm_pages;
 static uint32_t g_shm_epoch = 1;
 // Epoch sources (GPUPROF attribution of mid-frame page changes): 0 = walk start, 1 = after a guest
@@ -3433,18 +3512,33 @@ static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
         g_gpuprof[GP_VBYTES] += bytes;
         run = UINT32_MAX;
     };
+    // LSWTCS_SHMONCE (default on): a page is hashed at most once per frame. The world is drawn in tiles
+    // and every tile-drain yield starts a new epoch (~75 per hub frame), so the same static vertex and
+    // index pages were hashed up to 3 times a frame: 1146 of 2179 page hashes per hub frame were such
+    // re-hashes and none ever found a mid-frame change (Eden, 2026-10-08). A page a CP write landed on
+    // (gpu_shm_invalidate: epoch 0) is still re-hashed. Only pages unchanged for kShmStableFrames
+    // frames are skipped: CPU-written dynamic vertex pages (dust/footstep particles while a character
+    // runs) ARE rewritten mid-frame, and skipping them replayed stale vertices (stretched default-texture
+    // shards in hub/levels, 2026-10-08). =0: per epoch, as before (the GPUPROF "changed mid-frame"
+    // counter needs it).
+    static int once = -1; if (once < 0) { const char* e = getenv("LSWTCS_SHMONCE"); once = (e && e[0] == '0') ? 0 : 1; }
+    constexpr uint32_t kShmStableFrames = 8;
     for (uint32_t p = p0; p <= p1; ++p) {
         GpuShmPage& pg = g_shm_pages[p];
         bool dirty = always != 0;
-        if (pg.epoch != g_shm_epoch) {
+        if (pg.epoch != g_shm_epoch &&
+            !(once && pg.frame == g_shm_frame && pg.epoch != 0 && pg.valid && pg.stable >= kShmStableFrames)) {
             // XXH3 (SIMD: AVX2 here, NEON on Switch); LSWTCS_XXH3=0 = the scalar lsw_hash_bytes (A/B).
             static int xxh = -1; if (xxh < 0) { const char* e = getenv("LSWTCS_XXH3"); xxh = (e && e[0] == '0') ? 0 : 1; }
             const uint8_t* src = phys + (size_t(p) << kShmPageShift);
             uint64_t h = xxh ? XXH3_64bits(src, kShmPageSize) : lsw_hash_bytes(src, kShmPageSize);
             ++g_gpuprof[GP_N_PAGEHASH];
             if (pg.frame == g_shm_frame) { ++g_gpuprof[GP_N_REHASH]; if (pg.valid && pg.hash != h) { ++g_gpuprof[GP_N_MIDCHANGE]; ++g_gpuprof[GP_N_MID_WALK + g_shm_epoch_src]; } }
+            const bool changed = !pg.valid || pg.hash != h;
+            if (changed) pg.stable = 0;
+            else if (pg.frame != g_shm_frame && pg.stable < kShmStableFrames) ++pg.stable;
             pg.frame = g_shm_frame;
-            if (!pg.valid || pg.hash != h) dirty = true;
+            if (changed) dirty = true;
             pg.hash = h; pg.valid = 1; pg.epoch = g_shm_epoch;
         }
         if (dirty) { if (run == UINT32_MAX) run = p; }
@@ -3480,10 +3574,129 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
                                  const uint8_t* inline_idx, uint32_t inline_words, uint32_t edram_mode);
 // DIAG wrapper: while the imlog_now window is open, log EVERY draw packet that reaches the recorder
 // ([DRAWIN] prim, count, VS/PS address, mode) and whether it was recorded (rec=0 -> dropped/CPU path).
+// ── Walk-time tile skipping (LSWTCS_TILESKIP, Switch; default on unless LSWTCS_GLUNTILE=0) ──────────────────
+// Predicated tiling makes the ring run the same IB once per EDRAM tile (Eden hub 2026-10-09, [TILEIB]: one 41,883-dword
+// IB, 222 draws + 3 resolves, three times with bin select 0x80000003 / 0x0C / 0x30; between the runs a small IB sets
+// the window offset 0x2080, window scissor 0x2081/0x2082 and resolve destination 0x2319). The Switch replay draws
+// only tile 0 of such a group (gl_backend.cpp plan_untile), so recording the later tiles' draws (shader lookup,
+// constant copies, vertex hashing: ~2/3 of the GPU-command thread's record time) was wasted work. A later run of
+// an IB already walked this frame under another bin select is recognised when every register the IB does not set
+// before its first draw equals tile 0's entry value, the four per-tile registers apart; its draws are then recorded
+// as copies of tile 0's records (tile_repeat) with this tile's viewport and scissor, which is all plan_untile reads
+// from them (content keys come out equal because the copies point at the same arena data). Resolves are recorded as
+// before. Register writes, resolves and the rest of the walk are unchanged.
+static uint64_t g_bin_mask = 0xFFFFFFFFull, g_bin_select = 0xFFFFFFFFull;   // bin predication state (pm4_bin_packet)
+#ifdef __SWITCH__
+struct TileIbRec {
+    std::vector<uint32_t> entry;       // register file at tile 0's IB entry, then VS / PS address and size
+    std::vector<uint8_t> set_before;   // 1: changed between that entry and the IB's first draw (the IB sets it)
+    std::vector<uint32_t> draws;       // per draw packet of tile 0: its record index, or UINT32_MAX if not recorded
+    uint64_t bin_select = 0;
+    bool first_draw_seen = false;
+};
+enum : uint32_t { kTskipRegs = 0x6000 + 4 };
+static std::unordered_map<uint64_t, TileIbRec> g_tskip_ibs;
+static uint32_t g_tskip_frame = ~0u;
+static TileIbRec* g_tskip_capture = nullptr;   // walking a first run: draws recorded normally and noted
+static TileIbRec* g_tskip_repeat = nullptr;    // walking a repeat: draws become copies of tile 0's
+static uint32_t g_tskip_q = 0;                 // draw packets of the current repeat so far
+static uint64_t g_tskip_ibs_repeated = 0, g_tskip_ibs_rejected = 0, g_tskip_copies = 0, g_tskip_mismatch = 0;
+static bool tskip_on() {
+    static const bool on = [] {
+        const char* a = getenv("LSWTCS_TILESKIP"); const char* b = getenv("LSWTCS_GLUNTILE");
+        return !(a && a[0] == '0') && !(b && b[0] == '0');
+    }();
+    return on;
+}
+static inline uint32_t tskip_state(uint32_t i) {
+    if (i < 0x6000) return g_xe_regs[i];
+    switch (i - 0x6000) { case 0: return g_vs_addr; case 1: return g_vs_size; case 2: return g_ps_addr; default: return g_ps_size; }
+}
+static inline bool tskip_per_tile(uint32_t i) { return (i >= 0x2080 && i <= 0x2082) || i == 0x2319; }
+// Ring-level IB about to be walked.
+static void tile_skip_begin(uint32_t addr, uint32_t len) {
+    g_tskip_capture = g_tskip_repeat = nullptr;
+    if (!tskip_on() || len < 64) return;
+    if (g_tskip_frame != g_shm_frame) { g_tskip_ibs.clear(); g_tskip_frame = g_shm_frame; }
+    const uint64_t key = (uint64_t(addr) << 32) | len;
+    auto it = g_tskip_ibs.find(key);
+    if (it == g_tskip_ibs.end()) {
+        TileIbRec& r = g_tskip_ibs[key];
+        r.entry.resize(kTskipRegs);
+        for (uint32_t i = 0; i < kTskipRegs; ++i) r.entry[i] = tskip_state(i);
+        r.bin_select = g_bin_select;
+        g_tskip_capture = &r;
+        return;
+    }
+    TileIbRec& r = it->second;
+    if (!r.first_draw_seen || r.bin_select == g_bin_select) return;   // no draws to reuse / not another tile
+    for (uint32_t i = 0; i < kTskipRegs; ++i) {
+        if (r.set_before[i] || tskip_per_tile(i) || tskip_state(i) == r.entry[i]) continue;
+        ++g_tskip_ibs_rejected;
+        static int nl = 0; if (++nl <= 20)
+            dbg_ram("[TILESKIP] IB %08X/%u not skipped: register 0x%04X %08X at entry, tile 0 had %08X\n", addr, len, i, tskip_state(i), r.entry[i]);
+        return;
+    }
+    g_tskip_repeat = &r;
+    g_tskip_q = 0;
+    ++g_tskip_ibs_repeated;
+}
+static void tile_skip_end(uint32_t addr, uint32_t len) {
+    if (g_tskip_repeat && g_tskip_q != g_tskip_repeat->draws.size()) {
+        ++g_tskip_mismatch;
+        static int nl = 0; if (++nl <= 20)
+            dbg_ram("[TILESKIP] IB %08X/%u: repeat had %u draw packets, tile 0 had %zu (the replay cannot untile this group)\n",
+                    addr, len, g_tskip_q, g_tskip_repeat->draws.size());
+    }
+    g_tskip_capture = g_tskip_repeat = nullptr;
+    static uint64_t n = 0; if ((++n % 20000) == 0)
+        dbg_ram("[TILESKIP] IBs repeated %llu, rejected %llu; draws copied %llu; count mismatches %llu\n", (unsigned long long)g_tskip_ibs_repeated,
+                (unsigned long long)g_tskip_ibs_rejected, (unsigned long long)g_tskip_copies, (unsigned long long)g_tskip_mismatch);
+}
+// A draw packet of a first run: note the record it produced (and, at the first one, what the IB set itself).
+static void tile_skip_note(bool rec, size_t before) {
+    TileIbRec& r = *g_tskip_capture;
+    if (!r.first_draw_seen) {
+        r.set_before.resize(kTskipRegs);
+        for (uint32_t i = 0; i < kTskipRegs; ++i) r.set_before[i] = tskip_state(i) != r.entry[i];
+        r.first_draw_seen = true;
+    }
+    r.draws.push_back(rec && g_gpu_frame_build.draws.size() > before ? uint32_t(g_gpu_frame_build.draws.size() - 1) : UINT32_MAX);
+}
+// A draw packet of a repeat: copy tile 0's record with this tile's viewport and scissor. Returns whether recorded.
+static bool tile_skip_copy(uint32_t initiator) {
+    TileIbRec& r = *g_tskip_repeat;
+    if (g_tskip_q >= r.draws.size()) { ++g_tskip_q; return false; }   // counted as a mismatch at the end
+    const uint32_t idx = r.draws[g_tskip_q++];
+    if (idx == UINT32_MAX) return false;   // tile 0 did not record this draw either
+    LswGpuDrawRec c = g_gpu_frame_build.draws[idx];
+    g_xe_regs[0x21FC] = initiator;          // as gpu_record_draw_impl, for the viewport calculation
+    lsw_gpu_viewport_scissor(g_xe_regs, c.ps_writes_depth, c.viewport, c.scissor);
+    c.tile_repeat = idx + 1;
+    g_gpu_frame_build.draws.push_back(c);
+    ++g_tskip_copies;
+    return true;
+}
+#else
+static inline void tile_skip_begin(uint32_t, uint32_t) {}
+static inline void tile_skip_end(uint32_t, uint32_t) {}
+#endif
+
 static bool gpu_record_draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size,
                             const uint8_t* inline_idx, uint32_t inline_words, uint32_t edram_mode = 4) {
     uint64_t gp0 = gp_now();
+#ifdef __SWITCH__
+    bool rec;
+    if (g_tskip_repeat) {
+        rec = tile_skip_copy(initiator);
+    } else {
+        const size_t before = g_gpu_frame_build.draws.size();
+        rec = gpu_record_draw_impl(initiator, dma_base, dma_size, inline_idx, inline_words, edram_mode);
+        if (g_tskip_capture) tile_skip_note(rec, before);
+    }
+#else
     bool rec = gpu_record_draw_impl(initiator, dma_base, dma_size, inline_idx, inline_words, edram_mode);
+#endif
     g_gpuprof[GP_RECORD] += gp_now() - gp0; g_gpuprof[GP_DRAWS] += rec;
     // Window: from a D3D clear (rect list, depth mode) to the next quad list. Printed only when that quad
     // list has 40 vertices (the title's "Press START" text); armed by file "pktwin_now".
@@ -3546,6 +3759,43 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     if (!prepared) {
         static int nfail = 0; if (++nfail <= 10) dbg_ram("[GPUDRAW] prepare failed VS=0x%08X/%u PS=0x%08X/%u\n", g_vs_addr, g_vs_size, g_ps_addr, g_ps_size);
         return false;
+    }
+    // DIAG (LSWTCS_CAMFIND=<swap #>): where the game keeps its camera. At that swap the first world draw's view
+    // matrix rows (vertex constants c4-c6, translation in w; Eden hub dump 2026-10-09) are searched in guest memory
+    // [0x80000000, 0xA0000000) as rows (3 consecutive floats) and as columns (16-byte stride), big-endian, to 1e-4.
+    // For the "show the goal" camera that swings to a random stud: the hits lead (Ghidra) to the camera code.
+    {
+        static const uint64_t at = [] { const char* e = getenv("LSWTCS_CAMFIND"); return e ? strtoull(e, nullptr, 10) : 0ull; }();
+        static bool done = false;
+        if (at && !done && g_geom_swaps_pub >= at && edram_mode == 4 && d.vs_float_count >= 7) {
+            done = true;
+            const float* v = d.vs_float + 4 * 4;   // c4
+            dbg_ram("[CAMFIND] swap %llu view rows c4 %.5f %.5f %.5f %.4f | c5 %.5f %.5f %.5f %.4f | c6 %.5f %.5f %.5f %.4f\n",
+                    (unsigned long long)g_geom_swaps_pub, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+            auto rd = [](uint32_t va) { uint32_t b = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(g_base + va)); float x; memcpy(&x, &b, 4); return x; };
+            auto near = [](float a, float b) { return std::fabs(a - b) <= 1e-4f * std::max(1.0f, std::fabs(b)); };
+            uint32_t hits = 0, low = 0;
+            for (uint32_t va = 0x80000000u; va < 0xA0000000u - 64; va += 4) {
+                const float x = rd(va);
+                for (int row = 0; row < 3; ++row) {
+                    const float* rr = v + row * 4;
+                    if (!near(x, rr[0]) || std::fabs(rr[0]) < 1e-3f) continue;
+                    const bool as_row = near(rd(va + 4), rr[1]) && near(rd(va + 8), rr[2]);
+                    const bool as_col = row == 0 && near(rd(va + 16), v[4]) && near(rd(va + 32), v[8]);
+                    if (!as_row && !as_col) continue;
+                    if (va < 0x82000000u) { ++low; continue; }   // GPU constant uploads in low physical memory
+                    if (++hits <= 60) {
+                        dbg_ram("[CAMFIND] hit %u at 0x%08X: %s of c%d\n", hits, va, as_row ? "row" : "column 0", 4 + row);
+                        if (hits <= 16) {
+                            const uint32_t b0 = (va - 32) & ~15u;
+                            for (uint32_t q = 0; q < 96; q += 16)
+                                dbg_ram("[CAMFIND]     %08X: %10.4f %10.4f %10.4f %10.4f\n", b0 + q, rd(b0 + q), rd(b0 + q + 4), rd(b0 + q + 8), rd(b0 + q + 12));
+                        }
+                    }
+                }
+            }
+            dbg_ram("[CAMFIND] %u hits from 0x82000000 up, %u below (GPU uploads, not listed)\n", hits, low);
+        }
     }
     LswGpuFrame& f = g_gpu_frame_build;
     LswGpuDrawRec r{};
@@ -3644,7 +3894,23 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
         const uint8_t* srcp = (src == 0) ? (g_base + 0x80000000u + ((dma_base & 0x1FFFFFFFu) & ~(idx32 ? 3u : 1u))) : inline_idx;
         if (src == 1 && bytes > inline_words * 4) bytes = inline_words * 4;
         uint32_t esz = idx32 ? 4u : 2u, n = bytes / esz;
-        if (fan) {
+        // Switch (LSWTCS_IBSHM, default on there, off on PC whose replay reads indices from the arena):
+        // guest index buffers go through shared-memory residency like vertex data, so unchanged index
+        // pages are not copied every frame. Indices were ~1 MB of the ~2 MB hub arena, and every byte
+        // written into GPU-visible memory is slow in Eden (2026-10-07, [GLARENA]/[GLUPLOAD]).
+#ifdef __SWITCH__
+        static int ibshm = -1; if (ibshm < 0) { const char* e = getenv("LSWTCS_IBSHM"); ibshm = (e && e[0] == '0') ? 0 : 1; }
+#else
+        static int ibshm = 0;
+#endif
+        const uint32_t ib_phys = (dma_base & 0x1FFFFFFFu) & ~(esz - 1);
+        if (ibshm && src == 0 && !fan && bytes && bytes <= 0x1000000u && ib_phys + bytes <= 0x20000000u) {
+            const uint64_t t_ib = gp_now();
+            gpu_shm_track(f, ib_phys, bytes);
+            g_gpuprof[GP_VCOPY] += gp_now() - t_ib;
+            r.range_count = uint32_t(f.ranges.size()) - r.first_range;
+            r.ib_off = ib_phys; r.ib_shm = 1; r.ib_count = n;
+        } else if (fan) {
             // Rewrite as a list, copying RAW guest elements (the VS applies the endian swap).
             uint32_t tris = n >= 3 ? n - 2 : 0;
             r.ib_off = f.alloc(tris ? tris * 3 * esz : 4, 16);
@@ -3676,6 +3942,7 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     { static const uint32_t ci[4] = {0x2001, 0x2003, 0x2004, 0x2005}, bc[4] = {0x2201, 0x2209, 0x220A, 0x220B};
       for (int i = 0; i < 4; ++i) { r.color_info_mrt[i] = g_xe_regs[ci[i]]; r.blend_mrt[i] = g_xe_regs[bc[i]]; }
       r.ps_rt_mask = d.ps_dxbc ? d.ps_color_targets : 0; }
+    r.ps_writes_depth = d.ps_writes_depth;
     r.stencil_ref = g_xe_regs[0x210D]; r.stencil_ref_bf = g_xe_regs[0x210C];
     r.depthcontrol = g_xe_regs[0x2200]; r.sc_mode_cntl = g_xe_regs[0x2205];
     memcpy(r.viewport, d.viewport, sizeof(r.viewport)); memcpy(r.scissor, d.scissor, sizeof(r.scissor));
@@ -3791,7 +4058,7 @@ static uint64_t g_chain_depthcap = 0, g_chain_nested = 0;
 // D3D's predicated tiling sets BIN_MASK/SELECT per tile, so per-tile packets (draws, resolves, and the
 // tile-replay callback it records into the deferred stream) execute only for their tile.
 // LSWTCS_PREDICATE=0 executes every packet (old behaviour).
-static uint64_t g_bin_mask = 0xFFFFFFFFull, g_bin_select = 0xFFFFFFFFull;
+// (g_bin_mask / g_bin_select are defined above, before the walk-time tile skipping that reads them.)
 // Returns true if the packet must be skipped. `rd(i)` reads body dword i (1-based).
 template <typename RD> static bool pm4_bin_packet(uint32_t hdr, uint32_t op, uint32_t body, RD rd) {
     switch (op) {
@@ -3833,16 +4100,25 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
     if (ibmask) phys_addr &= 0x1FFFFFFFu;
     uint32_t guest_base = phys_addr + 0x80000000u;
     if (guest_base < 0x80000000u || guest_base >= 0xA0000000u) { reject(2); return; }
+    // One host pointer per IB instead of a fold + host translation per dword (the walk re-reads the same
+    // IBs ~75 times a frame for predicated tiling; per-dword ppc_fold/lsw_host/ib_read were ~25% of the
+    // GPU-command thread's walker samples, 2026-10-08). [0x80000000, 0xA0000000) folds to itself, so an
+    // IB that ends below 0xA0000000 is one contiguous host block; one that wraps past it uses ib_read.
+    const uint32_t* ib_host = (uint64_t(guest_base) + uint64_t(dword_count) * 4u <= 0xA0000000ull)
+                              ? reinterpret_cast<const uint32_t*>(lsw_host(guest_base)) : nullptr;
+    auto ib_rd = [&](uint32_t off) -> uint32_t {
+        return ib_host ? __builtin_bswap32(ib_host[off]) : ib_read(guest_base, off);
+    };
     uint32_t pos = 0;
     while (pos < dword_count) {
-        uint32_t hdr  = ib_read(guest_base, pos);
+        uint32_t hdr  = ib_rd(pos);
         uint32_t type = hdr >> 30;
         if (g_pktwin > 0 && type != 2) {
             --g_pktwin;
             char b[256];
             snprintf(b, sizeof b, "[PKTWIN] ib=0x%08X pos=%u/%u depth=%d hdr=%08X type=%u op=0x%02X(%s) body=%u d1=%08X d2=%08X\n", guest_base, pos, dword_count, depth, hdr, type,
                      type == 3 ? (hdr >> 8) & 0x7F : 0, type == 3 ? pm4_op_name((hdr >> 8) & 0x7F) : "-", ((hdr >> 16) & 0x3FFF) + 1,
-                     pos + 1 < dword_count ? ib_read(guest_base, pos + 1) : 0, pos + 2 < dword_count ? ib_read(guest_base, pos + 2) : 0);
+                     pos + 1 < dword_count ? ib_rd(pos + 1) : 0, pos + 2 < dword_count ? ib_rd(pos + 2) : 0);
             g_pktwin_buf += b;
         }
         if (type == 2) { pos++; continue; }
@@ -3850,18 +4126,18 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
             uint32_t reg = hdr & 0x7FFF;
             if (g_pm4_trace_on) pm4_trace(depth, "T0 SET_REG base=0x%04X x%u  [first=%08X]",
-                                          reg, cnt, cnt ? ib_read(guest_base, pos + 1) : 0);
+                                          reg, cnt, cnt ? ib_rd(pos + 1) : 0);
             // Bit 15 = write_one_reg: every value goes to the SAME register (Xenia
             // WriteOneRegisterFromRing). It was ignored, smearing such writes across `cnt` regs.
             bool one_reg = (hdr >> 15) & 1u;
             for (uint32_t i = 0; i < cnt && pos + 1 + i < dword_count; i++) {
                 uint32_t r = one_reg ? reg : reg + i;
-                if (r < 0x6000) { uint32_t v = ib_read(guest_base, pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); }
+                if (r < 0x6000) { uint32_t v = ib_rd(pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); }
             }
             if (reg < 0x4800 && reg + cnt > 0x4000 && LSW_ENV_SET("LSWTCS_XVS")) {
                 static int m = 0;
                 if (++m <= 12) dbg_ram("[T0-ALU] hdr=%08X oneReg=%u reg=0x%04X cnt=%u first=%08X %08X %08X %08X\n", hdr, (hdr >> 15) & 1u, reg, cnt,
-                                       ib_read(guest_base, pos + 1), ib_read(guest_base, pos + 2), ib_read(guest_base, pos + 3), ib_read(guest_base, pos + 4));
+                                       ib_rd(pos + 1), ib_rd(pos + 2), ib_rd(pos + 3), ib_rd(pos + 4));
             }
             pos += 1 + cnt; continue;
         }
@@ -3870,8 +4146,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             uint32_t op    = (hdr >> 8) & 0x7F;
             uint32_t total = 1 + body;
             if (pos + total > dword_count) break;
-            if (pm4_bin_packet(hdr, op, body, [&](uint32_t i) { return ib_read(guest_base, pos + i); })) { pos += total; continue; }
-            if (op == 0x64 && body >= 1 && ib_read(guest_base, pos + 1) == 0x53574150u) geom_swap_packet(ib_read(guest_base, pos + 2));
+            if (pm4_bin_packet(hdr, op, body, [&](uint32_t i) { return ib_rd(pos + i); })) { pos += total; continue; }
+            if (op == 0x64 && body >= 1 && ib_rd(pos + 1) == 0x53574150u) geom_swap_packet(ib_rd(pos + 2));
             if (op == 0x54 && body >= 1) {   // INTERRUPT inside a draw IB
                 // LSWTCS_IBINT: 0 = never fire (default), 1 = fire all (hangs the title load),
                 // 2 = fire only D3D's predicated-tiling replay callback 0x822D2BA0 (EndTiling hands the
@@ -3891,8 +4167,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                         if (++nt <= 10 || (nt % 500) == 0) dbg_ram("[IBINT] tiling replay #%llu arg=0x%08X\n", (unsigned long long)nt, PPC_LOAD_U32(sa + 20));
                     }
                 }
-                if (n <= 5 || (n % 1000) == 0) dbg_ram("[IBINT] #%llu mask=0x%02X mode=%d fired=%d\n", (unsigned long long)n, ib_read(guest_base, pos + 1), on, (int)fire);
-                if (fire) pm4_fire_interrupt(ib_read(guest_base, pos + 1));
+                if (n <= 5 || (n % 1000) == 0) dbg_ram("[IBINT] #%llu mask=0x%02X mode=%d fired=%d\n", (unsigned long long)n, ib_rd(pos + 1), on, (int)fire);
+                if (fire) pm4_fire_interrupt(ib_rd(pos + 1));
             }
             if (g_pm4_trace_on) pm4_trace(depth, "T3 %-20s op=0x%02X x%u", pm4_op_name(op), op, body);
             // OPHIST (env LSWTCS_OPHIST, removable): histogram of type-3 opcodes reaching the
@@ -3903,7 +4179,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 if (on) {
                     static uint64_t cnt[128], sc_type[8], total = 0;
                     cnt[op & 0x7F]++;
-                    if (op == 0x2D && body >= 1) sc_type[(ib_read(guest_base, pos + 1) >> 16) & 7]++;
+                    if (op == 0x2D && body >= 1) sc_type[(ib_rd(pos + 1) >> 16) & 7]++;
                     if ((++total % 400000) == 0) {
                         char b[1024]; int k = snprintf(b, sizeof b, "[OPHIST] after %llu pkts:", (unsigned long long)total);
                         for (int o = 0; o < 128 && k < 900; ++o) if (cnt[o]) k += snprintf(b + k, sizeof b - k, " %s(0x%02X)=%llu", pm4_op_name((uint32_t)o), o, (unsigned long long)cnt[o]);
@@ -3917,23 +4193,23 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             // them in order with the stream; LSWTCS_IBFENCE=0 skips them (old behaviour).
             { static int ibf = -1; if (ibf < 0) { const char* e = getenv("LSWTCS_IBFENCE"); ibf = (e && e[0] == '0') ? 0 : 1; }
               if (ibf && op == 0x58 && body >= 3) {                       // EVENT_WRITE_SHD
-                  uint32_t init = ib_read(guest_base, pos + 1), a = ib_read(guest_base, pos + 2), v = ib_read(guest_base, pos + 3);
+                  uint32_t init = ib_rd(pos + 1), a = ib_rd(pos + 2), v = ib_rd(pos + 3);
                   g_xe_regs[0x21F9] = init & 0x3F;                            // VGT_EVENT_INITIATOR
                   if ((init >> 31) & 1) { static uint32_t ctr = 0; v = ++ctr; }
                   pm4_gpu_write(a, v);
                   static int nl = 0; if (++nl <= 16) dbg_ram("[IBFENCE] EVENT_WRITE_SHD init=0x%08X addr=0x%08X value=0x%08X\n", init, a, v);
               } else if (ibf && op == 0x3D && body >= 2) {                 // MEM_WRITE
-                  uint32_t a = ib_read(guest_base, pos + 1);
-                  for (uint32_t i = 0; i + 1 < body; ++i) pm4_gpu_write(a + i * 4, ib_read(guest_base, pos + 2 + i));
-                  static int nl = 0; if (++nl <= 16) dbg_ram("[IBFENCE] MEM_WRITE addr=0x%08X n=%u first=0x%08X\n", a, body - 1, ib_read(guest_base, pos + 2));
+                  uint32_t a = ib_rd(pos + 1);
+                  for (uint32_t i = 0; i + 1 < body; ++i) pm4_gpu_write(a + i * 4, ib_rd(pos + 2 + i));
+                  static int nl = 0; if (++nl <= 16) dbg_ram("[IBFENCE] MEM_WRITE addr=0x%08X n=%u first=0x%08X\n", a, body - 1, ib_rd(pos + 2));
               } else if (op == 0x3C && body >= 5) {                        // WAIT_REG_MEM (Xenia semantics)
                   // Waits until (reg or memory & mask) <cmp> ref. The CP stalls here on hardware; we hand
                   // the turn to the CPU side (e.g. the tile worker that writes the acknowledgement) and
                   // re-check, bounded so a never-satisfied wait cannot deadlock. Default OFF since 2026-10-05 (froze the game after the hub); LSWTCS_WAITREG=1 enables.
                   static int wr = -1; if (wr < 0) { const char* e = getenv("LSWTCS_WAITREG"); wr = (e && e[0] == '1') ? 1 : 0; }
                   if (wr) {
-                      uint32_t wi = ib_read(guest_base, pos + 1), addr = ib_read(guest_base, pos + 2), ref = ib_read(guest_base, pos + 3),
-                               mask = ib_read(guest_base, pos + 4);
+                      uint32_t wi = ib_rd(pos + 1), addr = ib_rd(pos + 2), ref = ib_rd(pos + 3),
+                               mask = ib_rd(pos + 4);
                       bool is_mem = (wi & 0x10) != 0;
                       auto value = [&]() -> uint32_t {
                           if (is_mem) {
@@ -3970,8 +4246,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                   // reports here. Xenia fakes 'whole screen' (draw lands in every tile): min x/y 0,
                   // max x/y 8192>>3, z 0..1, as big-endian u16 (LSWTCS_EXTENT=0 skips).
                   static int ext = -1; if (ext < 0) { const char* e = getenv("LSWTCS_EXTENT"); ext = (e && e[0] == '0') ? 0 : 1; }
-                  g_xe_regs[0x21F9] = ib_read(guest_base, pos + 1) & 0x3F;
-                  uint32_t a = ib_read(guest_base, pos + 2) & ~3u;
+                  g_xe_regs[0x21F9] = ib_rd(pos + 1) & 0x3F;
+                  uint32_t a = ib_rd(pos + 2) & ~3u;
                   if (ext && a < 0x20000000u) {
                       const uint16_t v[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
                       uint8_t* d = g_base + 0x80000000ull + a;
@@ -3979,17 +4255,17 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                   }
                   static uint64_t nl = 0; if (++nl <= 4 || (nl % 100000) == 0) dbg_ram("[EXTENT] #%llu addr=0x%08X\n", (unsigned long long)nl, a);
               } else if (op == 0x46 && body >= 1) {
-                  static int nl = 0; if (++nl <= 16) dbg_ram("[IBFENCE] EVENT_WRITE init=0x%08X body=%u w1=0x%08X w2=0x%08X\n", ib_read(guest_base, pos + 1), body,
-                                                             body >= 2 ? ib_read(guest_base, pos + 2) : 0, body >= 3 ? ib_read(guest_base, pos + 3) : 0);
+                  static int nl = 0; if (++nl <= 16) dbg_ram("[IBFENCE] EVENT_WRITE init=0x%08X body=%u w1=0x%08X w2=0x%08X\n", ib_rd(pos + 1), body,
+                                                             body >= 2 ? ib_rd(pos + 2) : 0, body >= 3 ? ib_rd(pos + 3) : 0);
               } }
             if (op == 0x2D && body >= 1) {                 // SET_CONSTANT
-                uint32_t d1    = ib_read(guest_base, pos + 1);
+                uint32_t d1    = ib_rd(pos + 1);
                 uint32_t ctype = (d1 >> 16) & 0xFF;
                 uint32_t coff  = d1 & 0x7FF;
                 uint32_t base  = (ctype==0)?0x4000 : (ctype==1)?0x4800 :
                                  (ctype==2)?0x4900 : (ctype==3)?0x4908 : (ctype==4)?0x2000 : 0;
                 if (base) for (uint32_t i = 0; i < body - 1 && pos + 2 + i < dword_count; i++)
-                    if (base + coff + i < 0x6000) { uint32_t v = ib_read(guest_base, pos + 2 + i); g_xe_regs[base + coff + i] = v; regset_note(base + coff + i, v); }
+                    if (base + coff + i < 0x6000) { uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[base + coff + i] = v; regset_note(base + coff + i, v); }
             } else if (op == 0x2F && body >= 3) {          // LOAD_ALU_CONSTANT (from memory)
                 // Matches Xenia ExecutePacketType3_LOAD_ALU_CONSTANT. This is how the game
                 // uploads its matrices/fetch constants (15k packets per run, OPHIST); it was
@@ -3997,9 +4273,9 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // LSWTCS_LOADALU=0 restores the old behaviour.
                 static int on = -1; if (on < 0) { const char* e = getenv("LSWTCS_LOADALU"); on = (e && e[0] == '0') ? 0 : 1; }
                 if (on) {
-                    uint32_t addr  = ib_read(guest_base, pos + 1) & 0x3FFFFFFFu;
-                    uint32_t ot    = ib_read(guest_base, pos + 2);
-                    uint32_t size  = ib_read(guest_base, pos + 3) & 0xFFFu;
+                    uint32_t addr  = ib_rd(pos + 1) & 0x3FFFFFFFu;
+                    uint32_t ot    = ib_rd(pos + 2);
+                    uint32_t size  = ib_rd(pos + 3) & 0xFFFu;
                     uint32_t index = ot & 0x7FFu, ctype = (ot >> 16) & 0xFFu;
                     uint32_t rbase = (ctype == 0) ? 0x4000u : (ctype == 1) ? 0x4800u : (ctype == 2) ? 0x4900u :
                                      (ctype == 3) ? 0x4908u : (ctype == 4) ? 0x2000u : 0u;
@@ -4025,15 +4301,15 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                                 (src >= 0x80000000u && src < 0xA0000000u && size) ? ib_read(src, 0) : 0);
                 }
             } else if ((op == 0x55 || op == 0x56) && body >= 2) {   // SET_CONSTANT2 / SET_SHADER_CONSTANTS
-                uint32_t index = ib_read(guest_base, pos + 1) & 0xFFFFu;   // absolute register index
+                uint32_t index = ib_rd(pos + 1) & 0xFFFFu;   // absolute register index
                 for (uint32_t i = 0; i + 1 < body && pos + 2 + i < dword_count; ++i) {
                     uint32_t r = index + i; if (r >= 0x6000) break;
-                    uint32_t v = ib_read(guest_base, pos + 2 + i); g_xe_regs[r] = v; regset_note(r, v);
+                    uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[r] = v; regset_note(r, v);
                 }
             } else if (op == 0x27 && body >= 2) {          // IM_LOAD (microcode by addr)
                 g_imload27++;
-                uint32_t d1 = ib_read(guest_base, pos + 1);
-                uint32_t d2 = ib_read(guest_base, pos + 2);
+                uint32_t d1 = ib_rd(pos + 1);
+                uint32_t d2 = ib_rd(pos + 2);
                 uint32_t stype = d1 & 0x3;                  // 0=VS, 1=PS
                 uint32_t gaddr = (d1 & ~0xFu) + 0x80000000u;
                 uint32_t ssize = d2 & 0xFFFF;
@@ -4063,8 +4339,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // opcode, so this never fired and looked like "no shaders loaded"). Packet:
                 // d0=shader_type(0=VS,1=PS), d1=start<<16|size_dwords, then inline microcode.
                 g_imload28++;
-                uint32_t d1 = ib_read(guest_base, pos + 1);  // shader_type | start
-                uint32_t d2 = ib_read(guest_base, pos + 2);  // start<<16 | size_dwords
+                uint32_t d1 = ib_rd(pos + 1);  // shader_type | start
+                uint32_t d2 = ib_rd(pos + 2);  // start<<16 | size_dwords
                 uint32_t stype = d1 & 0x3;
                 uint32_t gaddr = guest_base + (pos + 3) * 4;  // inline microcode location
                 uint32_t ssize = d2 & 0xFFFF;
@@ -4077,9 +4353,9 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // Register read-modify-write. Xenia semantics: reg = rmw_info & 0x1FFF;
                 // value = regfile[reg]; if(bit31) value &= regfile[and_mask&0x1FFF] else value &= and_mask;
                 // if(bit30) value |= regfile[or_mask&0x1FFF] else value |= or_mask; writeReg(reg,value).
-                uint32_t rmw_info = ib_read(guest_base, pos + 1);
-                uint32_t and_mask = ib_read(guest_base, pos + 2);
-                uint32_t or_mask  = ib_read(guest_base, pos + 3);
+                uint32_t rmw_info = ib_rd(pos + 1);
+                uint32_t and_mask = ib_rd(pos + 2);
+                uint32_t or_mask  = ib_rd(pos + 3);
                 uint32_t reg = rmw_info & 0x1FFF;
                 uint32_t v = g_xe_regs[reg];
                 v &= (rmw_info & 0x80000000u) ? g_xe_regs[and_mask & 0x1FFF] : and_mask;
@@ -4097,7 +4373,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 if (LSW_ENV_SET("LSWTCS_DRAWLOG")) {
                     static int s_drawlog = 0;
                     if (s_drawlog < 16) { s_drawlog++;
-                        uint32_t di = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                        uint32_t di = ib_rd(pos + (op == 0x22 ? 2 : 1));
                         dbg_ram("[DRAWLOG#%d] op=0x%02X depth=%d body=%u prim=%u num_indices=%u mode=%u "
                                 "VS=0x%08X/%u PS=0x%08X/%u IB=0x%08X@%u\n",
                                 s_drawlog, op, depth, body, di & 0x3F, (di >> 16) & 0xFFFF, mode,
@@ -4112,7 +4388,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 if (LSW_ENV_SET("LSWTCS_DRAWLOG2") && g_vs_size > 40 && mode == 4) {
                     static int s_d2 = 0;
                     if (s_d2 < 24) { s_d2++;
-                        uint32_t w[6]; for (int i = 0; i < 6; ++i) w[i] = (uint32_t)i < body ? ib_read(guest_base, pos + 1 + i) : 0;
+                        uint32_t w[6]; for (int i = 0; i < 6; ++i) w[i] = (uint32_t)i < body ? ib_rd(pos + 1 + i) : 0;
                         dbg_ram("[DRAWLOG2#%d] op=0x%02X body=%u mode=%u VS=0x%08X/%u PS=0x%08X/%u pkt=%08X %08X %08X %08X %08X %08X vfc0=%08X %08X vfc1=%08X %08X\n",
                                 s_d2, op, body, mode, g_vs_addr, g_vs_size, g_ps_addr, g_ps_size,
                                 w[0], w[1], w[2], w[3], w[4], w[5],
@@ -4131,23 +4407,23 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     }
                 }
                 if (g_pm4_trace_on) {
-                    uint32_t di = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                    uint32_t di = ib_rd(pos + (op == 0x22 ? 2 : 1));
                     pm4_trace(depth, "   DRAW %s prim=%u num_indices=%u mode=%u VS=0x%08X/%u PS=0x%08X/%u",
                               pm4_op_name(op), di & 0x3F, (di >> 16) & 0xFFFF, mode,
                               g_vs_addr, g_vs_size, g_ps_addr, g_ps_size);
                 }
                 if (mode == 5 && g_vs_addr && gpurt_on()) {  // kDepth: depth-only pass (GPU path only)
-                    uint32_t init5 = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                    uint32_t init5 = ib_rd(pos + (op == 0x22 ? 2 : 1));
                     uint32_t src5 = (init5 >> 6) & 3;
                     if (op == 0x22 && body >= 4)
-                        gpu_record_draw(ib_read(guest_base, pos + 2), ib_read(guest_base, pos + 3), ib_read(guest_base, pos + 4), nullptr, 0, 5);
+                        gpu_record_draw(ib_rd(pos + 2), ib_rd(pos + 3), ib_rd(pos + 4), nullptr, 0, 5);
                     else if (src5 == 2)
                         gpu_record_draw(init5, 0, 0, nullptr, 0, 5);
                     else if (op == 0x36 && src5 == 1 && body >= 2)
                         gpu_record_draw(init5, 0, 0, reinterpret_cast<const uint8_t*>(lsw_host(guest_base + (pos + 2) * 4)), body - 1, 5);
                 }
                 if (mode == 4 && g_vs_addr) {               // kColorDepth geometry → collect
-                    uint32_t init = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                    uint32_t init = ib_rd(pos + (op == 0x22 ? 2 : 1));
                     uint32_t nidx = (init >> 16) & 0xFFFF;
                     uint32_t vb = (g_xe_regs[0x4800] & ~0x3u) + 0x80000000u;
                     // DIAG: log each DISTINCT (VS first-dword,size) menu shader once, with its PS
@@ -4179,11 +4455,11 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     // old behaviour (only DMA-indexed DRAW_INDX; the rest went to the UI-only path,
                     // which assumes a pass-through VS -- backgrounds/starfields vanished there).
                     static int alld = -1; if (alld < 0) { const char* e = getenv("LSWTCS_XVS_ALLDRAWS"); alld = (e && e[0] == '0') ? 0 : 1; }
-                    uint32_t init0 = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                    uint32_t init0 = ib_rd(pos + (op == 0x22 ? 2 : 1));
                     uint32_t srcsel = (init0 >> 6) & 3;   // 0 = DMA indices, 1 = immediate, 2 = auto
                     bool gpu_done = false;
                     if (op == 0x22 && body >= 4)
-                        gpu_done = gpu_record_draw(ib_read(guest_base, pos + 2), ib_read(guest_base, pos + 3), ib_read(guest_base, pos + 4), nullptr, 0);
+                        gpu_done = gpu_record_draw(ib_rd(pos + 2), ib_rd(pos + 3), ib_rd(pos + 4), nullptr, 0);
                     else if (srcsel == 2)
                         gpu_done = gpu_record_draw(init0, 0, 0, nullptr, 0);
                     else if (op == 0x36 && srcsel == 1 && body >= 2)
@@ -4202,8 +4478,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     } else
                     if (g_xvs_on && op == 0x22 && body >= 4) {
                         // Real VS on the CPU for DMA-indexed draws (the menu geometry).
-                        xvs_draw(ib_read(guest_base, pos + 2), ib_read(guest_base, pos + 3),
-                                 ib_read(guest_base, pos + 4));
+                        xvs_draw(ib_rd(pos + 2), ib_rd(pos + 3),
+                                 ib_rd(pos + 4));
                     } else if (g_xvs_on && alld && srcsel == 2) {
                         xvs_draw(init0, 0, 0);                                    // auto-indexed
                     } else if (g_xvs_on && alld && op == 0x36 && srcsel == 1 && body >= 2) {
@@ -4233,7 +4509,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                     g_draws_captured++;
                     if (g_draws_captured == 1)
                         dbg_ram("[DRAWCAP] first geometry draw at ~%llu ms\n", _kstub_start_ms());
-                    uint32_t init = ib_read(guest_base, pos + (op == 0x22 ? 2 : 1));
+                    uint32_t init = ib_rd(pos + (op == 0x22 ? 2 : 1));
                     dbg_ram("[DRAWCAP#%d] op=0x%02X prim=%u num_indices=%u init=0x%08X imload27=%u imload28=%u\n",
                            g_draws_captured, op, init & 0x3F, (init >> 16) & 0xFFFF, init,
                            g_imload27, g_imload28);
@@ -4268,8 +4544,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
 
                 }
             } else if (op == 0x3F || op == 0x37) {         // nested IB
-                uint32_t na = ib_read(guest_base, pos + 1);
-                uint32_t nl = ib_read(guest_base, pos + 2) & 0xFFFFF;
+                uint32_t na = ib_rd(pos + 1);
+                uint32_t nl = ib_rd(pos + 2) & 0xFFFFF;
                 if (g_pm4_trace_on) pm4_trace(depth, "   -> nested IB addr=0x%08X len=%u dw", na, nl);
                 g_chain_nested++;
                 pm4_extract_ib(na, nl, depth + 1);
@@ -4283,7 +4559,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             static int t1 = -1; if (t1 < 0) { const char* e = getenv("LSWTCS_PM4T1"); t1 = (e && e[0] == '0') ? 0 : 1; }
             if (t1 && pos + 2 < dword_count) {
                 uint32_t r1 = hdr & 0x7FF, r2 = (hdr >> 11) & 0x7FF;
-                uint32_t d1 = ib_read(guest_base, pos + 1), d2 = ib_read(guest_base, pos + 2);
+                uint32_t d1 = ib_rd(pos + 1), d2 = ib_rd(pos + 2);
                 g_xe_regs[r1] = d1; regset_note(r1, d1); pm4_reg_side_effect(r1, d1);
                 g_xe_regs[r2] = d2; regset_note(r2, d2); pm4_reg_side_effect(r2, d2);
                 pos += 3; continue;
@@ -4563,6 +4839,48 @@ static void pm4_process_ring(uint32_t wptr_dwords) {
 static uint32_t s_rbflat_logged = 0;
 static bool     g_pm4_exec_ibs  = false;   // service draw-IB fences? off (it crashes the game)
 bool g_tile_drain_pending = false;
+
+// DIAG (LSWTCS_TILEIBLOG=<swap #>): the ring-level IBs of four sampled frames (that swap, +1, +600, +1200) as [TILEIB] lines: address/length, bin
+// select, window offset and scissor, draws recorded, and the registers that differ from the entry state of the
+// previous run of the same IB in that frame. Shows how predicated tiling reaches the walker (same IB once per tile?)
+// and what differs between the tiles, before skipping repeated tiles in the walk.
+struct TileIbSnap { std::vector<uint32_t> regs; uint32_t vs, ps; };
+static std::unordered_map<uint64_t, TileIbSnap> g_tile_ib_snaps;
+static uint64_t g_tile_ib_frame = ~0ull;
+static bool tile_ib_log_frame() {
+    static const uint64_t first = [] { const char* e = getenv("LSWTCS_TILEIBLOG"); return e ? strtoull(e, nullptr, 10) : 0ull; }();
+    if (!first) return false;
+    const uint64_t s = g_geom_swaps_pub;
+    return s == first || s == first + 1 || s == first + 600 || s == first + 1200;
+}
+static size_t tile_ib_log_begin(uint32_t addr, uint32_t len) {
+    const size_t d0 = g_gpu_frame_build.draws.size();
+    if (!tile_ib_log_frame()) return d0;
+    if (g_tile_ib_frame != g_geom_swaps_pub) { g_tile_ib_snaps.clear(); g_tile_ib_frame = g_geom_swaps_pub; }
+    TileIbSnap& s = g_tile_ib_snaps[(uint64_t(addr) << 32) | len];
+    char diff[400]; int k = 0; uint32_t nd = 0;
+    if (!s.regs.empty()) {
+        for (uint32_t r = 0; r < 0x6000; ++r)
+            if (s.regs[r] != g_xe_regs[r]) {
+                if (k < 340) k += snprintf(diff + k, sizeof diff - k, " %04X:%08X>%08X", r, s.regs[r], g_xe_regs[r]);
+                ++nd;
+            }
+        if (s.vs != g_vs_addr || s.ps != g_ps_addr) k += snprintf(diff + k, sizeof diff - k, " VS/PS %08X/%08X>%08X/%08X", s.vs, s.ps, g_vs_addr, g_ps_addr);
+    }
+    diff[k] = 0;
+    dbg_ram("[TILEIB] f=%llu ib=%08X/%u sel=%016llX mask=%016llX wo=%08X wsc=%08X..%08X draws@%zu %s%u regs differ:%s\n",
+            (unsigned long long)g_geom_swaps_pub, addr, len, (unsigned long long)g_bin_select, (unsigned long long)g_bin_mask,
+            g_xe_regs[0x2080], g_xe_regs[0x2081], g_xe_regs[0x2082], d0, s.regs.empty() ? "FIRST " : "", nd, diff);
+    s.regs.assign(g_xe_regs, g_xe_regs + 0x6000);
+    s.vs = g_vs_addr; s.ps = g_ps_addr;
+    return d0;
+}
+static void tile_ib_log_end(size_t d0) {
+    if (!tile_ib_log_frame()) return;
+    size_t nd = 0, nr = 0;
+    for (size_t i = d0; i < g_gpu_frame_build.draws.size(); ++i) (g_gpu_frame_build.draws[i].kind ? nr : nd)++;
+    dbg_ram("[TILEIB]   -> %zu draws, %zu resolves\n", nd, nr);
+}
 static bool g_pm4_walking = false;
 static uint32_t pm4_tile_backlog() {
     if (!g_gfx_interrupt_data) return 0;
@@ -4637,8 +4955,13 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
                 if (pm4_bin_packet(hdr, op, body, [&](uint32_t i) { return rb_read(pos + i); })) {}
                 else if (op == 0x64 && rb_read(pos + 1) == 0x53574150u) geom_swap_packet(rb_read(pos + 2));
                 else if ((op == 0x3F || op == 0x37) && body >= 2) {
-                    pm4_extract_ib(rb_read(pos + 1), rb_read(pos + 2) & 0xFFFFF, 0);
-                    if (g_pm4_exec_ibs) pm4_process_ib(rb_read(pos + 1), rb_read(pos + 2) & 0xFFFFF, 0);
+                    const uint32_t iba = rb_read(pos + 1), ibl = rb_read(pos + 2) & 0xFFFFF;
+                    const size_t tl_d0 = tile_ib_log_begin(iba, ibl);
+                    tile_skip_begin(iba, ibl);
+                    pm4_extract_ib(iba, ibl, 0);
+                    tile_skip_end(iba, ibl);
+                    if (g_pm4_exec_ibs) pm4_process_ib(iba, ibl, 0);
+                    tile_ib_log_end(tl_d0);
                     ibs++;
                 } else if (op == 0x54 && body >= 1) { pm4_fire_interrupt(rb_read(pos + 1)); ints++; }
                 else if ((op == 0x46 || op == 0x58) && body >= 3 && g_pm4_exec_ibs) {
@@ -4749,6 +5072,32 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
 // Then calls gpu_d3d12_present() to blit the frontbuffer to the D3D12 window.
 //
 static std::mutex g_vdswap_mutex;  // serialize concurrent VdSwap calls from worker threads
+
+// DIAG: the game's frame time [0x830AA97C] of the last 120 swaps with the real time between them, printed by
+// lsw_ft_ring_dump() (the Switch capture combo) as [FTRING]. For the mid-level "show the goal" camera that shows its
+// target and then swings off somewhere (Switch 2026-10-09): do long frames (the game caps its delta at 0.1 s,
+// 0x82000B78) come right before the swing?
+float g_ft_last_game = 0, g_ft_last_real = 0;   // the latest values, copied into the published frame (frames.log)
+static float g_ft_ring[120];
+static float g_ft_ring_real[120];
+static uint64_t g_ft_ring_n = 0;
+static void lsw_ft_ring_push(float ft) {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    g_ft_ring_real[g_ft_ring_n % 120] = std::chrono::duration<float>(now - last).count();
+    last = now;
+    g_ft_ring[g_ft_ring_n % 120] = ft;
+    g_ft_last_game = ft;
+    g_ft_last_real = g_ft_ring_real[g_ft_ring_n % 120];
+    ++g_ft_ring_n;
+}
+extern "C" void lsw_ft_ring_dump() {
+    const uint64_t n = g_ft_ring_n, k = n < 120 ? n : 120;
+    printf("[FTRING] last %llu swaps up to #%llu, game frame time ms / real ms (oldest first):", (unsigned long long)k, (unsigned long long)n);
+    for (uint64_t i = n - k; i < n; ++i) printf("%s%.0f/%.0f", (i - (n - k)) % 12 ? " " : "\n[FTRING]  ", g_ft_ring[i % 120] * 1000.0f, g_ft_ring_real[i % 120] * 1000.0f);
+    printf("\n");
+    fflush(stdout);
+}
 
 PPC_FUNC(__imp__VdSwap) {
     PPC_FUNC_PROLOGUE();
@@ -5046,6 +5395,36 @@ PPC_FUNC(__imp__VdSwap) {
           dbg_ram("[IOPROBE] read +%llu KB this window (total %llu KB)\n",
                   (unsigned long long)((now-_last)/1024), (unsigned long long)(now/1024));
           _last=now; } }
+    // DIAG (LSWTCS_SPIKEMS=N, default 0 = off): a guest frame (swap to swap) of N ms or more logs
+    // [GSPIKE]: time each scheduler id ran in it (needs LSWTCS_SCHEDPROF=1), the wait for the render
+    // thread, draw preparation (shader translation included), PM4 walk, and file bytes read. For lag
+    // spikes on game actions (lightsaber, breaking objects; 2026-10-08) the render side cannot see.
+    { static int spike_ms = -1;
+      if (spike_ms < 0) { const char* e = getenv("LSWTCS_SPIKEMS"); spike_ms = e ? atoi(e) : 0; }
+      if (spike_ms > 0) {
+          static uint64_t t_last = 0, gp_prev[GP_COUNT], sp_prev[LSW_SCHED_MAX + 1], io_prev = 0, ions_prev = 0, ion_prev = 0;
+          static LARGE_INTEGER qf{}; if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+          const uint64_t t = gp_now(), io = g_file_bytes_read.load(), io_ns = g_file_read_ns.load(), io_n = g_file_reads.load();
+          if (t_last && t - t_last >= uint64_t(spike_ms) * 1000000ull) {
+              auto ms = [](uint64_t ns) { return ns / 1e6; };
+              char b[1400];
+              int k = snprintf(b, sizeof b, "[GSPIKE] swap #%d t=%llums frame=%.1fms | rtwait=%.1f prepare=%.1f walk=%.1f io=%lluKB io_ms=%.1f reads=%llu | ran:",
+                               count, (unsigned long long)_kstub_start_ms(), ms(t - t_last), ms(g_gpuprof[GP_RTWAIT] - gp_prev[GP_RTWAIT]),
+                               ms(g_gpuprof[GP_PREPARE] - gp_prev[GP_PREPARE]), ms(g_gpuprof[GP_WALK] - gp_prev[GP_WALK]),
+                               (unsigned long long)((io - io_prev) / 1024), ms(io_ns - ions_prev),
+                               (unsigned long long)(io_n - ion_prev));
+              for (int i = 0; i <= LSW_SCHED_MAX && k < 1300; ++i) {
+                  const double d = 1e3 * double(g_sp_run[i] - sp_prev[i]) / double(qf.QuadPart);
+                  if (d < 1.0) continue;
+                  if (i == LSW_SCHED_MAX) k += snprintf(b + k, sizeof b - k, " idle=%.1f", d);
+                  else k += snprintf(b + k, sizeof b - k, " %d(%08X)=%.1f", i, g_sp_entry[i], d);
+              }
+              dbg_ram("%s\n", b);
+          }
+          t_last = t; io_prev = io; ions_prev = io_ns; ion_prev = io_n;
+          memcpy(gp_prev, g_gpuprof, sizeof gp_prev);
+          memcpy(sp_prev, g_sp_run, sizeof sp_prev);
+      } }
     auto _prof_t1 = std::chrono::high_resolution_clock::now();
 
     // ── Emulate the EDRAM→framebuffer resolve (clear-color stage) ──────────────
@@ -5157,6 +5536,7 @@ PPC_FUNC(__imp__VdSwap) {
         float ft, acc; memcpy(&ft, &ftb, 4); memcpy(&acc, &accb, 4);
         if (swaps == 0) acc0 = acc;
         ft_sum += ft; ++swaps;
+        lsw_ft_ring_push(ft);
         LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
         double real = double(qn.QuadPart - q0.QuadPart) / double(qf.QuadPart);
         if (real >= 5.0) {
@@ -5232,7 +5612,9 @@ PPC_FUNC(__imp__VdSwap) {
             // CP swap-done interrupt (source=1)
             PPCContext icb{};
             icb.r1.u32    = ctx.r1.u32 - 0x200;  // fresh stack frame below caller
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
             icb.r2.u32    = ctx.r2.u32;
+#endif
             icb.r13.u32   = ctx.r13.u32;          // real PCR so r13+268 CPU_ID reads work
             icb.r3.u32    = 1;                    // source: CP interrupt
             icb.r4.u32    = g_gfx_interrupt_data;
@@ -5608,7 +5990,12 @@ static void audio_worker_body(int idx, uint32_t sp, uint32_t pcr, uint32_t toc) 
         if (c.credits.load() > 0 && fn) {
             c.credits--;
             PPCContext t{};
-            t.r1.u32 = sp; t.r2.u32 = toc; t.r13.u32 = pcr; t.fpscr.csr = 0x1F80u;
+            t.r1.u32 = sp; t.r13.u32 = pcr; t.fpscr.csr = 0x1F80u;
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
+            t.r2.u32 = toc;
+#else
+            (void)toc;
+#endif
             t.r3.u32 = c.wrapped;
             fn(t, g_base);
             if ((++c.calls % 2000) == 1)
@@ -5671,7 +6058,11 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient) {
     if (outp >= 0x80000000u && outp < 0xA0000000u) PPC_STORE_U32(outp, 0x41550000u | (uint32_t)idx);
     dbg_ram("[XAUDIO] RegisterRenderDriverClient idx=%d callback=0x%08X arg=0x%08X handle=0x%08X lr=0x%08X\n",
             idx, callback, callback_arg, 0x41550000u | (uint32_t)idx, (uint32_t)ctx.lr);
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
     c.host_thread = std::thread(audio_worker_body, idx, sp, pcr, ctx.r2.u32);
+#else
+    c.host_thread = std::thread(audio_worker_body, idx, sp, pcr, 0u);
+#endif
     c.host_thread.detach();
     sched_add_slot(c.sched_id);   // join the rotation at THIS guest point (deterministic)
     ctx.r3.u32 = 0;

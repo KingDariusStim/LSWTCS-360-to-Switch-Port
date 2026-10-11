@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+extern "C" void lsw_ft_ring_dump();   // kernel_stubs.cpp: game frame times of the last 120 swaps ([FTRING])
 
 namespace {
 
@@ -446,7 +447,19 @@ BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft) {
     *ft = to_ft(secs * 10000000ull + st->wMilliseconds * 10000ull);
     return TRUE;
 }
-DWORD GetTimeZoneInformation(TIME_ZONE_INFORMATION* tz) { memset(tz, 0, sizeof *tz); return TIME_ZONE_ID_UNKNOWN; }
+// The console's time zone (System Settings) via the time service's own rule. Bias = the offset in
+// effect now, DST included, and no transition dates (the guest then never switches to daylight
+// time itself). Was all zeros: the Load Game screen showed save times in UTC.
+DWORD GetTimeZoneInformation(TIME_ZONE_INFORMATION* tz) {
+    memset(tz, 0, sizeof *tz);
+    u64 now = 0;
+    TimeCalendarTime ct{}; TimeCalendarAdditionalInfo ci{};
+    if (R_FAILED(timeGetCurrentTime(TimeType_Default, &now)) || R_FAILED(timeToCalendarTimeWithMyRule(now, &ct, &ci)))
+        return TIME_ZONE_ID_UNKNOWN;
+    tz->Bias = -ci.offset / 60;   // UTC = local + Bias (minutes)
+    for (int i = 0; i < 7 && ci.timezoneName[i]; ++i) tz->StandardName[i] = tz->DaylightName[i] = WCHAR(ci.timezoneName[i]);
+    return TIME_ZONE_ID_UNKNOWN;
+}
 DWORD timeBeginPeriod(DWORD) { return 0; }
 DWORD timeEndPeriod(DWORD) { return 0; }
 
@@ -487,6 +500,22 @@ DWORD WINAPI nx_xinput_get_state(DWORD slot, void* out) {
         {HidNpadButton_A, 0x1000}, {HidNpadButton_B, 0x2000}, {HidNpadButton_X, 0x4000},
         {HidNpadButton_Y, 0x8000}};
     for (auto& m : kMap) if (b & m.nx) st.buttons |= m.xi;
+    // Capture combo (LSWTCS_CAPCOMBO, default on): hold ZL + ZR and click the right stick -> screenshot +
+    // per-draw [GLDRAWCAP] log in stdout.log (shot_now) + every resolve/render target as PNG (resdump_now), for
+    // glitches that are on screen only briefly (cutscenes). Files land in sdmc:/lswtcs. At most once per 3 s.
+    {
+        static const bool combo_on = [] { const char* e = getenv("LSWTCS_CAPCOMBO"); return !(e && e[0] == '0'); }();
+        static u64 last_ns = 0;
+        const u64 want = HidNpadButton_ZL | HidNpadButton_ZR | HidNpadButton_StickR;
+        const u64 now_ns = armTicksToNs(armGetSystemTick());
+        if (combo_on && (b & want) == want && now_ns - last_ns > 3000000000ull) {
+            last_ns = now_ns;
+            for (const char* n : {"shot_now", "resdump_now"}) if (FILE* t = fopen(n, "wb")) fclose(t);
+            printf("[CAPCOMBO] capture requested (ZL+ZR+R-stick)\n");
+            fflush(stdout);
+            lsw_ft_ring_dump();
+        }
+    }
     st.lt = (b & HidNpadButton_ZL) ? 255 : 0;
     st.rt = (b & HidNpadButton_ZR) ? 255 : 0;
     const HidAnalogStickState l = padGetStickPos(&g_pad, 0), r = padGetStickPos(&g_pad, 1);

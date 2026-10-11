@@ -4,6 +4,8 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,15 +57,53 @@ void load_env_file(const char* path) {
 // passes no attributes; give every thread at least kMinStack (linked with --wrap=pthread_create).
 static constexpr size_t kMinStack = 8u << 20;
 extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+// Core hint for threads that third-party code creates (Mesa's glthread worker): libnx starts every thread on the
+// process's default core (0 = the guest threads). While lsw_set_new_thread_core(c) is set, new threads first pin
+// themselves to core c.
+// The hint is per creating thread (thread_local): other threads creating threads meanwhile (shader-compile workers,
+// Mesa queues) are not affected. Pinned threads get priority 0x2C: below the audio output thread (0x2B, also core 2;
+// with LSWTCS_GLPIPE the worker spins in nouveau's GPU fence wait, which made audio extremely choppy on hardware,
+// 2026-10-09) and above the core-2 shader-compile worker (0x2D): Horizon does not time-slice equal priorities.
+static thread_local int g_new_thread_core = -1;
+extern "C" void lsw_set_new_thread_core(int core) { g_new_thread_core = core; }
+namespace {
+struct PinnedStart { void* (*fn)(void*); void* arg; int core; };
+void* pinned_start(void* p) {
+    PinnedStart s = *static_cast<PinnedStart*>(p);
+    delete static_cast<PinnedStart*>(p);
+    const Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, s.core, 1u << s.core);
+    const Result rp = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
+    printf("[NX] new thread pinned to core %d, priority 0x2C (rc 0x%X / 0x%X)\n", s.core, rc, rp);
+    fflush(stdout);
+    return s.fn(s.arg);
+}
+}  // namespace
 extern "C" int __wrap_pthread_create(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg) {
     pthread_attr_t a;
     if (attr) a = *attr; else pthread_attr_init(&a);
     size_t sz = 0;
     pthread_attr_getstacksize(&a, &sz);
     if (sz < kMinStack) pthread_attr_setstacksize(&a, kMinStack);
-    int rc = __real_pthread_create(t, &a, fn, arg);
+    int rc;
+    if (const int core = g_new_thread_core; core >= 0) {
+        auto* s = new PinnedStart{fn, arg, core};
+        rc = __real_pthread_create(t, &a, pinned_start, s);
+        if (rc) delete s;
+    } else {
+        rc = __real_pthread_create(t, &a, fn, arg);
+    }
     if (!attr) pthread_attr_destroy(&a);
     return rc;
+}
+
+// C11 thrd_create for Mesa: newlib defines thrd_success = 4, but switch-mesa 20.1's u_thread_create() does
+// `if (ret) return 0;` (assumes thrd_success == 0), so every Mesa worker thread was created and then reported as
+// failed: util_queue_init() returned false -> glthread never enabled, Mesa's other queues (e.g. the shader disk-cache
+// writer) never ran. Only Mesa uses C11 threads here (our code and libstdc++ use pthreads).
+extern "C" int __real_thrd_create(void* thr, int (*func)(void*), void* arg);
+extern "C" int __wrap_thrd_create(void* thr, int (*func)(void*), void* arg) {
+    const int r = __real_thrd_create(thr, func, arg);
+    return r == 4 /* newlib thrd_success */ ? 0 : (r ? r : 2 /* thrd_error */);
 }
 
 // ---- crash reports --------------------------------------------------------------------------
@@ -162,10 +202,42 @@ static void runtime_selftest() {
 // block is simply never reclaimed (-Wl,--wrap=pthread_detach).
 extern "C" int __wrap_pthread_detach(pthread_t) { return 0; }
 
+// DIAG: time threads spend acquiring newlib's single malloc lock (-Wl,--wrap=__malloc_lock). Parallel
+// shader builds ran 10-20x slower than one build alone (2026-10-08); this measures whether malloc
+// contention is why. Acquisitions over ~1 us (20 ticks of the 19.2 MHz counter) count as contended.
+struct _reent;
+extern "C" void __real___malloc_lock(struct _reent*);
+static uint64_t s_malloc_wait_ticks = 0, s_malloc_contended = 0, s_malloc_calls = 0;
+extern "C" void __wrap___malloc_lock(struct _reent* r) {
+    const uint64_t t0 = armGetSystemTick();
+    __real___malloc_lock(r);
+    const uint64_t d = armGetSystemTick() - t0;
+    ++s_malloc_calls;   // under the lock: exact
+    if (d > 20) { s_malloc_wait_ticks += d; ++s_malloc_contended; }
+}
+// Totals so far: wait in ns, contended acquisitions, all acquisitions.
+extern "C" void lsw_malloc_lock_stats(uint64_t* wait_ns, uint64_t* contended, uint64_t* calls) {
+    *wait_ns = armTicksToNs(s_malloc_wait_ticks);
+    *contended = s_malloc_contended;
+    *calls = s_malloc_calls;
+}
+
 // ---- init -----------------------------------------------------------------------------------
 extern "C" void lsw_switch_init() {
     mkdir(LSW_DATA_DIR, 0777);
     chdir(LSW_DATA_DIR);
+    // The previous session's logs are kept as *_prev.log (a relaunch used to overwrite them before they were read:
+    // the [FTRING] of a camera capture was lost, 2026-10-09). Capture triggers left by a session that ended
+    // mid-capture are dropped, or the first frame of this one is captured (a black shot_1.png).
+    for (const char* n : {"stdout", "trace", "frames"}) {
+        char cur[32], prev[32];
+        snprintf(cur, sizeof cur, "%s.log", n);
+        snprintf(prev, sizeof prev, "%s_prev.log", n);
+        remove(prev);
+        rename(cur, prev);
+    }
+    remove("shot_now");
+    remove("resdump_now");
     // stdout/stderr -> log file (printf is the runtime's main log; dbg_ram writes trace.log).
     g_stdout_log = freopen(LSW_DATA_DIR "/stdout.log", "w", stdout);
     freopen(LSW_DATA_DIR "/stderr.log", "w", stderr);

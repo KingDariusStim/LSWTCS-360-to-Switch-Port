@@ -45,3 +45,15 @@ build/
 *.xci
 *.nsp
 *.nca
+
+# Our own scripts (recomp post-passes: live-in, data-prefix, switch ERROR repairs; Ghidra/bisect helpers).
+!/tools/
+__pycache__/
+# Run output: console / Eden logs, captures and memory dumps (hundreds of MB), per-build logs.
+/switch/hwlogs/
+/switch/build_*.log
+# Forwarder: only the build script is ours; the rest is build output and vendored code.
+/switch/forwarder/*
+!/switch/forwarder/build_forwarder.sh
+# Generated from the recompiled guest reverb by tools/gen_native_reverb.py (derived from the game code).
+/LSWTCSRuntime/source/native_reverb_gen.inc

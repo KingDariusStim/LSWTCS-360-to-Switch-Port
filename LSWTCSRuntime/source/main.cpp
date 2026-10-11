@@ -180,6 +180,115 @@ void lswtcs_heaptest(PPCContext& ctx, uint8_t* base) {
 
 static void ppc_noop_stub(PPCContext& ctx, uint8_t* base) { (void)ctx; (void)base; }
 
+// DIAG (LSWTCS_CAMCMDLOG, default on): the level scripts' camera commands, logged as [CAMCMD] in stdout.log with the
+// swap number, argument registers, the first words at r3 / r4 and the caller. The port pulls the camera to a random
+// stud at the start of a level where the original game (Xenia, 2026-10-10) makes no camera move at all, possibly a
+// puzzle's reward camera firing at load as if the puzzle were already solved. Handlers from the script command table
+// at 0x82E7B248..0x82E7B328 (name, handler, id); the scripts reach them through the dispatch table, which is where
+// the wrappers go.
+struct CamCmd { uint32_t addr; const char* name; PPCFunc* orig; uint64_t calls; };
+static CamCmd g_camcmds[] = {{0x82130DA0u, "CameraCut", nullptr, 0},       {0x82130260u, "DynamicCameraCut", nullptr, 0},
+                             {0x82132B90u, "EndCameraCut", nullptr, 0},    {0x821A0388u, "JudderGameCamera", nullptr, 0},
+                             {0x821A05E0u, "CameraShake", nullptr, 0},     {0x821A0750u, "ResetGameCamera", nullptr, 0}};
+template <int I> static void camcmd_hook(PPCContext& ctx, uint8_t* base) {
+    extern uint64_t g_geom_swaps_pub;
+    CamCmd& c = g_camcmds[I];
+    auto words = [&](uint32_t p, char* out, size_t n) {
+        if (p < 0x80000000u || p >= 0x9FFFFFF0u) { snprintf(out, n, "-"); return; }
+        snprintf(out, n, "%08X %08X %08X %08X", PPC_LOAD_U32(p), PPC_LOAD_U32(p + 4), PPC_LOAD_U32(p + 8), PPC_LOAD_U32(p + 12));
+    };
+    char w3[48], w4[48];
+    words(ctx.r3.u32, w3, sizeof w3);
+    words(ctx.r4.u32, w4, sizeof w4);
+    const bool log = ++c.calls <= 400;
+    if (log)
+        printf("[CAMCMD] swap %llu %s #%llu r3=%08X [%s] r4=%08X [%s] r5=%08X r6=%08X lr=%08X\n", (unsigned long long)g_geom_swaps_pub,
+               c.name, (unsigned long long)c.calls, ctx.r3.u32, w3, ctx.r4.u32, w4, ctx.r5.u32, ctx.r6.u32, uint32_t(ctx.lr));
+    c.orig(ctx, base);
+    if (log) { printf("[CAMCMD]   %s returned r3=%08X\n", c.name, ctx.r3.u32); fflush(stdout); }
+}
+template <int I> static void camcmd_install_one() {
+    g_camcmds[I].orig = PPC_LOOKUP_FUNC(g_base, g_camcmds[I].addr);
+    if (g_camcmds[I].orig) PPC_LOOKUP_FUNC(g_base, g_camcmds[I].addr) = camcmd_hook<I>;
+}
+// DIAG (LSWTCS_OBJLOG, default on): the level trigger network's object state queries and activations, as [OBJQ] /
+// [OBJACT] in stdout.log. Trigger nodes of type 0 ask "is object X in state Y" through the object's class (class
+// table at [0x8309BA70]: 28 classes of 0xB8 bytes, +0x48 query, +0x54 activate; read from Eden / PC memory
+// 2026-10-10), and an action node whose inputs all hold activates its targets. In the port the Episode 2 hub
+// disco ball is switched on by that network at hub load (the Force object it waits for already sits finished),
+// where the original game waits for the player. Queries are logged the first time and whenever their answer
+// changes; activations always (first 2000).
+static const uint32_t kObjQuery[28] = {0x823EA930, 0x82443B88, 0x821CAE98, 0x82407878, 0x82413788, 0x82210748, 0x823E5B10,
+                                       0x8247B5C0, 0x82410738, 0x8227A350, 0x82471FF8, 0x821C4190, 0x8218CE80, 0x82475E78,
+                                       0x8246E248, 0x82479AC8, 0x824795C0, 0x821D9370, 0x821E36E8, 0x8245FB90, 0x8241B978,
+                                       0x8226C1B0, 0x821DCCF8, 0x82476E30, 0x8247CDE0, 0x823DA368, 0x82478AF8, 0x82269750};
+static const uint32_t kObjAct[28] = {0x823E93C0, 0x82444AC0, 0x821CDD30, 0x82409FD0, 0x824137B0, 0x82211160, 0x823E24C8,
+                                     0x8247BAA8, 0x824103C8, 0x8227A118, 0x82471168, 0x821C3CF8, 0x821330E0, 0x82475F70,
+                                     0,          0x82479B10, 0x82479610, 0x821DB900, 0x821E4A88, 0x8245F9A8, 0x8241B9C0,
+                                     0x8226C128, 0x821DC630, 0,          0x8247CE28, 0x823DA268, 0x82478628, 0x82268EF8};
+static PPCFunc* g_objq_orig[28];
+static PPCFunc* g_obja_orig[28];
+static void objlog_name(uint32_t obj, char* out, size_t n) {   // a printable name at the object, else its first words
+    uint8_t* base = g_base;
+    if (obj < 0x80000000u || obj >= 0x9FFFFF00u) { snprintf(out, n, "-"); return; }
+    size_t k = 0;
+    for (; k + 1 < n && k < 31; ++k) {
+        const uint8_t c = PPC_LOAD_U8(obj + uint32_t(k));
+        if (!c) break;
+        if (c < 32 || c > 126) { k = 0; break; }
+        out[k] = char(c);
+    }
+    if (k >= 3) { out[k] = 0; return; }
+    snprintf(out, n, "[%08X %08X]", PPC_LOAD_U32(obj), PPC_LOAD_U32(obj + 4));
+}
+template <int I> static void objq_hook(PPCContext& ctx, uint8_t* base) {
+    extern uint64_t g_geom_swaps_pub;
+    const uint32_t obj = ctx.r3.u32, want = ctx.r4.u32, flag = ctx.r5.u32;
+    g_objq_orig[I](ctx, base);
+    static std::unordered_map<uint64_t, uint32_t> last;   // (object, wanted state) -> last answer
+    const uint64_t key = (uint64_t(obj) << 32) ^ (uint64_t(want) << 8) ^ uint64_t(I);
+    auto it = last.find(key);
+    if (it != last.end() && it->second == ctx.r3.u32) return;
+    last[key] = ctx.r3.u32;
+    char nm[40];
+    objlog_name(obj, nm, sizeof nm);
+    printf("[OBJQ] swap %llu class %d obj %08X %s want %u flag %u -> %u%s lr=%08X\n", (unsigned long long)g_geom_swaps_pub, I, obj, nm,
+           want, flag, ctx.r3.u32, it == last.end() ? "" : " (changed)", uint32_t(ctx.lr));
+}
+template <int I> static void obja_hook(PPCContext& ctx, uint8_t* base) {
+    extern uint64_t g_geom_swaps_pub;
+    static uint64_t n = 0;
+    if (++n <= 2000) {
+        char nm[40];
+        objlog_name(ctx.r3.u32, nm, sizeof nm);
+        printf("[OBJACT] swap %llu class %d obj %08X %s arg %u lr=%08X\n", (unsigned long long)g_geom_swaps_pub, I, ctx.r3.u32, nm,
+               ctx.r4.u32, uint32_t(ctx.lr));
+    }
+    g_obja_orig[I](ctx, base);
+}
+template <int... I> static void objlog_install_all(std::integer_sequence<int, I...>) {
+    ((g_objq_orig[I] = PPC_LOOKUP_FUNC(g_base, kObjQuery[I]),
+      g_objq_orig[I] ? (void)(PPC_LOOKUP_FUNC(g_base, kObjQuery[I]) = objq_hook<I>) : (void)0), ...);
+    ((g_obja_orig[I] = kObjAct[I] ? PPC_LOOKUP_FUNC(g_base, kObjAct[I]) : nullptr,
+      g_obja_orig[I] ? (void)(PPC_LOOKUP_FUNC(g_base, kObjAct[I]) = obja_hook<I>) : (void)0), ...);
+}
+static void objlog_install() {
+    const char* e = getenv("LSWTCS_OBJLOG");
+    if (e && e[0] == '0') return;
+    objlog_install_all(std::make_integer_sequence<int, 28>{});
+    printf("[OBJQ] logging state queries / activations of 28 object classes (LSWTCS_OBJLOG=0 turns it off)\n");
+}
+
+static void camcmd_log_install() {
+    const char* e = getenv("LSWTCS_CAMCMDLOG");
+    if (e && e[0] == '0') return;
+    camcmd_install_one<0>(); camcmd_install_one<1>(); camcmd_install_one<2>();
+    camcmd_install_one<3>(); camcmd_install_one<4>(); camcmd_install_one<5>();
+    int n = 0;
+    for (const CamCmd& c : g_camcmds) n += c.orig != nullptr;
+    printf("[CAMCMD] logging %d camera script commands (LSWTCS_CAMCMDLOG=0 turns it off)\n", n);
+}
+
 uint8_t* g_base = nullptr;
 // Per-512 MB-region host base for PPC_HOST (ppc_context.h); filled right after g_base is mapped.
 extern "C" uint8_t* ppc_view_base[8] = {};
@@ -970,6 +1079,9 @@ int main() {
     PPC_LOOKUP_FUNC(g_base, 0x823143D0) = ppc_noop_stub;
     printf("[PATCH] sub_823143D0 redirected to no-op\n");
 
+    camcmd_log_install();
+    objlog_install();
+
     // Override sub_824A5D00: factory/initializer that calls vtable[3] on objects
     // created by sub_82548568. Those objects have null vtables because the factory
     // chain produces zero-initialized output (no valid backing store for this subsystem).
@@ -1085,7 +1197,9 @@ int main() {
     // Set up initial context
     PPCContext ctx{};
     ctx.r1.u32 = 0x835FFFF0 - 0x10;
+#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
     ctx.r2.u32 = 0;
+#endif
     // Initialize fpscr.csr from the host MXCSR so disableFlushMode/enableFlushMode
     // don't zero out exception-mask bits (which would unmask all SSE FP exceptions).
     ctx.fpscr.csr = ctx.fpscr.getcsr();

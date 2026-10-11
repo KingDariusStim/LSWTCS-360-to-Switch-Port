@@ -40,6 +40,14 @@ int main(int argc, char** argv) {
                  uint32_t(d.size()));
   xe::StringBuffer buf;
   sh.AnalyzeUcode(buf);
+  // Ucode disassembly next to the input's outputs (argv[3] = the .spv path): <argv[3]>.dis
+  if (argc > 3) {
+    std::string dis_path = std::string(argv[3]) + ".dis";
+    if (FILE* o = fopen(dis_path.c_str(), "wb")) {
+      fwrite(sh.ucode_disassembly().data(), 1, sh.ucode_disassembly().size(), o);
+      fclose(o);
+    }
+  }
   // No Vulkan device: core-feature defaults (all=false), SPIR-V 1.0, no EDRAM interlock.
   SpirvShaderTranslator::Features features(false);
   features.spirv_version = spv::Spv_1_0;

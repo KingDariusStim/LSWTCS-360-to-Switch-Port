@@ -32,6 +32,9 @@
 #include "lsw_gl_shader.h"
 #include "lsw_gpu_bridge.h"
 #include "lsw_spirv_glsl.h"
+#define XXH_INLINE_ALL
+#include "third_party/xxhash/xxhash.h"
+extern uint64_t g_geom_swaps_pub;   // kernel_stubs.cpp: swaps seen ([SHADERNEW])
 
 using namespace xe;
 using namespace xe::gpu;
@@ -82,6 +85,20 @@ Bridge& bridge() {
       const char* e = getenv("LSWTCS_GLFMZ");
       f.lsw_host_mul_zero_wins = !e || e[0] == '1';
     }
+    // Pixel-shader computed-LOD fetches as implicit LOD + bias instead of explicit gradients
+    // (SpirvShaderTranslator::lsw_implicit_lod_bias). LSWTCS_GLTEXBIAS=0 turns it off.
+    {
+      const char* e = getenv("LSWTCS_GLTEXBIAS");
+      SpirvShaderTranslator::lsw_implicit_lod_bias = !e || e[0] == '1';
+    }
+    // Forward-jump shaders without the switch dispatcher (LSWTCS_GLFWDCF, default on) and, opt-in,
+    // guest loops structured too (LSWTCS_GLFWDLOOPS=1).
+    {
+      const char* e = getenv("LSWTCS_GLFWDCF");
+      SpirvShaderTranslator::lsw_forward_jumps = !e || e[0] == '1';
+      const char* l = getenv("LSWTCS_GLFWDLOOPS");
+      SpirvShaderTranslator::lsw_structured_loops = l && l[0] == '1';
+    }
     b->translator = std::make_unique<SpirvShaderTranslator>(f, false, false, false);
     b->vs_float.reserve(512 * 4);
     b->ps_float.reserve(512 * 4);
@@ -117,6 +134,14 @@ SpirvShader* get_shader(xenos::ShaderType type, const uint32_t* ucode_be, uint32
     // The Shader constructor byte-swaps from guest (big-endian) order.
     auto sh = std::make_unique<SpirvShader>(type, key, ucode_be, dwords);
     sh->AnalyzeUcode(b.disasm_buffer);
+    {   // DIAG: every new guest shader under Xenia's name for it (pipeline_cache.cc: XXH3_64bits of the guest bytes,
+        // dump files shader_<hash>.ucode.*), with the swap it first appeared at: the shaders a room draws in the
+        // port and not in Xenia (dump_shaders) belong to effects the port switches on by itself (Episode 2 hub
+        // jukebox already lit, 2026-10-10).
+        printf("[SHADERNEW] swap %llu %s %016llX (%u dwords)\n", (unsigned long long)g_geom_swaps_pub,
+               type == xenos::ShaderType::kPixel ? "PS" : "VS",
+               (unsigned long long)XXH3_64bits(ucode_be, size_t(dwords) * 4u), dwords);
+    }
     raw = sh.get();
     b.shaders.emplace(key, std::move(sh));
   }
@@ -190,6 +215,25 @@ const LswGlShader* get_glsl(SpirvShader& shader, uint64_t modification, LswGlSta
                ms_since(t0), glsl.size());
         fflush(stdout);
       }
+      // Pixel shaders without `precise` (LSWTCS_GLPSPRECISE=1 keeps it): Xenia marks every ALU result NoContraction
+      // to reproduce the 360's rounding exactly, which stops Mesa fusing mul+add into ffma and reordering, roughly
+      // doubling the ALU instruction count of the heavy full-screen passes on the Switch GPU (hardware [GLGPU]: top
+      // pixel shaders 1.5-2.9 ms per frame each). Vertex shaders keep it: position invariance across passes.
+      if (stage == kLswGlPixel) {
+        static const bool keep = [] { const char* e = getenv("LSWTCS_GLPSPRECISE"); return e && e[0] == '1'; }();
+        if (!keep) {
+          std::string o;
+          o.reserve(glsl.size());
+          for (size_t i = 0; i < glsl.size();) {
+            if (glsl.compare(i, 8, "precise ") == 0 && (i == 0 || !(isalnum(uint8_t(glsl[i - 1])) || glsl[i - 1] == '_'))) {
+              i += 8;
+              continue;
+            }
+            o += glsl[i++];
+          }
+          glsl.swap(o);
+        }
+      }
       out = std::make_unique<LswGlShader>();
       out->stage = stage;
       out->key = key;
@@ -242,6 +286,29 @@ void pack_floats(const RegisterFile& regs, const Shader::ConstantRegisterMap& ma
 
 extern "C" uint32_t lsw_gpu_system_constants_size(void) {
   return kLswGlClipPlaneOffset + kLswGlClipPlaneSize;
+}
+
+// Viewport and scissor exactly as lsw_gpu_prepare computes them (kernel_stubs.cpp walk-time tile skipping: a
+// repeated tile's draw reuses tile 0's record and only needs these for its own window offset).
+extern "C" void lsw_gpu_viewport_scissor(const uint32_t* regs_in, uint32_t ps_writes_depth, float viewport[6],
+                                         uint32_t scissor_out[4]) {
+  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(regs_in);
+  draw_util::ViewportInfo viewport_info;
+  draw_util::GetViewportInfoArgs gviargs{};
+  gviargs.Setup(1, 1, divisors::MagicDiv(1), divisors::MagicDiv(1), true, 16384, 16384, false,
+                draw_util::GetNormalizedDepthControl(regs), false, true, ps_writes_depth != 0);
+  gviargs.SetupRegisterValues(regs);
+  draw_util::GetHostViewportInfo(&gviargs, viewport_info);
+  viewport[0] = float(viewport_info.xy_offset[0]);
+  viewport[1] = float(viewport_info.xy_offset[1]);
+  viewport[2] = float(viewport_info.xy_extent[0]);
+  viewport[3] = float(viewport_info.xy_extent[1]);
+  viewport[4] = viewport_info.z_min;
+  viewport[5] = viewport_info.z_max;
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  scissor_out[0] = scissor.offset[0]; scissor_out[1] = scissor.offset[1];
+  scissor_out[2] = scissor.extent[0]; scissor_out[3] = scissor.extent[1];
 }
 
 extern "C" int lsw_gpu_prepare(const uint32_t* regs_in, const uint32_t* vs_ucode_be, uint32_t vs_dwords,
