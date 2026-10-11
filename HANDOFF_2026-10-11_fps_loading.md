@@ -34,6 +34,24 @@ and for anything past that minimum.
 
 ## 2. Work list, ranked by expected gain per effort
 
+**Progress (2026-10-11 s4):**
+- **2.1 DONE**, `LSWTCSRuntime/source/native_crt.cpp`: memcpy, memset, _stricmp, stristr (82500958), strlen
+  (824F9068), strcpy-returning-length (824F8F48). `LSWTCS_CRTCHECK=1`: 0 mismatches over 18.4 M calls (boot, hub,
+  Episode I load). Load profiles: memset gone from main (was 10.5 % at boot, 5 % in the level load), memcpy 19 % ->
+  ~2 % of the I/O thread. **Recomp bug found:** XenonRecomp split memset at 0x8250F130, so the recompiled one left
+  the last 1-2 bytes unwritten when the tail after alignment was 2-3 bytes (hit ~once per boot); native writes all
+  bytes. The ~370 MB heap clears at boot are one memset each (native now). 824FF558 is a tokenizer, not a CRT
+  routine. The 1205-site stricmp's hot caller is the text-file command dispatch `sub_825034B0` (linear search of a
+  {name, handler} table per line); native stricmp is single-pass, so no index was needed.
+- **2.2 DONE**, `native_lz2k.cpp` restructured (see its header): offline benchmark (156 MB of real blocks, dump with
+  `LSWTCS_LZ2KDUMP=<MB>` -> lz2k_dump.bin) 293 -> 469 MB/s on PC (1.6x); **Eden 3.2-3.7 s -> 1.38 s for the same
+  153 MB (2.3-2.7x)**; `LSWTCS_LZ2KCHECK=1` 0 mismatches over 197 MB. Key lever: -fno-strict-aliasing means every
+  output byte store could alias the decoder state, so the bit reader is a value-type copy held in locals.
+  Remaining cost: per-symbol Huffman decode (~5 ns/symbol PC) and block headers (~18 %, 5.5 us each); next step
+  would be multi-symbol tables.
+- Eden hub A/B (eden_ab.sh): both on p50 19.4 / p90 22.6 ms vs 22.4-23.2 / 25.8-26.5 in today's earlier runs;
+  `LSWTCS_NATIVECRT=0` gives 19.7 / 23.4. Fewer underruns in the loading windows. Console test pending.
+
 ### 2.1 Native C-library routines (main thread FPS, loading) — do first
 The game's CRT is recompiled byte loops; every byte goes through the address fold and a store.
 

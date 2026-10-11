@@ -145,6 +145,7 @@ target_compile_options(lsw_spirv PRIVATE ${LSW_ARCH_FLAGS} ${LSW_COMPAT} -O2 -g 
 set(RT "${LSW_ROOT}/LSWTCSRuntime/source")
 add_executable(lswtcs
     "${RT}/main.cpp" "${RT}/kernel_stubs.cpp" "${RT}/gpu_ringbuf.cpp" "${RT}/native_lz2k.cpp" "${RT}/native_reverb.cpp"
+    "${RT}/native_crt.cpp"
     source/platform_switch.cpp source/win32_switch.cpp source/null_backends.cpp source/linux_shim.cpp
     source/gl_backend.cpp source/mesa_shim.cpp source/audio_switch.cpp)
 # The runtime's main() runs on a 16 MB thread started by platform_switch.cpp.
