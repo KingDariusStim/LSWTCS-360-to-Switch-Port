@@ -1,5 +1,10 @@
 # HANDOFF 2026-10-11: why do NPCs not appear in the main hub (Mos Eisley Cantina)?
 
+> **PC build: not yet run with this fix.** `LSWTCSRuntime/build/LSWTCSRuntime.exe` is still the 10-08 archive build
+> (no switch repairs, no resolve-swap fix, FRONTINIT patch still on). Rebuild it (native mingw64 cmake) and check
+> that it boots without `LSWTCS_FRONTINIT` (intro card, then title) and that the Cantina NPCs appear. If the PC boot
+> hangs, `LSWTCS_FRONTINIT=1` restores the old behaviour (and the NPCs disappear again).
+
 ## RESOLVED (2026-10-11, same day)
 
 The user confirmed in Xenia that non-playable NPCs are present in the original game with the same save. Cause, traced
@@ -17,9 +22,9 @@ in Eden with the console's current save (`savegame_78_4c`):
    patch is OFF by default (`LSWTCS_FRONTINIT=1` turns it back on). Side effect: the developer intro card now plays
    at boot as in Xenia (the title level appears at about 74 s in Eden instead of 20 s).
 
-Verified in Eden: RandomMap picks return 170/202 and the user saw the NPCs in the Cantina. Not yet re-checked:
-the Episode 2 disco ball, the Kamino camera and the colours (§3 step 4), and the PC build (still the 10-08 archive
-build).
+Verified in Eden: RandomMap picks return 170/202 and the user saw the NPCs in the Cantina. The user checked the
+Episode 2 disco ball: fine. Not yet re-checked: the Kamino camera and the colours (§3 step 4), and the PC build (see
+the note at the top).
 
 New diagnostics in main.cpp: `LSWTCS_FNLOG` (`=1` for all entries, or a comma list of hex addresses) logs calls to the
 functions in `FNLOG_LIST` (strong overrides of the recompiled weak `sub_X`, so direct calls are caught; adding

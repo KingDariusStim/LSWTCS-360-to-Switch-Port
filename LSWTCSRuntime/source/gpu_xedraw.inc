@@ -434,7 +434,8 @@ static XdRt* xd_rt_depth(uint32_t surf_info, uint32_t depth_info) {
 // Resolve destinations: host texture per guest physical base, sampled instead of guest memory.
 struct XdResolved { ID3D12Resource* res; D3D12_RESOURCE_STATES state; UINT w, h; DXGI_FORMAT fmt; UINT rtv; uint32_t tfmt; uint64_t frame;
                     uint64_t probe; uint32_t probe_bytes; bool composite; uint64_t composed_frame;
-                    uint32_t vy0 = 0xFFFFFFFFu, vy1 = 0; };   // rows ever written by resolves
+                    uint32_t vy0 = 0xFFFFFFFFu, vy1 = 0;   // rows ever written by resolves
+                    bool swap = false; };   // last resolve into it had copy_dest_swap (see xd_resolved_swizzle)
 static std::unordered_map<uint32_t, XdResolved> g_xd_resolved;
 // We never write resolve output back to guest memory, so the guest bytes under a resolve target
 // only change when the CPU reuses that memory (e.g. a new level texture loaded there). Fingerprint
@@ -617,6 +618,7 @@ static void xd_do_resolve(const LswGpuDrawRec& r) {
                 xd_blit(src->res, depth_src ? (xd_stencil() ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT) : src->fmt, xd_rtv(dst->rtv), dst->fmt,
                         r.rs_dest_x, r.rs_dest_y, w, h, x0 - r.rs_dest_x, y0 - r.rs_dest_y, mode, int32_t(sx), int32_t(sy));
                 dst->frame = ++g_xd_resolve_seq;
+                dst->swap = r.rs_dest_swap != 0;   // copied unswapped; applied where sampled (xd_resolved_swizzle)
                 dst->vy0 = std::min<uint32_t>(dst->vy0, uint32_t(r.rs_dest_y));
                 dst->vy1 = std::max<uint32_t>(dst->vy1, uint32_t(r.rs_dest_y + h));
                 dst->probe_bytes = std::max<uint32_t>(64u, std::min<uint32_t>(dw * dh * 4u, 0x1000000u));
@@ -831,7 +833,27 @@ static XdView* xd_resolved_view(uint32_t base, XdResolved& src, uint32_t w, uint
 // exactly the fetch size from the base-address target (row 0) plus every sub-range target (row
 // (sub - base) / row_bytes), rebuilt whenever any source is re-resolved. No sub-ranges: the base
 // target itself, or a sized view when the fetch size differs.
-struct XdTexSrc { ID3D12Resource* res; DXGI_FORMAT fmt; D3D12_RESOURCE_STATES* state; };
+struct XdTexSrc { ID3D12Resource* res; DXGI_FORMAT fmt; D3D12_RESOURCE_STATES* state; bool swap = false; };
+// Swizzle for a fetch bound to a resolved source: single-channel host formats replicate channel 0,
+// k_8 resolves keep RGBA (LSWTCS_K8RGBA), constants 0/1 pass through. swap: the resolve that wrote the
+// source had copy_dest_swap. On the console guest memory then holds red and blue exchanged and the fetch
+// swizzle (e.g. A8R8G8B8's) maps them back; the host texture holds the render target's own order, so the
+// swizzle's red/blue sources are exchanged instead (same as switch/source/gl_rt.inc resolved_swizzle).
+// Until 2026-10-11 the game's render-target format switch (sub_8231B770) was broken and its surfaces
+// arrived as format 2 with no swizzle; once fixed, everything resolved turned blue without this.
+static uint32_t xd_resolved_swizzle(uint32_t tsw, uint32_t tf, DXGI_FORMAT fmt, bool swap) {
+    const bool single = fmt == DXGI_FORMAT_R8_UNORM || fmt == DXGI_FORMAT_R32_FLOAT;
+    static int k8 = -1; if (k8 < 0) { const char* e = getenv("LSWTCS_K8RGBA"); k8 = (e && e[0] == '0') ? 0 : 1; }
+    if (k8 && tf == 2 && !single) return 0x688;   // sample RGBA as-is
+    uint32_t map = 0;
+    for (int c = 0; c < 4; ++c) {
+        uint32_t sw = (tsw >> (3 * c)) & 7;
+        if (swap && !single && (sw == 0 || sw == 2)) sw ^= 2;
+        if (sw < 4 && single) sw = 0; else if (sw > 5) sw = 4;
+        map |= sw << (3 * c);
+    }
+    return map;
+}
 static std::unordered_map<uint32_t, XdResolved> g_xd_composed;
 static uint64_t g_xd_src_epoch = 0;   // bumps when xd_texture_source drops or replaces a target (memo below)
 static bool xd_texture_source_uncached(uint32_t base, uint32_t tfmt, uint32_t w, uint32_t h, XdTexSrc& out);
@@ -886,8 +908,8 @@ static bool xd_texture_source_uncached(uint32_t base, uint32_t tfmt, uint32_t w,
     if (subs.empty()) {
         if (ex == g_xd_resolved.end()) { if (w >= 256) xd_fstate(" MISS:%X(%ux%u)", base, w, h); return false; }
         XdResolved& rr = ex->second;
-        if (XdView* vw = xd_resolved_view(base, rr, w, h)) { out = {vw->res, vw->fmt, &vw->state}; return true; }
-        out = {rr.res, rr.fmt, &rr.state}; return true;
+        if (XdView* vw = xd_resolved_view(base, rr, w, h)) { out = {vw->res, vw->fmt, &vw->state, rr.swap}; return true; }
+        out = {rr.res, rr.fmt, &rr.state, rr.swap}; return true;
     }
     DXGI_FORMAT fmt = ex != g_xd_resolved.end() ? ex->second.fmt : subs[0].second->fmt;
     uint64_t seq = ex != g_xd_resolved.end() ? ex->second.frame : 0;
@@ -934,7 +956,7 @@ static bool xd_texture_source_uncached(uint32_t base, uint32_t tfmt, uint32_t w,
             xd_blit(s.res, s.fmt, xd_rtv(c.rtv), c.fmt, 0, int32_t(yoff + y0), int32_t(cw), int32_t(y1 - y0), 0, -int32_t(yoff), 0, 1, 1);
         }
     }
-    out = {c.res, c.fmt, &c.state};
+    out = {c.res, c.fmt, &c.state, ex != g_xd_resolved.end() ? ex->second.swap : subs[0].second->swap};
     return true;
 }
 
@@ -1275,15 +1297,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                     if (tinfo && xd_texture_source(tb, tf, tw, th, src)) {
                         const D3D12_RESOURCE_STATES srv_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                         if (*src.state != srv_state) { barrier(src.res, *src.state, srv_state); *src.state = srv_state; }
-                        bool single = src.fmt == DXGI_FORMAT_R8_UNORM || src.fmt == DXGI_FORMAT_R32_FLOAT;
-                        { static int k8 = -1; if (k8 < 0) { const char* e = getenv("LSWTCS_K8RGBA"); k8 = (e && e[0] == '0') ? 0 : 1; }
-                          if (k8 && tf == 2 && !single) tsw = 0x688; }   // experiment: sample RGBA as-is
-                        uint32_t map = 0;
-                        for (int c = 0; c < 4; ++c) {
-                            uint32_t sw = (tsw >> (3 * c)) & 7;
-                            if (sw < 4 && single) sw = 0; else if (sw > 5) sw = 4;
-                            map |= sw << (3 * c);
-                        }
+                        const uint32_t map = xd_resolved_swizzle(tsw, tf, src.fmt, src.swap);
                         s.res = src.res; s.fmt = src.fmt; s.map = map | (1u << 12);
                         s.dim = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; s.mips = 1; s.layers = 1;
                         ++res_tex_binds;
@@ -1339,15 +1353,7 @@ static void gpu_xedraw_replay_impl(D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv, uint32_t 
                     if (tinfo && xd_texture_source(tb, tf, tw, th, src)) {
                         const D3D12_RESOURCE_STATES srv_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                         if (*src.state != srv_state) { barrier(src.res, *src.state, srv_state); *src.state = srv_state; }
-                        bool single = src.fmt == DXGI_FORMAT_R8_UNORM || src.fmt == DXGI_FORMAT_R32_FLOAT;
-                        { static int k8 = -1; if (k8 < 0) { const char* e = getenv("LSWTCS_K8RGBA"); k8 = (e && e[0] == '0') ? 0 : 1; }
-                          if (k8 && tf == 2 && !single) tsw = 0x688; }   // experiment: sample RGBA as-is
-                        uint32_t map = 0;
-                        for (int c = 0; c < 4; ++c) {
-                            uint32_t sw = (tsw >> (3 * c)) & 7;
-                            if (sw < 4 && single) sw = 0; else if (sw > 5) sw = 4;
-                            map |= sw << (3 * c);
-                        }
+                        const uint32_t map = xd_resolved_swizzle(tsw, tf, src.fmt, src.swap);
                         ID3D12Resource* bind_res = src.res;
                         D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.Format = src.fmt;
                         sv.Shader4ComponentMapping = map | (1u << 12);

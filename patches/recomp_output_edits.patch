@@ -1488,8 +1488,14 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.213.cpp output
  	// b 0x8250f270
 diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output/ppc_recomp.219.cpp
 --- output_locals_raw_folded/ppc_recomp.219.cpp	2026-10-09 00:06:31.937855100 -0400
-+++ output/ppc_recomp.219.cpp	2026-10-09 00:05:54.231027300 -0400
-@@ -1076,8 +1076,17 @@
++++ output/ppc_recomp.219.cpp	2026-10-11 02:37:33.285363600 -0400
+@@ -1,4 +1,5 @@
+ #include "ppc_recomp_shared.h"
++extern "C" double lsw_ft_min(double floor);   // LSW_FTFLOOR: kernel_stubs.cpp
+ 
+ __attribute__((alias("__imp__sub_822157E8"))) PPC_WEAK_FUNC(sub_822157E8);
+ PPC_FUNC_IMPL(__imp__sub_822157E8) {
+@@ -1076,8 +1077,17 @@
  	PPCRegister f29{};
  	PPCRegister f30{};
  	PPCRegister f31{};
@@ -1507,7 +1513,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// mflr r12
  	r12.u64 = ctx.lr;
  	// bl 0x8250f200
-@@ -1167,7 +1176,9 @@
+@@ -1167,7 +1177,9 @@
  	ctx.r3.u64 = r11.u64;
  	// bl 0x82505da0
  	ctx.lr = 0x82215B40;
@@ -1517,7 +1523,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r11,-32003
  	r11.s64 = -2097348608;
  	// stw r3,-11860(r11)
-@@ -1272,18 +1283,26 @@
+@@ -1272,18 +1284,26 @@
  	sub_8244E010(ctx, base);
  	// bl 0x82449290
  	ctx.lr = 0x82215BE8;
@@ -1544,7 +1550,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r11,-32005
  	r11.s64 = -2097479680;
  	// addi r31,r11,-31664
-@@ -1294,7 +1313,9 @@
+@@ -1294,7 +1314,9 @@
  	PPC_STORE_U32(ctx.r1.u32 + 84, r31.u32);
  	// bl 0x8243c988
  	ctx.lr = 0x82215C0C;
@@ -1554,7 +1560,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r11,-32024
  	r11.s64 = -2098724864;
  	// lis r30,-31990
-@@ -1422,6 +1443,9 @@
+@@ -1422,6 +1444,9 @@
  	r11.s64 = -1;
  	// stw r11,28068(r10)
  	PPC_STORE_U32(ctx.r10.u32 + 28068, r11.u32);
@@ -1564,7 +1570,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r10,-31989
  	ctx.r10.s64 = -2096431104;
  	// li r11,0
-@@ -1436,6 +1460,9 @@
+@@ -1436,6 +1461,9 @@
  	cr6.compare<int32_t>(r11.s32, -1, xer);
  	// stw r11,15432(r10)
  	PPC_STORE_U32(ctx.r10.u32 + 15432, r11.u32);
@@ -1574,7 +1580,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r10,-31989
  	ctx.r10.s64 = -2096431104;
  	// beq cr6,0x82215d40
-@@ -1685,6 +1712,7 @@
+@@ -1685,6 +1713,7 @@
  	r11.s64 = r11.s64 + 3848;
  	// stw r11,116(r1)
  	PPC_STORE_U32(ctx.r1.u32 + 116, r11.u32);
@@ -1582,7 +1588,15 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  loc_82215EE8:
  	// lis r11,-32025
  	r11.s64 = -2098790400;
-@@ -3837,6 +3865,9 @@
+@@ -3518,6 +3547,7 @@
+ 	// lfs f13,-22144(r11)
+ 	temp.u32 = PPC_LOAD_U32(r11.u32 + -22144);
+ 	ctx.f13.f64 = double(temp.f32);
++	ctx.f13.f64 = lsw_ft_min(ctx.f13.f64);   // LSW_FTFLOOR: minimum clamp only (fix_ftfloor_sites.py)
+ 	// fcmpu cr6,f0,f13
+ 	cr6.compare(f0.f64, ctx.f13.f64);
+ 	// blt cr6,0x82216bac
+@@ -3837,6 +3867,9 @@
  loc_82216DC0:
  	// stw r11,28068(r31)
  	PPC_STORE_U32(r31.u32 + 28068, r11.u32);
@@ -1592,7 +1606,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.219.cpp output
  	// lis r11,-31988
  	r11.s64 = -2096365568;
  	// lwz r10,-11448(r21)
-@@ -3887,6 +3918,9 @@
+@@ -3887,6 +3920,9 @@
  	PPC_STORE_U32(ctx.r1.u32 + 80, ctx.r10.u32);
  	// stw r8,15432(r10)
  	PPC_STORE_U32(ctx.r10.u32 + 15432, ctx.r8.u32);
@@ -2006,8 +2020,14 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.284.cpp output
  	goto loc_82261D74;
 diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output/ppc_recomp.286.cpp
 --- output_locals_raw_folded/ppc_recomp.286.cpp	2026-10-09 00:06:36.051469400 -0400
-+++ output/ppc_recomp.286.cpp	2026-10-09 00:05:54.276856700 -0400
-@@ -1087,6 +1087,12 @@
++++ output/ppc_recomp.286.cpp	2026-10-11 02:37:33.286363100 -0400
+@@ -1,4 +1,5 @@
+ #include "ppc_recomp_shared.h"
++extern "C" double lsw_ft_min(double floor);   // LSW_FTFLOOR: kernel_stubs.cpp
+ 
+ __attribute__((alias("__imp__sub_82263EE0"))) PPC_WEAK_FUNC(sub_82263EE0);
+ PPC_FUNC_IMPL(__imp__sub_82263EE0) {
+@@ -1087,6 +1088,12 @@
  	r29.s64 = r11.s64 + 31304;
  	// mr r3,r29
  	ctx.r3.u64 = r29.u64;
@@ -2020,7 +2040,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// bl 0x8242bbb0
  	ctx.lr = 0x822644A4;
  	sub_8242BBB0(ctx, base);
-@@ -2352,6 +2358,7 @@
+@@ -2352,6 +2359,7 @@
  PPC_FUNC_IMPL(__imp__sub_82264AA8) {
  	PPC_FUNC_PROLOGUE();
  	PPCXERRegister xer{};
@@ -2028,7 +2048,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	PPCCRRegister cr0{};
  	PPCCRRegister cr6{};
  	PPCRegister r11{};
-@@ -2430,6 +2437,10 @@
+@@ -2430,6 +2438,10 @@
  	PPC_STORE_U32(ctx.r10.u32 + 5020, r15.u32);
  	// stw r29,92(r1)
  	PPC_STORE_U32(ctx.r1.u32 + 92, r29.u32);
@@ -2039,7 +2059,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// lwz r11,-4260(r11)
  	r11.u64 = PPC_LOAD_U32(r11.u32 + -4260);
  	// cmpwi cr6,r11,0
-@@ -2485,9 +2496,11 @@
+@@ -2485,9 +2497,11 @@
  	sub_8250F2B0(ctx, base);
  	// lwz r3,24788(r31)
  	ctx.r3.u64 = PPC_LOAD_U32(r31.u32 + 24788);
@@ -2051,7 +2071,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// lis r11,-32005
  	r11.s64 = -2097479680;
  	// addi r11,r11,-31664
-@@ -2555,9 +2568,11 @@
+@@ -2555,9 +2569,11 @@
  	r31.s64 = -2097348608;
  	// beq cr6,0x82264bd4
  	if (cr6.eq) goto loc_82264BD4;
@@ -2063,7 +2083,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// cmpwi cr6,r3,1
  	cr6.compare<int32_t>(ctx.r3.s32, 1, xer);
  	// beq cr6,0x82264bdc
-@@ -2781,9 +2796,11 @@
+@@ -2781,9 +2797,11 @@
  	if (!cr6.eq) goto loc_82264D6C;
  	// addi r3,r1,96
  	ctx.r3.s64 = ctx.r1.s64 + 96;
@@ -2075,7 +2095,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// cmpwi r3,0
  	cr0.compare<int32_t>(ctx.r3.s32, 0, xer);
  	// bne 0x82264d6c
-@@ -3002,9 +3019,11 @@
+@@ -3002,9 +3020,11 @@
  	PPC_STORE_U64(r11.u32 + 0, r15.u64);
  	// stw r15,8(r11)
  	PPC_STORE_U32(r11.u32 + 8, r15.u32);
@@ -2087,7 +2107,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// li r6,1
  	ctx.r6.s64 = 1;
  	// lwz r3,0(r30)
-@@ -3090,8 +3109,10 @@
+@@ -3090,8 +3110,10 @@
  	// blt cr6,0x82264fa4
  	if (cr6.lt) goto loc_82264FA4;
  	// bl 0x8244e188
@@ -2098,7 +2118,16 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.286.cpp output
  	// cmplwi r3,0
  	cr0.compare<uint32_t>(ctx.r3.u32, 0, xer);
  	// beq 0x82264fa4
-@@ -3360,6 +3381,7 @@
+@@ -3292,7 +3314,7 @@
+ 	// fcmpu cr6,f13,f0
+ 	cr6.compare(ctx.f13.f64, f0.f64);
+ 	// blt cr6,0x822650bc
+-	if (cr6.lt) goto loc_822650BC;
++	if (ctx.f13.f64 < lsw_ft_min(f0.f64)) { f0.f64 = lsw_ft_min(f0.f64); goto loc_822650BC; }   // LSW_FTFLOOR: minimum clamp only; the 3x cap below keeps the real floor (fix_ftfloor_sites.py)
+ 	// fmuls f0,f0,f22
+ 	f0.f64 = double(float(f0.f64 * f22.f64));
+ 	// fcmpu cr6,f13,f0
+@@ -3360,6 +3382,7 @@
  	// stw r29,13724(r30)
  	PPC_STORE_U32(r30.u32 + 13724, r29.u32);
  loc_82265120:
@@ -14039,8 +14068,15 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.414.cpp output
  	case 1:
 diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.415.cpp output/ppc_recomp.415.cpp
 --- output_locals_raw_folded/ppc_recomp.415.cpp	2026-10-09 00:06:32.139348800 -0400
-+++ output/ppc_recomp.415.cpp	2026-10-09 00:05:54.711543300 -0400
-@@ -5764,7 +5764,7 @@
++++ output/ppc_recomp.415.cpp	2026-10-11 02:52:18.737095800 -0400
+@@ -1,4 +1,6 @@
+ #include "ppc_recomp_shared.h"
++extern "C" bool lsw_io_wait(uint8_t* base);   // LSW_IOWAKE: kernel_stubs.cpp
++extern "C" void lsw_io_flag_set(void);   // LSW_IOWAKE: kernel_stubs.cpp
+ 
+ __attribute__((alias("__imp__sub_824F25A8"))) PPC_WEAK_FUNC(sub_824F25A8);
+ PPC_FUNC_IMPL(__imp__sub_824F25A8) {
+@@ -5764,7 +5766,7 @@
  	ctr.u64 = r12.u64;
  	// nop 
  	// bctr 
@@ -14049,7 +14085,25 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.415.cpp output
  	case 0:
  		goto loc_824F4A28;
  	case 1:
-@@ -11976,6 +11976,7 @@
+@@ -11753,6 +11755,7 @@
+ 	r11.s64 = -2094530560;
+ 	// stw r30,18272(r10)
+ 	PPC_STORE_U32(ctx.r10.u32 + 18272, r30.u32);
++	lsw_io_flag_set();   // LSW_IOWAKE: wake the loader waiting on [0x83284760]
+ 	// lwz r3,-4408(r11)
+ 	ctx.r3.u64 = PPC_LOAD_U32(r11.u32 + -4408);
+ 	// bl 0x8250b538
+@@ -11793,7 +11796,8 @@
+ 	ctx.r3.s64 = 1;
+ 	// bl 0x82533af0
+ 	ctx.lr = 0x824F6F30;
+-	sub_82533AF0(ctx, base);
++	if (lsw_io_wait(base)) ctx.r3.u64 = 0;   // LSW_IOWAKE: wait for the read-ahead flag, not Sleep(1)
++	else sub_82533AF0(ctx, base);
+ loc_824F6F30:
+ 	// lwz r11,18272(r31)
+ 	r11.u64 = PPC_LOAD_U32(r31.u32 + 18272);
+@@ -11976,6 +11980,7 @@
  	if (cr6.eq) goto loc_824F7038;
  	// lbz r10,16(r3)
  	ctx.r10.u64 = PPC_LOAD_U8(ctx.r3.u32 + 16);
@@ -14057,7 +14111,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.415.cpp output
  	// b 0x824f703c
  	goto loc_824F703C;
  loc_824F7038:
-@@ -14834,7 +14835,7 @@
+@@ -14834,7 +14839,7 @@
  	ctx.r3.u64 = PPC_LOAD_U32(r11.u32 + -4268);
  	// stw r10,-4268(r11)
  	PPC_STORE_U32(r11.u32 + -4268, ctx.r10.u32);
@@ -14082,8 +14136,23 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.416.cpp output
  	// stw r3,-5536(r11)
 diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output/ppc_recomp.417.cpp
 --- output_locals_raw_folded/ppc_recomp.417.cpp	2026-10-09 00:06:32.141346400 -0400
-+++ output/ppc_recomp.417.cpp	2026-10-09 00:14:33.860201400 -0400
-@@ -2357,6 +2357,9 @@
++++ output/ppc_recomp.417.cpp	2026-10-11 02:52:18.735096200 -0400
+@@ -1,4 +1,6 @@
+ #include "ppc_recomp_shared.h"
++extern "C" bool lsw_io_wait(uint8_t* base);   // LSW_IOWAKE: kernel_stubs.cpp
++extern "C" void lsw_io_flag_set(void);   // LSW_IOWAKE: kernel_stubs.cpp
+ 
+ __attribute__((alias("__imp__sub_824FCE14"))) PPC_WEAK_FUNC(sub_824FCE14);
+ PPC_FUNC_IMPL(__imp__sub_824FCE14) {
+@@ -1981,6 +1983,7 @@
+ 	PPC_STORE_U64(r11.u32 + 8, ctx.r10.u64);
+ 	// stw r8,18272(r28)
+ 	PPC_STORE_U32(r28.u32 + 18272, ctx.r8.u32);
++	lsw_io_flag_set();   // LSW_IOWAKE: wake the loader waiting on [0x83284760]
+ 	// b 0x824fd9cc
+ 	goto loc_824FD9CC;
+ }
+@@ -2357,6 +2360,9 @@
  	ctx.r10.u64 = ctx.r3.u64;
  	// lwz r11,-1940(r8)
  	r11.u64 = PPC_LOAD_U32(ctx.r8.u32 + -1940);
@@ -14093,7 +14162,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// addi r11,r11,172
  	r11.s64 = r11.s64 + 172;
  	// mr r7,r11
-@@ -8404,7 +8407,7 @@
+@@ -8404,7 +8410,7 @@
  	ctr.u64 = r12.u64;
  	// nop 
  	// bctr 
@@ -14102,7 +14171,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	case 0:
  		goto loc_82500358;
  	case 1:
-@@ -13001,7 +13004,7 @@
+@@ -13001,7 +13007,7 @@
  	ctr.u64 = r12.u64;
  	// nop 
  	// bctr 
@@ -14111,7 +14180,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	case 0:
  		goto loc_82501F54;
  	case 1:
-@@ -15735,17 +15738,20 @@
+@@ -15735,17 +15741,20 @@
  	r30.u64 = ctx.r3.u64;
  	// mr r22,r4
  	r22.u64 = ctx.r4.u64;
@@ -14134,7 +14203,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// lwz r11,8(r30)
  	r11.u64 = PPC_LOAD_U32(r30.u32 + 8);
  	// rlwinm r29,r3,4,0,27
-@@ -15757,7 +15763,7 @@
+@@ -15757,7 +15766,7 @@
  	// cmpwi cr6,r11,0
  	cr6.compare<int32_t>(r11.s32, 0, xer);
  	// beq cr6,0x82503170
@@ -14143,7 +14212,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// bl 0x824f7ec8
  	ctx.lr = 0x82502FFC;
  	sub_824F7EC8(ctx, base);
-@@ -15766,7 +15772,8 @@
+@@ -15766,7 +15775,8 @@
  	// cmpwi cr6,r23,-1
  	cr6.compare<int32_t>(r23.s32, -1, xer);
  	// beq cr6,0x82503160
@@ -14153,7 +14222,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// mr r4,r23
  	ctx.r4.u64 = r23.u64;
  	// mr r3,r30
-@@ -15779,7 +15786,8 @@
+@@ -15779,7 +15789,8 @@
  	// cmpwi cr6,r25,-1
  	cr6.compare<int32_t>(r25.s32, -1, xer);
  	// beq cr6,0x82503144
@@ -14163,7 +14232,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// addi r11,r25,3
  	r11.s64 = r25.s64 + 3;
  	// rlwinm r11,r11,4,0,27
-@@ -15934,6 +15942,9 @@
+@@ -15934,6 +15945,9 @@
  loc_8250313C:
  	// addi r3,r23,2048
  	ctx.r3.s64 = r23.s64 + 2048;
@@ -14173,7 +14242,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// b 0x82503190
  	goto loc_82503190;
  loc_82503144:
-@@ -17390,12 +17401,15 @@
+@@ -17390,12 +17404,15 @@
  	r29.u64 = ctx.r5.u64;
  	// mr r25,r6
  	r25.u64 = ctx.r6.u64;
@@ -14189,7 +14258,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// bne 0x82503a70
  	if (!cr0.eq) goto loc_82503A70;
  	// cmplwi cr6,r29,0
-@@ -17428,6 +17442,7 @@
+@@ -17428,6 +17445,7 @@
  	r11.s64 = -2098069504;
  	// lwz r31,-1940(r11)
  	r31.u64 = PPC_LOAD_U32(r11.u32 + -1940);
@@ -14197,7 +14266,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  loc_82503A70:
  	// lwz r11,556(r31)
  	r11.u64 = PPC_LOAD_U32(r31.u32 + 556);
-@@ -17441,13 +17456,15 @@
+@@ -17441,13 +17459,15 @@
  	ctx.r3.u64 = r31.u64;
  	// mtctr r11
  	ctr.u64 = r11.u64;
@@ -14214,7 +14283,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// bne cr6,0x82503ad8
  	if (!cr6.eq) goto loc_82503AD8;
  	// lis r11,-32253
-@@ -17538,6 +17555,7 @@
+@@ -17538,6 +17558,7 @@
  	// mr. r26,r3
  	r26.u64 = ctx.r3.u64;
  	cr0.compare<int32_t>(r26.s32, 0, xer);
@@ -14222,7 +14291,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// blt 0x82503b20
  	if (cr0.lt) goto loc_82503B20;
  	// lis r11,-31974
-@@ -17557,6 +17575,7 @@
+@@ -17557,6 +17578,7 @@
  	// bl 0x8250f0a0
  	ctx.lr = 0x82503B5C;
  	sub_8250F0A0(ctx, base);
@@ -14230,7 +14299,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// addi r11,r29,52
  	r11.s64 = r29.s64 + 52;
  	// cmpwi cr6,r28,1
-@@ -17587,6 +17606,7 @@
+@@ -17587,6 +17609,7 @@
  	// bl 0x824fe258
  	ctx.lr = 0x82503B94;
  	sub_824FE258(ctx, base);
@@ -14238,7 +14307,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// cmpdi cr6,r3,0
  	cr6.compare<int64_t>(ctx.r3.s64, 0, xer);
  	// bge cr6,0x82503bb0
-@@ -17636,6 +17656,7 @@
+@@ -17636,6 +17659,7 @@
  	// bl 0x824fe258
  	ctx.lr = 0x82503BE8;
  	sub_824FE258(ctx, base);
@@ -14246,7 +14315,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// cmpdi cr6,r3,0
  	cr6.compare<int64_t>(ctx.r3.s64, 0, xer);
  	// bge cr6,0x82503c04
-@@ -17691,6 +17712,7 @@
+@@ -17691,6 +17715,7 @@
  loc_82503C44:
  	// addi r3,r26,1
  	ctx.r3.s64 = r26.s64 + 1;
@@ -14254,7 +14323,17 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  loc_82503C48:
  	// addi r1,r1,432
  	ctx.r1.s64 = ctx.r1.s64 + 432;
-@@ -20852,6 +20874,11 @@
+@@ -19820,7 +19845,8 @@
+ 	ctx.r3.s64 = 1;
+ 	// bl 0x82533af0
+ 	ctx.lr = 0x82504960;
+-	sub_82533AF0(ctx, base);
++	if (lsw_io_wait(base)) ctx.r3.u64 = 0;   // LSW_IOWAKE: wait for the read-ahead flag, not Sleep(1)
++	else sub_82533AF0(ctx, base);
+ loc_82504960:
+ 	// lwz r11,18272(r23)
+ 	r11.u64 = PPC_LOAD_U32(r23.u32 + 18272);
+@@ -20852,6 +20878,11 @@
  	PPCRegister r30{};
  	PPCRegister r31{};
  	uint32_t ea{};
@@ -14266,7 +14345,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// mflr r12
  	r12.u64 = ctx.lr;
  	// bl 0x8250f234
-@@ -21847,6 +21874,7 @@
+@@ -21847,6 +21878,7 @@
  	PPCRegister r30{};
  	PPCRegister r31{};
  	uint32_t ea{};
@@ -14274,7 +14353,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// mflr r12
  	r12.u64 = ctx.lr;
  	// bl 0x8250f210
-@@ -21877,7 +21905,9 @@
+@@ -21877,7 +21909,9 @@
  	r20.u64 = ctx.r3.u64;
  	// bl 0x82503a10
  	ctx.lr = 0x82505630;
@@ -14284,7 +14363,7 @@ diff -ruN --strip-trailing-cr output_locals_raw_folded/ppc_recomp.417.cpp output
  	// li r24,0
  	r24.s64 = 0;
  	// mr. r25,r3
-@@ -21894,6 +21924,7 @@
+@@ -21894,6 +21928,7 @@
  	ctx.r3.u64 = r25.u64;
  	// bl 0x824f73b0
  	ctx.lr = 0x8250564C;

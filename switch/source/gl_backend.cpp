@@ -1613,6 +1613,10 @@ void plan_dead_work(const LswGpuFrame& f, std::vector<uint8_t>& dead) {
         const LswGpuDrawRec& r = f.draws[i];
         if (r.kind == 1 && r.rs_copy_cmd <= 1 && r.rs_dest && dest_dead(r.rs_dest)) { dead[i] = 2; any = true; }
     }
+    // After the decisions: every resolve of this replay counts as "recent" for the next ones (dest_dead), so all
+    // tile resolves of a one-shot copy in this replay get the same answer.
+    for (size_t i = 0; i < n; ++i)
+        if (f.draws[i].kind == 1 && f.draws[i].rs_dest) g_dest_last_resolve[f.draws[i].rs_dest] = g_replays;
     if (!any) return;
     std::unordered_set<uint64_t> depth_read;   // depth targets tested against or resolved this frame
     for (const LswGpuDrawRec& r : f.draws) {
@@ -1765,7 +1769,10 @@ void frame_log(const LswGpuFrame& f, uint64_t replay_ns) {
         for (const auto& rg : kCamRanges)
             for (uint32_t a = rg[0]; a < rg[1]; a += 4) h.push_back(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(g_base + a)));
     }
-    if (turn > 40.0f && auto_shots < 10 && now - last_capture_ns > 20000000000ull) {
+    // Opt-in (LSWTCS_CAMCAPTURE=1): every hub/level entry is a camera cut, and the capture stalls that load by
+    // seconds (Eden hub entry 2026-10-11: 7.8 s replay + 8.2 s swap) and costs the game clock as much.
+    static const bool cam_capture = env_on("LSWTCS_CAMCAPTURE", false);
+    if (cam_capture && turn > 40.0f && auto_shots < 10 && now - last_capture_ns > 20000000000ull) {
         const std::vector<uint32_t>& was = cam_hist[(g_replays + 1) % 16];   // 15 replays ago (oldest kept)
         const std::vector<uint32_t>& is = cam_hist[g_replays % 16];
         char name[48];

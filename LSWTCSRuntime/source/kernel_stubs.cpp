@@ -682,6 +682,19 @@ static int   g_sched_count = 0;           // highest registered id + 1
 static bool  g_sched_runnable[LSW_SCHED_MAX] = {};
 static bool  g_sched_alive[LSW_SCHED_MAX]    = {};
 static std::atomic<int> g_sched_next_id{1};   // 0 reserved for the main thread
+// LSWTCS_SCHEDWAKE1=1 (opt-in): wake only the thread whose turn it is instead of notify_all on one condition variable.
+// Same schedule. Eden hub 2026-10-11: no measurable change (p50 18.2 vs 18.3 ms; most guest threads block in host
+// waits off the rotation, not on this variable), so the broadcast stays the default.
+static std::condition_variable  g_sched_cv_id[LSW_SCHED_MAX];
+static bool sched_wake1() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_SCHEDWAKE1"); return e && e[0] == '1'; }();
+    return on;
+}
+static void sched_wait_turn(std::unique_lock<std::mutex>& lk, int id) {   // caller holds g_sched_mtx via lk
+    if (sched_wake1()) g_sched_cv_id[id].wait(lk, [id] { return g_sched_turn == id; });
+    else g_sched_cv.wait(lk, [id] { return g_sched_turn == id; });
+}
+static void sched_notify_all() { if (!sched_wake1()) g_sched_cv.notify_all(); }   // wake1: sched_turn_set notified
 // ── SCHEDPROF (LSWTCS_SCHEDPROF=1, diagnostic): wall time each scheduler id holds the turn, and
 // time with NO runnable thread (turn == -1, everyone blocked on host waits). Dumped every 5 s.
 static uint32_t g_sp_entry[LSW_SCHED_MAX];           // guest entry of each id (0 = main)
@@ -716,6 +729,7 @@ static void sched_turn_set(int n) {   // caller holds g_sched_mtx
         }
     }
     g_sched_turn = n;
+    if (sched_wake1() && n >= 0 && n < LSW_SCHED_MAX) g_sched_cv_id[n].notify_one();
 }
 
 // ── KPRCB tick registry (LAYOUT-LOTTERY 2nd-stall fix, 2026-06-16) ──────────────────────────────
@@ -744,9 +758,30 @@ static inline void lswtcs_advance_all_kprcb_ticks() {
     for (int i = 0; i < n; i++) PPC_STORE_U32(g_kprcb_list[i] + 88, ticks);
 }
 
+// LSWTCS_AUDIOPRIO (see lswtcs_gil_quantum): the audio chain (the XAudio client workers that run the render-driver
+// callback, and the game's XAudio render thread, guest entry 0x827DB318) gets the turn first whenever one of them is
+// runnable, so a coarser quantum (LSWTCS_QDIV) does not delay audio. Bit per scheduler id, set at thread creation.
+static std::atomic<uint64_t> g_sched_prio_mask{0};
+static void sched_mark_prio(int id) { if (id >= 0 && id < LSW_SCHED_MAX) g_sched_prio_mask.fetch_or(1ull << id); }
+// 1 = chosen first at every handoff AND a waiting audio thread cuts the LSWTCS_QDIV divisor short; 2 = chosen first only.
+static int audioprio_mode() {
+    static const int m = [] { const char* e = getenv("LSWTCS_AUDIOPRIO"); return e ? atoi(e) : 0; }();
+    return m;
+}
+static bool audioprio_on() { return audioprio_mode() != 0; }
+// A priority thread (other than `self`) that is runnable, i.e. waiting for the turn; -1 if none. Racy read is fine.
+static int sched_prio_waiting(int self) {
+    if (!audioprio_on()) return -1;
+    for (uint64_t m = g_sched_prio_mask.load(std::memory_order_relaxed); m; m &= m - 1) {
+        const int p = __builtin_ctzll(m);
+        if (p != self && g_sched_alive[p] && g_sched_runnable[p]) return p;
+    }
+    return -1;
+}
 // next runnable id strictly after 'from' (round-robin); -1 if none runnable anywhere.
 static int sched_next_locked(int from) {
     if (g_sched_count <= 0) return -1;
+    if (const int p = sched_prio_waiting(from); p >= 0) return p;
     for (int i = 1; i <= g_sched_count; i++) {
         int c = (from + i) % g_sched_count;
         if (g_sched_alive[c] && g_sched_runnable[c]) return c;
@@ -783,7 +818,8 @@ static void sampleprof_loop(int mode) {
         ResumeThread(h);
         if (!ok) continue;
         ++hist[(c.Rip & 0xFFFFFFFFFFFFull) | (uint64_t(id) << 48)]; ++samples;
-        if (GetTickCount64() - t_dump > 20000) {
+        static const uint64_t dump_ms = [] { const char* e = getenv("LSWTCS_SAMPLEPROF_DUMPMS"); return e ? strtoull(e, nullptr, 10) : 20000ull; }();
+        if (GetTickCount64() - t_dump > dump_ms) {
             t_dump = GetTickCount64();
             std::vector<std::pair<uint32_t, uint64_t>> v; v.reserve(hist.size());
             for (auto& kv : hist) v.push_back({kv.second, kv.first});
@@ -818,7 +854,7 @@ static void sched_register(int id) {
     if (id >= g_sched_count) g_sched_count = id + 1;
     g_sched_alive[id] = true; g_sched_runnable[id] = true;
     if (g_sched_turn == -1) sched_turn_set(id);         // idle → claim immediately
-    g_sched_cv.wait(lk, [id]{ return g_sched_turn == id; });
+    sched_wait_turn(lk, id);
 }
 // ⭐ DETERMINISM: add a worker's scheduler slot at the GUEST's create/resume point (called by the
 // CREATOR thread, which KEEPS its turn). This makes rotation MEMBERSHIP equal to the guest's create/
@@ -835,13 +871,13 @@ static void sched_add_slot(int id) {
     if (id >= g_sched_count) g_sched_count = id + 1;
     g_sched_alive[id] = true; g_sched_runnable[id] = true;
     if (g_sched_turn == -1) sched_turn_set(id);
-    g_sched_cv.notify_all();
+    sched_notify_all();
 }
 static void sched_leave(int id) {
     if (!gil_on() || id < 0) return;
     std::unique_lock<std::mutex> lk(g_sched_mtx);
     g_sched_alive[id] = false; g_sched_runnable[id] = false;
-    if (g_sched_turn == id) { int n = sched_next_locked(id); sched_turn_set(n); g_sched_cv.notify_all(); }
+    if (g_sched_turn == id) { int n = sched_next_locked(id); sched_turn_set(n); sched_notify_all(); }
 }
 // Pass the turn to the next runnable thread, then wait until it's ours again (stay runnable).
 static void sched_yield_turn() {
@@ -849,8 +885,8 @@ static void sched_yield_turn() {
     std::unique_lock<std::mutex> lk(g_sched_mtx);
     int n = sched_next_locked(id);
     if (n == id || n < 0) return;                        // only us runnable → nothing to do
-    sched_turn_set(n); g_sched_cv.notify_all();
-    g_sched_cv.wait(lk, [id]{ return g_sched_turn == id; });
+    sched_turn_set(n); sched_notify_all();
+    sched_wait_turn(lk, id);
 }
 // RAII for a host-blocking call: mark this thread off the rotation (so the scheduler hands the
 // turn elsewhere while we block on a host primitive), then rejoin + reclaim the turn after.
@@ -860,16 +896,72 @@ struct GilYield {
         if (!gil_on() || id < 0) return; active = true;
         std::unique_lock<std::mutex> lk(g_sched_mtx);
         g_sched_runnable[id] = false;
-        if (g_sched_turn == id) { int n = sched_next_locked(id); sched_turn_set(n); g_sched_cv.notify_all(); }
+        if (g_sched_turn == id) { int n = sched_next_locked(id); sched_turn_set(n); sched_notify_all(); }
     }
     ~GilYield() {
         if (!active) return;
         std::unique_lock<std::mutex> lk(g_sched_mtx);
         g_sched_runnable[id] = true;
         if (g_sched_turn == -1) sched_turn_set(id);
-        g_sched_cv.wait(lk, [this]{ return g_sched_turn == id; });
+        sched_wait_turn(lk, id);
     }
 };
+// LSWTCS_IOWAKE (default on): the game's file loader polls its read-ahead flag [0x83284760] with Sleep(1) per block
+// (sub_825048C8 / sub_824F6F10); the I/O thread (sub_824FD9A8) sets it. Each block cost at least one host sleep
+// (~1.9 ms on Windows) although the read was long done: the PC hub load slept 95 % of the time. The poll sites now
+// call lsw_io_wait (off the rotation, woken by lsw_io_flag_set right after the flag store, 2 ms at most);
+// tools/fix_io_wake.py, marker LSW_IOWAKE. =0: the guest's Sleep(1) as before.
+static std::mutex g_io_mtx;
+static std::condition_variable g_io_cv;
+static bool iowake_on() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_IOWAKE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+extern "C" bool lsw_io_wait(uint8_t* base) {
+    if (!iowake_on()) return false;
+    GilYield y;   // declared first: the lock below is released before the turn is reclaimed
+    auto ready = [base] { return PPC_LOAD_U32(0x83284760u) != 0; };
+    // Up to 2 ms on the steady clock. A condition-variable wait that returns at once without a notify (seen on the
+    // console 2026-10-11: loader/I/O turns of 9/3 us, 73,890 switches in 5 s during a level load) must not hand the
+    // turn back immediately: sleep 100 us instead and look again.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    std::unique_lock<std::mutex> lk(g_io_mtx);
+    while (!ready()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (t0 >= deadline) break;
+        g_io_cv.wait_for(lk, deadline - t0);
+        if (!ready() && std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(50)) {
+            lk.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            lk.lock();
+        }
+    }
+    return true;
+}
+// DIAG (once at boot, [CVTEST] in stdout): how long a 2 ms condition-variable wait without a notify, and a 1 ms
+// sleep, really take on this platform (the console's wall clock is wrong; libstdc++ timed waits may depend on it).
+static void lsw_cv_selftest() {
+    std::mutex m; std::condition_variable cv;
+    char b[256]; int k = snprintf(b, sizeof b, "[CVTEST] cv.wait_for(2ms) took us:");
+    for (int i = 0; i < 5; ++i) {
+        std::unique_lock<std::mutex> lk(m);
+        const auto t0 = std::chrono::steady_clock::now();
+        cv.wait_for(lk, std::chrono::milliseconds(2));
+        k += snprintf(b + k, sizeof b - k, " %lld", (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    k += snprintf(b + k, sizeof b - k, " | sleep_for(1ms) took %lld us", (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t1).count());
+    printf("%s\n", b); fflush(stdout); dbg_ram("%s\n", b);
+}
+extern "C" void lsw_io_flag_set(void) {
+    if (!iowake_on()) return;
+    // sub_824F6E38 also stores 0 there: only a set flag wakes the loader (every futile wake cost two GIL handoffs;
+    // console level load 2026-10-11: 73,890 switches in 5 s, loader/I/O turns of 9/3 us).
+    { uint8_t* base = g_base; if (!base || PPC_LOAD_U32(0x83284760u) == 0) return; }
+    { std::lock_guard<std::mutex> lk(g_io_mtx); }   // a waiter is either before its check or inside wait
+    g_io_cv.notify_all();
+}
 // Host-side blocking call from another TU (gpu_d3d12.cpp GPU fence waits): runs fn off the
 // cooperative rotation so guest threads keep running while the host blocks.
 // LSWTCS_PRESENTYIELD=0 keeps the turn (old behaviour, for A/B).
@@ -983,7 +1075,11 @@ extern "C" void lswtcs_gil_quantum() {
     // woken thread to be sampled at a timing-dependent moment → more deterministic, while still
     // providing eventual liveness for guest spin-waits. Sweep to find determinism/liveness balance.
     { static int qdiv = -1; if (qdiv < 0) { const char* e = getenv("LSWTCS_QDIV"); qdiv = (e ? atoi(e) : 1); if (qdiv < 1) qdiv = 1; }
-      if (qdiv > 1) { static thread_local int qc = 0; if (++qc < qdiv) return; qc = 0; } }
+      if (qdiv > 1) {
+          // With LSWTCS_AUDIOPRIO a runnable audio thread waiting for the turn is never kept waiting by the divisor.
+          const bool prio_waiting = audioprio_mode() == 1 && sched_prio_waiting(g_sched_id) >= 0;
+          static thread_local int qc = 0; if (++qc < qdiv && !prio_waiting) return; qc = 0;
+      } }
     sched_yield_turn();
 }
 
@@ -2214,6 +2310,7 @@ PPC_FUNC(__imp__ExCreateThread) {
         gt->sched_id    = g_sched_next_id++;   // deterministic id (main thread assigns in order)
         gt->entry       = entry;
         if (gt->sched_id >= 0 && gt->sched_id < LSW_SCHED_MAX) g_sp_entry[gt->sched_id] = entry;
+        if (entry == 0x827DB318u) sched_mark_prio(gt->sched_id);   // XAudio render thread (LSWTCS_AUDIOPRIO)
         gt->arg         = arg;
         gt->api_startup = api_startup;
 #ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL  // r2 is a per-function local in locals mode (TOC unused)
@@ -3773,15 +3870,15 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
             dbg_ram("[CAMFIND] swap %llu view rows c4 %.5f %.5f %.5f %.4f | c5 %.5f %.5f %.5f %.4f | c6 %.5f %.5f %.5f %.4f\n",
                     (unsigned long long)g_geom_swaps_pub, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
             auto rd = [](uint32_t va) { uint32_t b = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(g_base + va)); float x; memcpy(&x, &b, 4); return x; };
-            auto near = [](float a, float b) { return std::fabs(a - b) <= 1e-4f * std::max(1.0f, std::fabs(b)); };
+            auto close_to = [](float a, float b) { return std::fabs(a - b) <= 1e-4f * std::max(1.0f, std::fabs(b)); };   // not "near": a Windows macro
             uint32_t hits = 0, low = 0;
             for (uint32_t va = 0x80000000u; va < 0xA0000000u - 64; va += 4) {
                 const float x = rd(va);
                 for (int row = 0; row < 3; ++row) {
                     const float* rr = v + row * 4;
-                    if (!near(x, rr[0]) || std::fabs(rr[0]) < 1e-3f) continue;
-                    const bool as_row = near(rd(va + 4), rr[1]) && near(rd(va + 8), rr[2]);
-                    const bool as_col = row == 0 && near(rd(va + 16), v[4]) && near(rd(va + 32), v[8]);
+                    if (!close_to(x, rr[0]) || std::fabs(rr[0]) < 1e-3f) continue;
+                    const bool as_row = close_to(rd(va + 4), rr[1]) && close_to(rd(va + 8), rr[2]);
+                    const bool as_col = row == 0 && close_to(rd(va + 16), v[4]) && close_to(rd(va + 32), v[8]);
                     if (!as_row && !as_col) continue;
                     if (va < 0x82000000u) { ++low; continue; }   // GPU constant uploads in low physical memory
                     if (++hits <= 60) {
@@ -4130,6 +4227,20 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             // Bit 15 = write_one_reg: every value goes to the SAME register (Xenia
             // WriteOneRegisterFromRing). It was ignored, smearing such writes across `cnt` regs.
             bool one_reg = (hdr >> 15) & 1u;
+            const uint32_t n = std::min<uint32_t>(cnt, dword_count - pos - 1);
+            if (!one_reg && ib_host && reg + n <= 0x6000) {
+                // Fast path (shader constants: thousands of registers a frame): byte-swapped block copy, then the
+                // per-register hooks only where they act (regset_note: 0x2000-0x23FF and 0x4800-0x4805;
+                // pm4_reg_side_effect: 0x578-0x57F). Same result as the loop below, ~1/3 of the walker's samples.
+                const uint32_t* src = ib_host + pos + 1;
+                for (uint32_t i = 0; i < n; i++) g_xe_regs[reg + i] = __builtin_bswap32(src[i]);
+                auto hooks = [&](uint32_t lo, uint32_t hi) {
+                    for (uint32_t r = std::max(reg, lo); r < std::min(reg + n, hi); ++r) {
+                        regset_note(r, g_xe_regs[r]); pm4_reg_side_effect(r, g_xe_regs[r]);
+                    }
+                };
+                hooks(0x578, 0x580); hooks(0x2000, 0x2400); hooks(0x4800, 0x4806);
+            } else
             for (uint32_t i = 0; i < cnt && pos + 1 + i < dword_count; i++) {
                 uint32_t r = one_reg ? reg : reg + i;
                 if (r < 0x6000) { uint32_t v = ib_rd(pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); }
@@ -5073,6 +5184,16 @@ static void pm4_process_ring_flat_impl(bool allow_drain) {
 //
 static std::mutex g_vdswap_mutex;  // serialize concurrent VdSwap calls from worker threads
 
+// LSWTCS_FTFLOOR (default on): game frame time = real time at 60 fps; see the block in VdSwap.
+static bool lsw_ftfloor_on() {
+    static const bool on = [] { const char* e = getenv("LSWTCS_FTFLOOR"); return !(e && e[0] == '0'); }();
+    return on;
+}
+static bool g_ftfloor_k_done = false;
+// The minimum frame time at the game's two clamps (main loop sub_82215AA0, boot intro sub_82264AA8; edits
+// marked LSW_FTFLOOR in the generated code): 1 ms instead of the game's [0x830AA980] (1/60 or 1/30).
+extern "C" double lsw_ft_min(double floor) { return lsw_ftfloor_on() ? 0.001 : floor; }
+
 // DIAG: the game's frame time [0x830AA97C] of the last 120 swaps with the real time between them, printed by
 // lsw_ft_ring_dump() (the Switch capture combo) as [FTRING]. For the mid-level "show the goal" camera that shows its
 // target and then swings off somewhere (Switch 2026-10-09): do long frames (the game caps its delta at 0.1 s,
@@ -5101,6 +5222,35 @@ extern "C" void lsw_ft_ring_dump() {
 
 PPC_FUNC(__imp__VdSwap) {
     PPC_FUNC_PROLOGUE();
+    // DIAG (LSWTCS_SWAPCHAIN=1): the guest call chain of the presenting thread, logged as [SWAPCHAIN] whenever it
+    // differs from the previous swap's (which game state is presenting, e.g. during a load's idle wait). Walks the
+    // back chain: frame SP s -> caller SP [s], return address saved at [caller SP - 8] (stw r12,-8(r1) prologues).
+    {
+        static const bool on = [] { const char* e = getenv("LSWTCS_SWAPCHAIN"); return e && e[0] == '1'; }();
+        if (on) {
+            static uint32_t prev[16]; static int lines = 0; static uint64_t swaps = 0;
+            uint32_t ch[16] = {uint32_t(ctx.lr)}; int n = 1;
+            for (uint32_t s = ctx.r1.u32; n < 16; ++n) {
+                const uint32_t c = (s >= 0x70000000u && s < 0xC0000000u) ? PPC_LOAD_U32(s) : 0;
+                if (c <= s || c >= 0xC0000000u) break;
+                ch[n] = PPC_LOAD_U32(c - 8); s = c;
+            }
+            ++swaps;
+            if (swaps % 30 == 0 && lines < 3000) {   // loading-screen loop sub_8220D680: exit gate, timer, elapsed
+                ++lines;
+                auto f = [&](uint32_t a) { uint32_t v = PPC_LOAD_U32(a); float x; memcpy(&x, &v, 4); return x; };
+                dbg_ram("[SWAPCHAIN] t=%llums swap %llu: gate[82E7E980]=%u timer[82FCC2F0]=%.3f start[82FCC1A0]=%.3f "
+                        "elapsed[82FCC1FC]=%.3f\n", (unsigned long long)GetTickCount64(), (unsigned long long)swaps,
+                        PPC_LOAD_U32(0x82E7E980u), f(0x82FCC2F0u), f(0x82FCC1A0u), f(0x82FCC1FCu));
+            }
+            if (memcmp(ch, prev, sizeof ch) != 0 && lines < 3000) {
+                ++lines; memcpy(prev, ch, sizeof ch);
+                char b[256]; int k = snprintf(b, sizeof b, "[SWAPCHAIN] t=%llums swap %llu:", (unsigned long long)GetTickCount64(), (unsigned long long)swaps);
+                for (int i = 0; i < n && k < 230; ++i) k += snprintf(b + k, sizeof b - k, " %08X", ch[i]);
+                dbg_ram("%s\n", b);
+            }
+        }
+    }
     GilMutexGuard vdswap_lock(g_vdswap_mutex);   // GIL-cooperative (raw lock_guard deadlocks — see GilMutexGuard)
 
     uint32_t buffer_ptr = ctx.r3.u32;  // ring buffer write location
@@ -5508,25 +5658,17 @@ PPC_FUNC(__imp__VdSwap) {
     // Under the GIL the game's own frame measurements jitter by a few ms around 16.7 even though the
     // limiter is exact, so rounding the short frames up (the long ones count in full) made game time
     // run ~10% fast at 60 fps (FTSTAT x1.10; x1.02 at 30 fps). Cutscenes (fpsec x frame time) then
-    // drifted 1-2 s ahead of their real-time audio and were cut off at the end. Set K = 0 and the floor
-    // to 1 ms: game time becomes the sum of measured deltas = real time. LSWTCS_FTFLOOR=0 disables.
+    // drifted 1-2 s ahead of their real-time audio and were cut off at the end. Set K = 0 and lower the
+    // minimum to 1 ms: game time becomes the sum of measured deltas = real time. LSWTCS_FTFLOOR=0 disables.
+    // The minimum is lowered only where the game clamps with it (lsw_ft_min, called from the main loop and
+    // the boot intro, tools/fix_ftfloor_sites.py), NOT by overwriting [0x830AA980] as before 2026-10-11: the
+    // game also uses that word as its nominal frame length (the intro caps a frame at 3x it, which became 3 ms
+    // and stretched the intro to ~55 s; sub_8242F728/FA28 convert frame counts to seconds with it).
     {
-        static int en = -1; static uint32_t floor_bits = 0;
-        if (en < 0) {
-            const char* e = getenv("LSWTCS_FTFLOOR"); en = (e && e[0] == '0') ? 0 : 1;
-            float ft = 0.001f;
-            memcpy(&floor_bits, &ft, 4);
-            if (en) {
-                dbg_ram("[FTFLOOR] frame-timer snap K 0x%08X -> 0\n", PPC_LOAD_U32(0x8203679Cu));
-                PPC_STORE_U32(0x8203679Cu, 0u);
-            }
-        }
-        if (en) {
-            uint32_t cur = PPC_LOAD_U32(0x830AA980u);
-            if (cur == 0x3D088889u /* 1/30 */ || cur == 0x3D23D70Au /* 1/25 */ || cur == 0x3C888889u /* 1/60 */) {
-                PPC_STORE_U32(0x830AA980u, floor_bits);
-                dbg_ram("[FTFLOOR] game min frame time 0x%08X -> 0x%08X\n", cur, floor_bits);
-            }
+        if (lsw_ftfloor_on() && !g_ftfloor_k_done) {
+            g_ftfloor_k_done = true;
+            dbg_ram("[FTFLOOR] frame-timer snap K 0x%08X -> 0\n", PPC_LOAD_U32(0x8203679Cu));
+            PPC_STORE_U32(0x8203679Cu, 0u);
         }
         // [FTSTAT] every ~5 s: game time advanced (sum of the frame time [0x830AA97C] seen at each swap,
         // and the game's own accumulator [0x82FEEAD4]) vs real time and the swap count.
@@ -5568,6 +5710,7 @@ PPC_FUNC(__imp__VdSwap) {
             timeBeginPeriod(1);
 #endif
             s_deadline = clock::now();
+            lsw_cv_selftest();
             dbg_ram("[FPSCAP] frame limiter active: target=%.0f fps (%s)\n",
                    s_target_fps, s_target_fps > 0 ? "locked" : "uncapped");
         }
@@ -6054,6 +6197,7 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient) {
         lswtcs_register_kprcb(pcr + 0x200);
     }
     c.sched_id = g_sched_next_id++;
+    sched_mark_prio(c.sched_id);   // XAudio client worker: first link of the audio chain (LSWTCS_AUDIOPRIO)
     c.host_out = host_audio_open(idx, audio_frame_played);
     if (outp >= 0x80000000u && outp < 0xA0000000u) PPC_STORE_U32(outp, 0x41550000u | (uint32_t)idx);
     dbg_ram("[XAUDIO] RegisterRenderDriverClient idx=%d callback=0x%08X arg=0x%08X handle=0x%08X lr=0x%08X\n",
@@ -6497,12 +6641,39 @@ PPC_FUNC(__imp__KeDelayExecutionThread) {
     // Cooperative delay: hand the turn to other guest threads (deterministic) instead of a host
     // yield/Sleep (host-timed → build-fragile non-determinism). The guest uses this to let workers
     // make progress; the round-robin already gives them turns. (Switch: real sleep on real cores.)
+    // DIAG (LSWTCS_DELAYLOG=1): guest sleeps per caller (lr) every 5 s as [DELAY]: count, requested ms, real ms.
+    static const bool delaylog = [] { const char* e = getenv("LSWTCS_DELAYLOG"); return e && e[0] == '1'; }();
+    const auto d0 = delaylog ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    uint32_t want_ms = 0;
     if (gil_on() && blockwait_on()) {
         uint32_t ms = guest_timeout_ms(base, ctx.r5.u32, 1u);
+        want_ms = ms;
         if (ms == 0) sched_yield_turn();
         else { GilYield y; Sleep(std::min<uint32_t>(ms, 1000u)); }
     } else if (gil_on()) sched_yield_turn();
     else { GilYield y; std::this_thread::yield(); }
+    if (delaylog) {
+        struct Acc { uint64_t n = 0, want = 0; double real = 0; };
+        static std::mutex m;
+        static std::unordered_map<uint32_t, Acc> acc;
+        static auto t0 = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(m);
+        // Through the Sleep wrapper sub_82538950 (frame 112, lr saved at +104) key by the wrapper's caller.
+        uint32_t lr = uint32_t(ctx.lr);
+        if (lr >= 0x82538950u && lr < 0x82538A00u) lr = PPC_LOAD_U32(ctx.r1.u32 + 104);
+        Acc& a = acc[lr];
+        ++a.n; a.want += want_ms; a.real += std::chrono::duration<double, std::milli>(now - d0).count();
+        if (now - t0 > std::chrono::seconds(5)) {
+            t0 = now;
+            char b[1024]; int k = snprintf(b, sizeof b, "[DELAY] 5 s:");
+            for (auto& [l, x] : acc)
+                if (k < 960) k += snprintf(b + k, sizeof b - k, " lr=%08X n=%llu want=%llums real=%.0fms;", l,
+                                           (unsigned long long)x.n, (unsigned long long)x.want, x.real);
+            dbg_ram("%s\n", b);
+            acc.clear();
+        }
+    }
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__MmQueryAllocationSize) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }

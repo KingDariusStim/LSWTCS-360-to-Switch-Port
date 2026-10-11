@@ -290,7 +290,7 @@ static void objlog_install() {
 #define FNLOG_LIST(X) X(821AEFB0) X(8219CE28) X(824D1988) X(824596F8) X(823F1338) X(82134AE0) X(82133800) X(8218FF78) \
     X(824218C0) X(82421E58) X(82423F58) X(82420F78) \
     X(8230CE10) X(8230CF38) X(823C0C20) X(823EFA88) X(823EFE40) X(823F0628) \
-    X(821680C0) X(821F1F00) X(8241AB08) X(82508C20)
+    X(821680C0) X(821F1F00) X(8241AB08) X(82508C20) X(82506A38) X(82357998) X(82358568) X(823CF5B0)
 #define FNLOG_DECL_IMP(A) extern "C" PPC_FUNC(__imp__sub_##A);
 FNLOG_LIST(FNLOG_DECL_IMP)
 static void dbgprint_guest_str(uint8_t* base, uint32_t a, char* out, size_t n);
@@ -322,10 +322,11 @@ static void fnlog_call(uint32_t addr, uint64_t& calls, int& on, PPCFunc* imp, PP
     extern uint64_t g_geom_swaps_pub;
     const uint64_t n = ++calls;
     const bool log = n <= g_fnlog_max || n % 1000 == 0;
-    if (log)
-        printf("[FNLOG] swap %llu sub_%08X #%llu r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X lr=%08X\n",
-               (unsigned long long)g_geom_swaps_pub, addr, (unsigned long long)n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
-               ctx.r6.u32, ctx.r7.u32, uint32_t(ctx.lr));
+    if (log && addr == 0x82506A38u) dbg_ram("[FTIMER] #%llu enter lr=%08X\n", (unsigned long long)n, uint32_t(ctx.lr));
+    else if (log)   // trace.log (dbg_ram): stdout is block-buffered and lost when the process is killed
+        dbg_ram("[FNLOG] t=%llums swap %llu sub_%08X #%llu r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X lr=%08X\n",
+                (unsigned long long)GetTickCount64(), (unsigned long long)g_geom_swaps_pub, addr, (unsigned long long)n,
+                ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, uint32_t(ctx.lr));
     if (log && addr == 0x821AEFB0u && ctx.r6.u32 >= 0x80000000u && ctx.r7.u32 <= 32) {   // script command: argv r6, argc r7
         printf("[FNLOG]   CreateCreatures r8=%08X args:", ctx.r8.u32);
         for (uint32_t i = 0; i < ctx.r7.u32; ++i) {
@@ -385,7 +386,21 @@ static void fnlog_call(uint32_t addr, uint64_t& calls, int& on, PPCFunc* imp, PP
         printf("\n");
     }
     imp(ctx, base);
-    if (log) printf("[FNLOG]   sub_%08X #%llu returned r3=%08X\n", addr, (unsigned long long)n, ctx.r3.u32);
+    if (log && addr == 0x82506A38u) {   // frame timer: returns the frame time in f1; host ms since the previous call
+        // trace.log (dbg_ram), not stdout: stdout is block-buffered and lost when the process is killed.
+        static LARGE_INTEGER qf{}, prev{};
+        LARGE_INTEGER now; if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&now);
+        const double dms = prev.QuadPart ? 1000.0 * double(now.QuadPart - prev.QuadPart) / double(qf.QuadPart) : 0.0;
+        prev = now;
+        uint32_t fixed_bits = PPC_LOAD_U32(0x8327EAA0u), ft_bits = PPC_LOAD_U32(0x830AA97Cu);
+        float fixed, ft; memcpy(&fixed, &fixed_bits, 4); memcpy(&ft, &ft_bits, 4);
+        dbg_ram("[FTIMER] #%llu f1=%.5f host_dt=%.2fms fixed[+64]=%.5f ft[830AA97C]=%.5f\n", (unsigned long long)n,
+                ctx.f1.f64, dms, fixed, ft);
+        return;
+    }
+    if (log) dbg_ram("[FNLOG]   t=%llums sub_%08X #%llu returned r3=%08X\n", (unsigned long long)GetTickCount64(), addr,
+                     (unsigned long long)n, ctx.r3.u32);
 }
 #define FNLOG_DEF(A)                                                                \
     PPC_FUNC(sub_##A) {                                                             \

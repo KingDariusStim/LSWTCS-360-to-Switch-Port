@@ -292,8 +292,13 @@ std::unordered_map<uint32_t, Resolved> g_resolved;
 // whose results no draw samples (Eden capture 2026-10-08). The copy of such a resolve is skipped (its
 // clears still run), and so is a draw whose only output feeds it (plan_dead_work). If a skipped
 // destination is sampled again its resolves resume from the next replay (one stale frame at worst).
-constexpr uint64_t kDeadReplays = 120;
+// Only a destination resolved again within the last kDeadRecent replays (a chain repeated every frame) can be dead:
+// a one-shot copy, e.g. the pause menu's snapshot of the current frame (sampled only after it is written, into a
+// buffer last used long ago), always copies. Without that rule the pause menu showed a stale hub frame mid-level
+// (Eden 2026-10-11).
+constexpr uint64_t kDeadReplays = 120, kDeadRecent = 2;
 std::unordered_map<uint32_t, uint64_t> g_dest_first, g_dest_used;   // replay first resolved / last sampled
+std::unordered_map<uint32_t, uint64_t> g_dest_last_resolve;          // replay of the previous resolve (plan_dead_work)
 void note_dest_used(uint32_t dest) { g_dest_used[dest] = g_replays; }
 bool deadskip_on() {
     static const bool on = [] { const char* e = getenv("LSWTCS_GLDEADSKIP"); return !(e && e[0] == '0'); }();
@@ -303,6 +308,8 @@ bool dest_dead(uint32_t dest) {
     if (!deadskip_on()) return false;
     auto fi = g_dest_first.find(dest);
     if (fi == g_dest_first.end() || g_replays < fi->second + kDeadReplays) return false;
+    auto li = g_dest_last_resolve.find(dest);
+    if (li == g_dest_last_resolve.end() || g_replays > li->second + kDeadRecent) return false;   // not a recurring chain
     auto ui = g_dest_used.find(dest);
     const uint64_t last = ui == g_dest_used.end() ? fi->second : ui->second;
     return g_replays > last + kDeadReplays;
