@@ -225,11 +225,18 @@ void clear_depth_tex(const HostTex& t, float z, int stencil, const int* rect) {
 // 1 = average 2x2 samples (4x MSAA), 2 = average 1x2 (2x MSAA), 3 = one sample (scale sx, sy).
 // Same shader as gpu_xedraw.inc xd_blit. Leaves program / framebuffer / state changed: callers
 // rebind before drawing (g_blit_count).
-uint64_t g_blit_count = 0;
+// Console 2026-10-11 s7: glCopyImageSubData for the plain copies (no draw, no epoch bump) was much SLOWER on nouveau
+// (texture-source blits 1.8 -> 6.5 ms, resolves 2.6 -> 6.3 ms, frame p50 34.2 -> 41.7 ms); removed.
+uint64_t g_blit_count = 0, g_blit_px = 0;
 // swap_rb: exchange red and blue on the way (a resolve with RB_COPY_DEST_INFO.copy_dest_swap).
 void blit(const HostTex& src, const HostTex& dst, int x, int y, int w, int h, int offx, int offy, int mode, int sx, int sy,
           bool swap_rb = false) {
     if (w <= 0 || h <= 0 || !src.tex || !dst.tex) return;
+    struct Stamp {   // DIAG ([GLGPU] texsrc blits): GPU time of a texture-source blit on its own
+        Stamp() { if (g_blit_stamp) gpu_stamp(GK_OTHER); }
+        ~Stamp() { if (g_blit_stamp) gpu_stamp(GK_TEXSRC); }
+    } stamp;
+    g_blit_px += uint64_t(w) * uint64_t(h);
     static GLuint prog = 0;
     static GLint u_off = -1, u_mode = -1, u_swap = -1;
     if (!prog) {

@@ -105,6 +105,10 @@ bool egl_init() {
     // Xenos 0 * anything = 0 by Maxwell's FMZ multiply (switch/mesa/mesa_fmz_edits.py) instead of
     // per-product selects in the GLSL; must match the translator setting in gl_bridge.cc.
     if (env_on("LSWTCS_GLFMZ", true)) setenv("NV50_MUL_ZERO_WINS", "1", 1);
+    // Constant-cache flush only after a buffer write, not after every UBO bind (switch/mesa/mesa_cbflush_edits.py).
+    // Console 2026-10-11 (Negotiations start, 921 MHz): frame p50 34.2 -> 27.9 ms, GPU 33.4 -> ~25.7 ms per frame,
+    // picture and audio fine. LSWTCS_GLCBFLUSH=0 (or NVC0_CB_FLUSH_ON_WRITE=0 in env.txt) restores the old flushes.
+    if (env_on("LSWTCS_GLCBFLUSH", true)) setenv("NVC0_CB_FLUSH_ON_WRITE", "1", 0);
     printf("[GL] eglGetDisplay...\n"); fflush(stdout);
     g_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (g_display == EGL_NO_DISPLAY) { printf("[GL] eglGetDisplay failed\n"); return false; }
@@ -735,7 +739,10 @@ uint64_t g_rp[RP_COUNT];
 // neighbouring draws) and texture-source blits count toward the next draw. Ends with a glFinish, so
 // only the sampled frame is slowed. For the Switch, where the GPU took 60-80 ms per hub frame.
 extern uint64_t g_replays;   // defined with the texture cache below
-enum { GK_START, GK_PLAIN, GK_POINTS, GK_RECTS, GK_QUADS, GK_RESOLVE, GK_PRESENT, GK_N };
+// GK_TEXSRC: blits made for a draw's texture sources (texture_source: sized views, stitched composites), timed on their
+// own since 2026-10-11 s7 (before, they were charged to the next draw: 15 rect draws "cost" 3.9 ms with pixels off).
+// GK_OTHER: GPU time just before such a blit (state setup, nothing drawn).
+enum { GK_START, GK_PLAIN, GK_POINTS, GK_RECTS, GK_QUADS, GK_RESOLVE, GK_PRESENT, GK_TEXSRC, GK_OTHER, GK_N };
 struct GpuStamp { uint8_t kind; GLuint prog; uint64_t ps_key; };
 bool g_gpuprof_frame = false;
 // Timestamp queries on switch-mesa return the GPU timer in ticks that run at 384/625 of real time (the Tegra X1 GPU
@@ -748,7 +755,15 @@ inline GLuint64 gpu_ticks_to_ns(GLuint64 t) { return t / 384 * 625 + t % 384 * 6
 // = pixel cost; pixels-off minus pixels+verts-off = vertex cost; the rest = fixed per-draw cost (state, driver).
 // Hardware 2026-10-09: pixels-off cost ~7 us per plain draw for every program. Those replays' pictures (and resolves,
 // which the scissor also clips) are wrong for one frame. [GLGPU] also reports the vertices (or indices) submitted.
+// Until 2026-10-11 s7 PIXELS OFF bumped g_gl_epoch after every draw, so the next draw re-bound every UBO, texture,
+// sampler and state block: the "fixed cost" it measured included that. Now only the state block is re-applied when it
+// changes (apply_state always enables the scissor test; the 1x1 scissor is set again after it).
+// LSWTCS_GLGPUSPLIT=2: six variants, each on top of the previous one: normal / PIXELS OFF / +VERTS OFF / +UBO FROZEN
+// (no UBO rebinds after the first in a state epoch) / +TEX FROZEN (no texture, swizzle or sampler rebinds) / +STATE
+// FROZEN (no state block changes). Differences = GPU cost of each kind of per-draw change. Pictures wrong for one frame.
 bool g_gpuprof_nopix = false, g_gpuprof_novtx = false;
+bool g_gpuprof_noubo = false, g_gpuprof_notex = false, g_gpuprof_nostate = false;
+bool g_blit_stamp = false;   // blit() stamps itself as GK_TEXSRC (set around texture_source)
 uint64_t g_gpuprof_verts = 0;
 std::vector<GLuint> g_gpq_pool;
 std::vector<GpuStamp> g_gpq_labels;
@@ -782,12 +797,15 @@ void gpu_prof_finish() {
         if (s.prog) { ProgCost& c = by_prog[s.prog]; c.ns += d; ++c.draws; c.ps_key = s.ps_key; }
     }
     const uint64_t total = n > 1 && t[n - 1] > t[0] ? t[n - 1] - t[0] : 0;
+    const char* variant = g_gpuprof_nostate ? " PIXELS+VERTS+UBO+TEX+STATE OFF" : g_gpuprof_notex ? " PIXELS+VERTS+UBO+TEX OFF"
+                        : g_gpuprof_noubo ? " PIXELS+VERTS+UBO OFF" : g_gpuprof_novtx ? " PIXELS+VERTS OFF" : g_gpuprof_nopix ? " PIXELS OFF" : "";
     printf("[GLGPU] replay %llu%s: GPU %.2f ms, %llu verts | plain %.2f (%llu) points %.2f (%llu) rects %.2f (%llu) quads %.2f (%llu) "
-           "resolves %.2f (%llu) present %.2f\n", (unsigned long long)g_replays, g_gpuprof_novtx ? " PIXELS+VERTS OFF" : g_gpuprof_nopix ? " PIXELS OFF" : "",
+           "resolves %.2f (%llu) texsrc blits %.2f (%llu, pre %.2f) present %.2f\n", (unsigned long long)g_replays, variant,
            total / 1e6, (unsigned long long)g_gpuprof_verts,
            by_kind[GK_PLAIN] / 1e6, (unsigned long long)cnt[GK_PLAIN], by_kind[GK_POINTS] / 1e6, (unsigned long long)cnt[GK_POINTS],
            by_kind[GK_RECTS] / 1e6, (unsigned long long)cnt[GK_RECTS], by_kind[GK_QUADS] / 1e6, (unsigned long long)cnt[GK_QUADS],
-           by_kind[GK_RESOLVE] / 1e6, (unsigned long long)cnt[GK_RESOLVE], by_kind[GK_PRESENT] / 1e6);
+           by_kind[GK_RESOLVE] / 1e6, (unsigned long long)cnt[GK_RESOLVE], by_kind[GK_TEXSRC] / 1e6, (unsigned long long)cnt[GK_TEXSRC],
+           by_kind[GK_OTHER] / 1e6, by_kind[GK_PRESENT] / 1e6);
     std::vector<std::pair<GLuint, ProgCost>> top(by_prog.begin(), by_prog.end());
     std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
     for (size_t i = 0; i < top.size() && i < 10; ++i)
@@ -1074,7 +1092,12 @@ void collect_units(const LswGlShader* s, const uint32_t* fetch_all, bool gpurt, 
         if (gpurt && !notex && info && u.dimension <= 1) {
             const HostTex* src = nullptr;
             bool found, rswap = false;
-            { RpScope rp(RP_TEXSRC); found = texture_source(base & 0x1FFFFFFFu, fmt, w, h, src, &rswap); }
+            {
+                RpScope rp(RP_TEXSRC);
+                g_blit_stamp = true;
+                found = texture_source(base & 0x1FFFFFFFu, fmt, w, h, src, &rswap);
+                g_blit_stamp = false;
+            }
             if (found && src && src->tex) {
                 tex = src->tex;
                 map = resolved_swizzle(gswz, fmt, src->fmt, rswap);
@@ -1234,6 +1257,7 @@ struct GlStateCache {
     void bind_ubo(GLuint i, GLuint b, GLintptr off, GLsizeiptr size) {
         Ubo& u = ubo[i];
         if (u.buf == b && u.off == off && u.size == size) return;
+        if (g_gpuprof_noubo && u.buf != ~0u) return;   // DIAG (GLGPUSPLIT=2)
         glBindBufferRange(GL_UNIFORM_BUFFER, i, b, off, size);
         u = {b, off, size};
         ++g_sc_changes[SC_UBO];
@@ -1241,6 +1265,7 @@ struct GlStateCache {
     void bind_unit(GLuint unit, GLenum target, GLuint t, GLuint sampler, bool set_swz, uint32_t s) {
         const int ti = target == GL_TEXTURE_CUBE_MAP ? 1 : target == GL_TEXTURE_3D ? 2 : 0;
         const bool tracked = unit < GLuint(kUnits);
+        if (g_gpuprof_notex && tracked && tex[unit][ti] != ~0u && smp[unit] != ~0u) return;   // DIAG (GLGPUSPLIT=2)
         auto activate = [&] { if (active != GLint(unit)) { glActiveTexture(GL_TEXTURE0 + unit); active = GLint(unit); } };
         if (!tracked || tex[unit][ti] != t) { activate(); glBindTexture(target, t); if (tracked) tex[unit][ti] = t; ++g_sc_changes[SC_TEX]; }
         if (set_swz) {
@@ -1957,11 +1982,14 @@ PresentSrc replay() {
     {   // DIAG (LSWTCS_GLGPUPROF=N): GPU timestamps in every Nth replay (gpu_stamp / gpu_prof_finish)
         static const uint64_t every = [] { const char* e = getenv("LSWTCS_GLGPUPROF"); return uint64_t(e ? atoi(e) : 0); }();
         g_gpuprof_frame = every && (g_replays % every) == 0;
-        static const bool split = env_on("LSWTCS_GLGPUSPLIT", false);
+        static const int split = [] { const char* e = getenv("LSWTCS_GLGPUSPLIT"); return e ? atoi(e) : 0; }();
         static uint64_t samples = 0;
-        const uint64_t kind = g_gpuprof_frame && split ? samples++ % 3 : 0;
-        g_gpuprof_nopix = kind != 0;
-        g_gpuprof_novtx = kind == 2;
+        const uint64_t kind = g_gpuprof_frame && split ? samples++ % (split >= 2 ? 6 : 3) : 0;
+        g_gpuprof_nopix = kind >= 1;
+        g_gpuprof_novtx = kind >= 2;
+        g_gpuprof_noubo = kind >= 3;
+        g_gpuprof_notex = kind >= 4;
+        g_gpuprof_nostate = kind >= 5;
         g_gpuprof_verts = 0;
         gpu_stamp(GK_START);
         span_stamp(SPAN_DRAWS);
@@ -2207,11 +2235,13 @@ PresentSrc replay() {
             memcpy(k.viewport, r.viewport, sizeof k.viewport);
             memcpy(k.scissor, r.scissor, sizeof k.scissor);
             k.dt = dt;
-            if (!g_sc.key_valid || memcmp(&k, &g_sc.key, sizeof k) != 0) {
+            // DIAG (GLGPUSPLIT=2, STATE FROZEN): only after a state-cache reset (a blit, clear or resolve changed GL state)
+            if (!g_sc.key_valid || (!g_gpuprof_nostate && memcmp(&k, &g_sc.key, sizeof k) != 0)) {
                 apply_state(r, dt);
                 ++g_sc_changes[SC_STATE];
                 g_sc.key = k;
                 g_sc.key_valid = true;
+                if (g_gpuprof_nopix) glScissor(0, 0, 1, 1);   // DIAG: PIXELS OFF (stays until the next apply_state)
             }
         }
         if (g_capture_frame) {
@@ -2241,7 +2271,6 @@ PresentSrc replay() {
             // Index source: the arena, or guest memory in shared memory (r.ib_shm, kernel_stubs LSWTCS_IBSHM).
             const GLuint ebo = r.ib_shm ? g_shm : g_arena;
             if (r.ib_count && ebo != ebo_bound) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo); ebo_bound = ebo; }
-            if (g_gpuprof_nopix) { glScissor(0, 0, 1, 1); ++g_gl_epoch; }   // DIAG: the next draw re-sets its scissor
             GLsizei count = GLsizei(r.ib_count ? r.ib_count : r.vertex_count);
             if (g_gpuprof_frame) g_gpuprof_verts += uint64_t(count);
             if (g_gpuprof_novtx) count = std::min<GLsizei>(count, 6);   // DIAG
@@ -3109,9 +3138,12 @@ void render_thread_main() {
                 static uint64_t sc_last[SC_N];
                 double ch[SC_N];
                 for (int k = 0; k < SC_N; ++k) { ch[k] = double(g_sc_changes[k] - sc_last[k]) / n; sc_last[k] = g_sc_changes[k]; }
+                static uint64_t bl_last = 0, px_last = 0;
                 printf("[GLPROF]   changes per replay: program %.0f, fbo %.0f, ubo %.0f, texture %.0f, swizzle %.0f, sampler %.0f, "
-                       "state %.0f, cache resets %.0f\n", ch[SC_PROG], ch[SC_FBO], ch[SC_UBO], ch[SC_TEX], ch[SC_SWZ], ch[SC_SMP],
-                       ch[SC_STATE], ch[SC_RESET]);
+                       "state %.0f, cache resets %.0f | blits %.1f (%.2f Mpx)\n", ch[SC_PROG], ch[SC_FBO], ch[SC_UBO],
+                       ch[SC_TEX], ch[SC_SWZ], ch[SC_SMP], ch[SC_STATE], ch[SC_RESET], double(g_blit_count - bl_last) / n,
+                       double(g_blit_px - px_last) / n / 1e6);
+                bl_last = g_blit_count; px_last = g_blit_px;
                 glsync_report(n);
                 fflush(stdout);
                 t_last = now; replay_ns = 0; max_ns = 0; n = 0;

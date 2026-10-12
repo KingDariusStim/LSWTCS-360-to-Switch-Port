@@ -55,6 +55,54 @@ cost (2.4 and 2.3 shader quality), (3) vertex fetch last (~1.3 ms). The "GPU idl
 WRONG (it came from the unscaled stamps). The pause idea (user): paused frames draw only the menu over a copied frame
 (969470b), so they show the per-frame floor, not what costs GPU time in the level.
 
+**⭐ s7 RUN 3: CB FLUSH FIX = WIN, NOW DEFAULT ON (logs `switch/hwlogs/2026-10-11_console_cbflush/`):** same spot,
+same profiler settings as run 1, `NVC0_CB_FLUSH_ON_WRITE=1`: frame p50 34.2 -> **27.9 ms**, p90 38.2 -> **30.1 ms**;
+GPU per normal frame 33.4 -> ~25.7 ms; render-thread gpuwait 19.2 -> 0.4 ms. User: picture fine (black frames = the
+profiler's PIXELS OFF samples, to confirm in a run without the profiler), audio fine (log idle waits ~37 per interval vs
+12-24 before: the guest is now saturated, scheduler IDLE 28 % -> 0.8 %). The spot is now CPU-bound: render-thread
+replay 17.6 ms (`other` ~10 ms), guest walk+record ~14 ms, main thread 52 %. Default on via `egl_init` (setenv, no
+overwrite; `LSWTCS_GLCBFLUSH=0` to opt out). **Clean console run (default-on build, original env.txt, no profiler; logs
+`switch/hwlogs/2026-10-11_console_cbflush_clean/`): p50/p90/p99 28.5 / 30.5 / 41.1 ms** at 1,800-1,950 draws (was
+34.1 / 38.5 / 48.1 at 921 MHz), gpuwait 0.0, scheduler IDLE 1.3 %. User: no black frames, audio fine (log idle waits
+35-50 per interval vs 15-22 before; not audible). Next: CPU side again (render thread `other` ~10 ms, guest
+walk/record/vhash ~14 ms), then pixel cost (17 ms GPU, the limit again in heavier scenes / cutscenes).
+
+**s7 console runs 1-2 (GLGPUPROF=120, GLGPUSPLIT=2, Negotiations start, 921 MHz; logs
+`switch/hwlogs/2026-10-11_console_split2_copy{0,1}/`), GPU ms, real (tick-scaled):**
+
+| variant | GPU | step cost |
+|---|---|---|
+| normal | 33.4 | |
+| PIXELS OFF | 16.3 | pixel shading ~17.1 |
+| +VERTS OFF | 15.4 | vertices ~0.9 |
+| +UBO FROZEN | ~9.6 | **UBO binds ~5.8 (2,400 per frame, ~2.4 us each)** |
+| +TEX FROZEN | ~9.2 | textures ~0.4 |
+| +STATE FROZEN | ~8.9 | state ~0.3 |
+| floor | 8.9 | resolves 2.6 (34), texsrc blits 1.8 (12), rects 1.5, plain 1.3 (~1.1 us/draw), points+quads+present 1.8 |
+
+Level: 28 blits per frame, 11.8 Mpx. Run 2 (`GLCOPYIMG=1`): LOSS (texsrc 1.8 -> 6.5, resolves 2.6 -> 6.3, frame p50
+34.2 -> 41.7 ms): nouveau's glCopyImageSubData is slow; code removed. **UBO-bind cause found in nouveau:**
+`nvc0_constbufs_validate` sets `cb_dirty` ("Force cache flush for UBO") on every buffer UBO bind, and `nvc0_draw_vbo`
+then emits `MEM_BARRIER 0x1011` (waits for prior work) -> a barrier on almost every draw. Fix:
+`switch/mesa/mesa_cbflush_edits.py` (in build_mesa.sh), opt-in `NVC0_CB_FLUSH_ON_WRITE=1` in env.txt: flush on a bind
+only if a buffer may have been written since the last flush (transfer_map WRITE, buffer copy, user upload,
+invalidate, clear_buffer) or the buffer is persistent. Eden hub OK (Eden does not model the constant cache: console
+must check the picture). Run 3 = same profiler settings + `NVC0_CB_FLUSH_ON_WRITE=1`.
+
+**s7 later: profiler flaw + texture-source copies (uncommitted build, Eden-checked):**
+- The PIXELS OFF variant bumped `g_gl_epoch` after every draw, so every following draw re-bound all UBOs, textures,
+  samplers and state: the "fixed ~17 ms" above is inflated by that, and pixel cost understated. Fixed (only the state
+  block is re-applied; the 1x1 scissor is set again after it). `LSWTCS_GLGPUSPLIT=2` adds +UBO FROZEN / +TEX FROZEN /
+  +STATE FROZEN variants to price each kind of per-draw change. Texture-source blits are now their own `[GLGPU]`
+  item ("texsrc blits", with "pre" = GPU time just before them), no longer charged to the next draw.
+- Blits are shader draws and each bumps `g_gl_epoch` (next draw re-binds everything). Eden hub: 21 blits per frame,
+  7.8 Mpx (~8.5 full screens). `LSWTCS_GLCOPYIMG=1` (default OFF until a console A/B): plain copies (mode 0, same
+  format, no swap, in bounds) use `glCopyImageSubData` instead, no epoch bump. Eden hub: 17 of 21 blits become copies,
+  cache resets 7 -> 5 per frame, ubo 864 -> 834, program 112 -> 102; hub and pause-menu screenshots unchanged
+  (`switch/hwlogs/2026-10-11_eden_copyimg/`). `[GLPROF]` changes line now prints blits / copies / Mpx per replay.
+- Planned console runs (Negotiations start, ~60 s each): (1) `GLGPUPROF=120 GLGPUSPLIT=2 GLCOPYIMG=0`; (2) same with
+  `GLCOPYIMG=1`; (3) optional `NV50_PROG_USE_NIR=1` (shader compiler A/B for pixel cost, env-only).
+
 **CONSOLE RESULT 2026-10-11 (s7; official charger, GPU 921 MHz; build 9fa9965; logs
 `switch/hwlogs/2026-10-11_console_gpuprof/`), standing at the Negotiations start (1,138-1,140 plain / 72 points /
 15 rects / 35 quads / 34 resolves, ~616 k vertices):**
