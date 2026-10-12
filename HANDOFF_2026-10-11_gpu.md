@@ -40,6 +40,66 @@ The tools exist; they have not been run since untiling (2026-10-09) and today's 
 - Run it standing at the same Negotiations spot (~1,870 draws) for 60 s+ so all three variants land on that scene;
   the user reports docked / handheld and clocks.
 
+**⚠️ CORRECTION 2026-10-11 s7 (read first): GPU timestamps on the Switch are in GPU-timer ticks running at 384/625
+of real time, not ns. Multiply every earlier `[GLGPU]` number (including 2026-10-09 and the table below) by 625/384 =
+1.628.** Proof (`LSWTCS_GLGPUSPAN=1` run, logs `switch/hwlogs/2026-10-11_console_gpuspan/`, 921 MHz): paused (27-30
+draws, vsync-locked 16.67 ms) the raw swap-to-swap stamps read 10.2 ms; in the level (frame mean 35.4 / p50 34.1 ms)
+21.0 ms. Both ratios ~1.63. Fixed in `gl_backend.cpp` (`gpu_ticks_to_ns`, applied to [GLGPU] and [GLSPAN]).
+Corrected picture at the Negotiations start: **the GPU is busy the whole ~34 ms frame** (swap-to-swap = draws..present,
+idle gap 0.0 ms, pre-draw and swap ~0): a true GPU limit, which is why GLPIPE gained nothing. Corrected split
+(sampled frames x1.628): total ~33.2 ms = **pixels ~15.0 ms + vertices ~1.3 ms + fixed ~16.9 ms**. Fixed: 1,138 plain
+draws 8.5 ms (~7.5 us each), 15 rects 3.9 ms with a 1x1 scissor (~260 us each; likely the texture-source blits
+charged to the next draw), resolves 2.6 ms, quads 0.85, points 0.65. Top program 46 (322 draws) 2.2-3.7 ms. Re-ranked
+levers: (1) fixed per-draw cost (2.2: UBO binds, state; and find what the 15 rect draws / texsrc blits do), (2) pixel
+cost (2.4 and 2.3 shader quality), (3) vertex fetch last (~1.3 ms). The "GPU idle / feeding-limited" reading below is
+WRONG (it came from the unscaled stamps). The pause idea (user): paused frames draw only the menu over a copied frame
+(969470b), so they show the per-frame floor, not what costs GPU time in the level.
+
+**CONSOLE RESULT 2026-10-11 (s7; official charger, GPU 921 MHz; build 9fa9965; logs
+`switch/hwlogs/2026-10-11_console_gpuprof/`), standing at the Negotiations start (1,138-1,140 plain / 72 points /
+15 rects / 35 quads / 34 resolves, ~616 k vertices):**
+
+| variant (replays) | GPU ms | plain | rects | resolves | points | quads |
+|---|---|---|---|---|---|---|
+| normal (5700, 6600) | 20.5, 20.4 | 11.6 | 4.8 | 2.4 | 0.8 | 0.6 |
+| PIXELS OFF (5100, 6000, 6900) | 11.0, 11.6, 11.0 | 5.7-6.7 | 2.1-2.5 | 1.6 | 0.4 | 0.5 |
+| PIXELS+VERTS OFF (4500, 6300; 5400 = 12.1 outlier) | 10.4, 10.4 | 5.2 | 2.4 | 1.6 | 0.4 | 0.5 |
+
+- Pixel cost ~9.2 ms, **vertex cost only ~0.8 ms** (so 2.1 vertex fetch drops to the bottom), fixed cost ~10.4 ms:
+  plain 4.6 us per draw (5.2 ms), the 15 rects 2.4 ms *with a 1x1 scissor* (~160 us each: probably the texture-source
+  blits that are charged to the next draw), resolves 1.6 ms with pixels clipped.
+- Top programs (normal): 46 (322 draws) 1.4-2.3 ms, 44 (208) 0.9-1.3, 167 (90) 0.4-1.4, 240 / 102 / 193 (1 draw
+  each, full-screen) 0.5-1.4 / 0.6-1.3 / 0.5-0.7, 113 (96) 0.45, 6 (points, 72) 0.4-0.8. No single dominant program.
+- **The GPU is busy only ~20.4 ms of the 34.7 ms frame** (`[GLPROF]` wall 34.7 = replay 15.1 + gpuwait 18.6; frame
+  p50 34.1 / p90 38.5 ms). "gpuwait" is the wait on the previous frame's fence, and with glthread that also includes
+  the glthread worker executing the queued GL calls (driver work), plus any time before nouveau kicks the push buffer.
+  So this spot is limited by **feeding the GPU** (render thread + glthread worker + kick timing), not by GPU
+  throughput. Next tests: `LSWTCS_GLPIPE=1` again (it was judged when the GPU took 38 ms), a glFlush every N draws
+  during replay so the GPU starts sooner, and cutting the driver work per draw (2,440 UBO binds, 2.2 below).
+
+**`LSWTCS_GLPIPE=1` console A/B 2026-10-11 (s7; same spot, same 921 MHz, profiler off; logs
+`switch/hwlogs/2026-10-11_console_glpipe/`): NO GAIN, keep it off.** Frames with 1,800-1,900 draws: p50/p90/p99
+34.6 / 38.7 / 50.7 ms vs 34.1 / 38.5 / 48.1 without it (profiler run, 1 sampled frame in 300). Audio idle waits per
+interval and controls unchanged (user: audio and controls fine). With the pipeline the render thread's replay grew
+to 32.9 ms, almost all `bind` 16.4 + `draw` 5.9 ms = blocked on a full glthread queue, and the worker's fence wait
+was 22.0 ms. Frame times are spread 32-42 ms, not vsync-quantised. So the serial chain is worker -> GPU, and
+overlapping the render thread does not help. That contradicts "GPU busy only 20.4 ms" unless the sampled stamps miss
+GPU work (work before `GK_START`: arena upload, texture uploads / texsrc blits; or the swap). **Next: measure GPU
+busy vs. idle in normal frames** (a timestamp at replay start and after present in every frame, read back a frame
+later, no glFinish; print the GPU span per frame and the gap between frames), before choosing between the
+flush-every-N-draws test and cutting driver work per draw.
+
+**Eden run 2026-10-11 (user asked for Eden instead of the console; logs `switch/hwlogs/2026-10-11_eden_gpuprof/`):**
+same spot (1,866-1,874 draws: 1,138-1,143 plain / 72 points / 15 rects / 35-38 quads / 34 resolves, matching the
+console `[GLDRAW]`), 90 s standing, 2,849 frames. As expected, Eden's GPU timestamps read ~0 (0.07 ms per frame), so
+**no pixel/vertex/fixed split; the console run above is still needed.** Usable numbers: **~616 k vertices per frame**
+(~540 per plain draw), the same in all three variants (the count is taken before the PIXELS+VERTS OFF clamp). Eden
+frame: game_ft p50 31.1 / p90 33.4 ms, replay p50 15.7 ms, `[GLPROF]` upload 5.7-6.3 ms (console 1.3), ubo 2,374 per
+replay. Wall time of the sampled frames (with glFinish) went *up* with work removed (normal 12-20, pixels-off 25-30,
+both-off 32-35 ms): Eden emulates the GPU on the host, so those times say nothing about Maxwell. Route in Eden:
+`hub_to_negotiations.sh` stopped at doors 2/3; door 1 is further west (`s:60`, `w:70`, `nw:50 n:60` opened it), then
+A (Story), START (crawl), START (skip the cutscene) about 25 s later.
+
 Last hardware numbers (2026-10-09, before untiling, `switch/hwlogs/2026-10-09_gpusplit3b/`, sampled scenes differ):
 fixed cost ~7 us per plain draw for every program; one heavy frame with PIXELS OFF still took **39.9 ms with 3,977 draws
 and 1.28 M vertices** (program 53: 12.5 ms over 2,523 draws; program 362: 7.5 ms over only 30 draws; program 259:
@@ -113,6 +173,15 @@ SPIR-V optimisation pass runs. Options:
   `touch .../shot_now`) and CPU-side A/B (`switch/tools/eden_ab.sh`).
 - Build: `switch/build.sh` (GCC -j4; don't run the PC build at the same time). Generated code build steps: recomp
   patch, then `tools/pass_vec_locals.py`, then `tools/pass_arg_locals.py` (accel handoff §1).
+  **Trap (2026-10-11 s7):** after the 9fa9965 commit, `Convert 360/LSWTCS/output` had been put back to the pre-arg-pass
+  state (vector pass applied, arg pass not), so a build came out 110.2 MB instead of 108.6 MB. Check with
+  `python tools/pass_arg_locals.py "Convert 360/LSWTCS/output" --dry-run` (it promotes ~2.09 M refs when not applied)
+  and the NRO size (~108.56 MB) before putting a build on the console.
+- Measurement build (s7, on the SD card as `lswtcs.nro`, 108,558,533 bytes, includes the tick-scale fix):
+  `LSWTCS_GLGPUSPAN=1` ([GLSPAN] per-frame GPU span / idle gap, no glFinish) and `LSWTCS_GLFLUSHN=N` (glFlush every
+  N draws; untested, moot now that the GPU is busy all frame), both off by default. SD env.txt has GLGPUSPAN=1.
+  Parked on SD: `lswtcs_A_9fa9965.nro` (previous playable), `lswtcs_prev_20261011_205034.nro` (GLSPAN build
+  before the tick-scale fix).
 
 ## 4. Commit checklist
 

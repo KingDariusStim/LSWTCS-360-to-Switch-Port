@@ -738,6 +738,11 @@ extern uint64_t g_replays;   // defined with the texture cache below
 enum { GK_START, GK_PLAIN, GK_POINTS, GK_RECTS, GK_QUADS, GK_RESOLVE, GK_PRESENT, GK_N };
 struct GpuStamp { uint8_t kind; GLuint prog; uint64_t ps_key; };
 bool g_gpuprof_frame = false;
+// Timestamp queries on switch-mesa return the GPU timer in ticks that run at 384/625 of real time (the Tegra X1 GPU
+// timer; yuzu/Eden convert with the same 384/625 ratio), not nanoseconds. Console 2026-10-11: the paused game swapped
+// every 16.67 ms (vsync) and the raw stamps read 10.2 ms apart; in a level 34-35 ms frames read 21.0 ms. All [GLGPU]
+// numbers before this fix are 1.63x too small.
+inline GLuint64 gpu_ticks_to_ns(GLuint64 t) { return t / 384 * 625 + t % 384 * 625 / 384; }
 // DIAG (LSWTCS_GLGPUSPLIT=1, with LSWTCS_GLGPUPROF): profiled replays cycle normal / "PIXELS OFF" (every draw with a
 // 1x1 scissor: almost no pixels shaded) / "PIXELS+VERTS OFF" (also at most 6 vertices per draw). Normal minus pixels-off
 // = pixel cost; pixels-off minus pixels+verts-off = vertex cost; the rest = fixed per-draw cost (state, driver).
@@ -765,7 +770,7 @@ void gpu_prof_finish() {
     glFinish();
     const size_t n = g_gpq_labels.size();
     std::vector<GLuint64> t(n);
-    for (size_t i = 0; i < n; ++i) glGetQueryObjectui64v(g_gpq_pool[i], GL_QUERY_RESULT, &t[i]);
+    for (size_t i = 0; i < n; ++i) { glGetQueryObjectui64v(g_gpq_pool[i], GL_QUERY_RESULT, &t[i]); t[i] = gpu_ticks_to_ns(t[i]); }
     uint64_t by_kind[GK_N] = {}, cnt[GK_N] = {};
     struct ProgCost { uint64_t ns = 0; uint32_t draws = 0; uint64_t ps_key = 0; };
     std::unordered_map<GLuint, ProgCost> by_prog;
@@ -790,6 +795,76 @@ void gpu_prof_finish() {
                (unsigned long long)top[i].second.ps_key, top[i].second.ns / 1e6, top[i].second.draws);
     fflush(stdout);
     g_gpq_labels.clear();
+}
+
+// DIAG (LSWTCS_GLGPUSPAN=1): GPU timestamps in EVERY replay (no glFinish): before the replay, where the draws begin
+// (after the arena upload), after the present blit and after the swap. Read back one frame later, right after the
+// render thread's wait on the previous frame's fence, so the results are already there. Printed as [GLSPAN] every
+// 60 frames: where the GPU's time per frame goes, including the idle gap between one frame's swap and the next
+// frame's first command. Not with LSWTCS_GLPIPE (the fence wait runs on the glthread worker there).
+// Console 2026-10-11 (Negotiations start, 921 MHz): swap-to-swap = draws..present = the whole 34 ms frame, idle gap 0:
+// the GPU is busy all frame. Paused (27-30 draws), draws..present also fills the 16.7 ms frame (probably the present blit
+// waiting on the GPU for a free window buffer, i.e. vsync), so paused frames show no idle gap either. (A first version also compared
+// GL_TIMESTAMP read on the CPU: it always read "0 ms behind", a different clock base; removed.)
+enum { SPAN_START, SPAN_DRAWS, SPAN_PRESENT, SPAN_SWAP, SPAN_N };
+bool gpuspan_on() { static const bool on = env_on("LSWTCS_GLGPUSPAN", false); return on; }
+GLuint g_span_q[4][SPAN_N];
+uint64_t g_span_frame = 0;      // replays stamped so far
+void span_stamp(int which) {
+    if (!gpuspan_on()) return;
+    if (!g_span_q[0][0]) glGenQueries(4 * SPAN_N, &g_span_q[0][0]);
+    glQueryCounter(g_span_q[g_span_frame & 3][which], GL_TIMESTAMP);
+}
+void span_begin() { span_stamp(SPAN_START); }
+void span_end() {   // after the swap
+    if (!gpuspan_on()) return;
+    span_stamp(SPAN_SWAP);
+    ++g_span_frame;
+}
+// After the wait on the previous frame's fence (set after its swap): read the previous frame's stamps.
+void span_collect() {
+    if (!gpuspan_on() || g_span_frame < 1) return;
+    const uint64_t fr = g_span_frame - 1;   // the current replay is g_span_frame (started, not swapped yet)
+    GLuint64 t[SPAN_N];
+    for (int k = 0; k < SPAN_N; ++k) {
+        GLint avail = 0;
+        glGetQueryObjectiv(g_span_q[fr & 3][k], GL_QUERY_RESULT_AVAILABLE, &avail);
+        if (!avail) return;
+        glGetQueryObjectui64v(g_span_q[fr & 3][k], GL_QUERY_RESULT, &t[k]);
+        t[k] = gpu_ticks_to_ns(t[k]);
+    }
+    static GLuint64 prev_swap = 0;
+    static std::vector<double> v[5];   // period, pre-draw, draws, swap, idle gap
+    auto ms = [](GLuint64 a, GLuint64 b) { return b > a ? (b - a) / 1e6 : 0.0; };
+    if (prev_swap) {
+        v[0].push_back(ms(prev_swap, t[SPAN_SWAP]));
+        v[4].push_back(ms(prev_swap, t[SPAN_START]));
+    }
+    v[1].push_back(ms(t[SPAN_START], t[SPAN_DRAWS]));
+    v[2].push_back(ms(t[SPAN_DRAWS], t[SPAN_PRESENT]));
+    v[3].push_back(ms(t[SPAN_PRESENT], t[SPAN_SWAP]));
+    prev_swap = t[SPAN_SWAP];
+    if (v[1].size() < 60) return;
+    auto pct = [](std::vector<double>& x, double p) {
+        if (x.empty()) return 0.0;
+        std::sort(x.begin(), x.end());
+        return x[size_t(p * (x.size() - 1))];
+    };
+    double p50[5], p90[5];
+    for (int k = 0; k < 5; ++k) { p50[k] = pct(v[k], .5); p90[k] = pct(v[k], .9); }
+    printf("[GLSPAN] %zu frames, GPU ms p50/p90: swap-to-swap %.1f/%.1f = pre-draw %.2f/%.2f + draws..present %.1f/%.1f + "
+           "swap %.2f/%.2f + idle gap %.1f/%.1f\n",
+           v[1].size(), p50[0], p90[0], p50[1], p90[1], p50[2], p90[2], p50[3], p90[3], p50[4], p90[4]);
+    fflush(stdout);
+    for (auto& x : v) x.clear();
+}
+
+// LSWTCS_GLFLUSHN=N (default 0 = off): glFlush after every Nth draw of a replay, so the driver hands the GPU work
+// during the replay instead of when its push buffer fills or at the frame's fence / swap.
+void maybe_flush_draws() {
+    static const int every = [] { const char* e = getenv("LSWTCS_GLFLUSHN"); return e ? atoi(e) : 0; }();
+    static int n = 0;
+    if (every > 0 && ++n >= every) { n = 0; glFlush(); }
 }
 struct RpScope {
     int k; uint64_t t0;
@@ -1874,7 +1949,7 @@ PresentSrc replay() {
         glClearStencil(0);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
-    if (f.draws.empty()) return present;
+    if (f.draws.empty()) { span_stamp(SPAN_DRAWS); return present; }
     // Arena (constants + indices) -> one buffer, bound as UBO ranges and as the index buffer. A ring of
     // three fixed buffers, reallocated only when a frame needs more: orphaning one buffer every frame
     // (glBufferData) ran Eden out of GPU address space in the hub.
@@ -1889,6 +1964,7 @@ PresentSrc replay() {
         g_gpuprof_novtx = kind == 2;
         g_gpuprof_verts = 0;
         gpu_stamp(GK_START);
+        span_stamp(SPAN_DRAWS);
     }
     const uint64_t t_arena = gp_now();
     // Per-draw system-constant copies with swizzle overrides for resolved textures (2 MB per frame).
@@ -2183,6 +2259,7 @@ PresentSrc replay() {
         }
         ++by_gs[r.gs_type & 3];
         gpu_stamp(uint8_t(GK_PLAIN + (r.gs_type & 3)), prog, ps ? ps->key : 0);
+        maybe_flush_draws();
         static const bool gltest = env_on("LSWTCS_GLTEST", false);
         static bool first_done = false;
         if (gltest && !first_done) {
@@ -2978,6 +3055,7 @@ void render_thread_main() {
             g_pipe_cv.wait(lk, [] { return g_pipe_up_done == g_pipe_up_queued && g_pipe_swap_done + 1 >= g_pipe_swap_queued; });
         }
         const uint64_t t0 = gp_now();
+        if (!g_glpipe) span_begin();
         const PresentSrc shown = replay();
         arena_fence();
         const uint64_t t_replay = gp_now() - t0;
@@ -2998,10 +3076,13 @@ void render_thread_main() {
                 glDeleteSync(prev_frame);
                 prev_frame = nullptr;
             }
+            span_collect();
             { RpScope rp(RP_PRESENT); present_frame(shown); }
             gpu_prof_finish();
+            span_stamp(SPAN_PRESENT);
             bool swapped;
             { RpScope rp(RP_SWAP); swapped = eglSwapBuffers(g_display, g_surface); }   // blocks for vsync
+            span_end();
             if (cap_queue()) prev_frame = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             if (!swapped) ++g_swap_fail;
         }
