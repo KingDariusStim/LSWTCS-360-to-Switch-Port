@@ -727,11 +727,19 @@ GLuint program(const LswGlShader* vs, const LswGlShader* ps, const LswGlShader* 
 // Leaf stages of a replay (ns, render thread only). [GLSTALL] prints the split of one stalled replay,
 // [GLPROF] the average per replay every 60 replays. Draw calls include Mesa's validation, so a new
 // program's backend compile (nouveau compiles at first draw) lands in RP_DRAW.
+// Stages are exclusive since 2026-10-11 s8: a stage nested in another (texsrc inside units inside loop) is counted
+// once, in the innermost stage. Before that, nested stages counted twice, so the old "other" was a lower bound.
+// take = gpu_frame_take, plan = plan_dead_work + plan_untile, units = collect_units outside its texture stages,
+// loop = the draw loop's own work (record walk, untiling copies, residency uploads that are not shm copies),
+// tail = after the loop (present source, last-good copy, [GLDRAW] diagnostics, frame log), fence = arena_fence.
 enum { RP_UPLOAD, RP_SHM, RP_FWAIT, RP_PROGRAM, RP_TEXSRC, RP_TEXKEY, RP_DECODE, RP_TEXUP, RP_SAMPLER, RP_RT, RP_BIND, RP_STATE,
-       RP_DRAW, RP_RESOLVE, RP_PRESENT, RP_SWAP, RP_EVICT, RP_GPUWAIT, RP_PIPE, RP_COUNT };
+       RP_DRAW, RP_RESOLVE, RP_TAKE, RP_PLAN, RP_UNITS, RP_LOOP, RP_TAIL, RP_FENCE,
+       RP_PRESENT, RP_SWAP, RP_EVICT, RP_GPUWAIT, RP_PIPE, RP_COUNT };
 const char* const kRpName[RP_COUNT] = {"upload", "shm", "fwait", "program", "texsrc", "texkey", "decode", "texup", "sampler", "rt",
-                                       "bind", "state", "draw", "resolve", "present", "swap", "evict", "gpuwait", "pipewait"};
+                                       "bind", "state", "draw", "resolve", "take", "plan", "units", "loop", "tail", "fence",
+                                       "present", "swap", "evict", "gpuwait", "pipewait"};
 uint64_t g_rp[RP_COUNT];
+uint64_t g_rp_scoped;   // time inside open stages, inclusive (render thread; racy only with LSWTCS_GLPIPE)
 
 // DIAG (LSWTCS_GLGPUPROF=N): every Nth replay, a GPU timestamp after every draw and resolve (and after the
 // present blit); the GPU time between two timestamps is charged to the later item. Printed as [GLGPU]:
@@ -884,10 +892,16 @@ void maybe_flush_draws() {
     static int n = 0;
     if (every > 0 && ++n >= every) { n = 0; glFlush(); }
 }
+// Closes a stage opened at t0 when g_rp_scoped was in0: adds its time minus the nested stages' time.
+inline void rp_close(int k, uint64_t t0, uint64_t in0) {
+    const uint64_t d = gp_now() - t0, inner = g_rp_scoped - in0;
+    g_rp[k] += d > inner ? d - inner : 0;
+    g_rp_scoped = in0 + d;
+}
 struct RpScope {
-    int k; uint64_t t0;
-    explicit RpScope(int stage) : k(stage), t0(gp_now()) {}
-    ~RpScope() { g_rp[k] += gp_now() - t0; }
+    int k; uint64_t t0, in0;
+    explicit RpScope(int stage) : k(stage), t0(gp_now()), in0(g_rp_scoped) {}
+    ~RpScope() { rp_close(k, t0, in0); }
 };
 
 // Bumped by everything outside the draw path that changes GL state or deletes objects (blits, clears,
@@ -1764,6 +1778,12 @@ void plan_dead_work(const LswGpuFrame& f, std::vector<uint8_t>& dead) {
 // per-draw log; at most once per 20 s, 10 per session), so a run needs no button press at the moment it happens.
 bool g_cam_auto_capture = false;
 uint64_t g_frame_hold_ns = 0;   // this replay's wait for program builds (wait_frame_programs)
+// LSWTCS_GLDIAG=0: no periodic render diagnostics ([GLPROF] / [CPULOAD] every 60 replays, the [GLPROG] / [GLDRAW]
+// block every 120, whose repeat scan over all draws cost ~1 ms per replay on average on the Switch). For play builds.
+bool gldiag_on() {
+    static const bool on = env_on("LSWTCS_GLDIAG", true);
+    return on;
+}
 bool framelog_on() {
     static const bool on = env_on("LSWTCS_FRAMELOG", true);
     return on;
@@ -1909,7 +1929,7 @@ void frame_log(const LswGpuFrame& f, uint64_t replay_ns) {
 }
 
 PresentSrc replay() {
-    gpu_frame_take();
+    { RpScope rp(RP_TAKE); gpu_frame_take(); }
     LswGpuFrame& f = g_gpu_frame_render;   // replayed again if no newer frame was published
     ++g_replays;
     ++g_gl_epoch;   // present / capture / clears changed state since the last replay
@@ -1994,7 +2014,7 @@ PresentSrc replay() {
         gpu_stamp(GK_START);
         span_stamp(SPAN_DRAWS);
     }
-    const uint64_t t_arena = gp_now();
+    const uint64_t t_arena = gp_now(), t_arena_in = g_rp_scoped;
     // Per-draw system-constant copies with swizzle overrides for resolved textures (2 MB per frame).
     static GLuint patch_ring[3] = {};
     constexpr GLsizeiptr kPatchCap = GLsizeiptr(2) << 20;
@@ -2006,7 +2026,7 @@ PresentSrc replay() {
     const GLuint patch_buf = patch_ring[g_ring_i];
     GLintptr patch_off = 0;
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_shm);
-    g_rp[RP_UPLOAD] += gp_now() - t_arena;
+    rp_close(RP_UPLOAD, t_arena, t_arena_in);
     uint32_t copies = 0;
     // Shared-memory ranges: GPU copies out of the arena buffer, which already holds their bytes
     // (LSWTCS_GLSHMCOPY=0: glBufferSubData). A CPU write into the 512 MB buffer every draw reads makes
@@ -2074,10 +2094,13 @@ PresentSrc replay() {
     uint32_t draw_i = 0;
     uint32_t dead_draws = 0, dead_resolves = 0;
     std::vector<uint8_t> dead;   // per record: 1 = skip the draw, 2 = skip the resolve's copy
+    const uint64_t t_plan = gp_now(), t_plan_in = g_rp_scoped;
     if (gpurt) plan_dead_work(f, dead); else dead.assign(f.draws.size(), 0);
     static UntilePlan ut;
     if (gpurt) plan_untile(f, ut); else { ut.act.assign(f.draws.size(), UT_NONE); ut.clear.assign(f.draws.size(), 0); ut.order.resize(f.draws.size()); for (size_t i = 0; i < f.draws.size(); ++i) ut.order[i] = uint32_t(i); ut.arg.assign(f.draws.size(), 0); ut.arg2.assign(f.draws.size(), 0); }
+    rp_close(RP_PLAN, t_plan, t_plan_in);
     GLuint ebo_bound = g_arena;   // arena_upload bound the arena as the index buffer
+    const uint64_t t_loop = gp_now(), t_loop_in = g_rp_scoped;
     LswGpuDrawRec rmod;   // a record with the untiling changes (scissor extended / resolve rows shifted)
     for (const uint32_t rec_order : ut.order) {
         const size_t rec_i = rec_order;
@@ -2162,11 +2185,14 @@ PresentSrc replay() {
         // 2. Texture sources (may blit composites / views: before any binding).
         const uint32_t* fetch_all = reinterpret_cast<const uint32_t*>(f.arena.data() + r.cb_fetch_off);
         units.clear(); swz.clear(); g_unit_log.clear();
-        collect_units(ps, fetch_all, gpurt, units, swz);
-        collect_units(vs, fetch_all, gpurt, units, swz);
+        {
+            RpScope rp(RP_UNITS);
+            collect_units(ps, fetch_all, gpurt, units, swz);
+            collect_units(vs, fetch_all, gpurt, units, swz);
+        }
         // 3. Render targets (sample space for MSAA surfaces).
         DrawTarget dt;
-        const uint64_t t_rt = gp_now();
+        const uint64_t t_rt = gp_now(), t_rt_in = g_rp_scoped;
         if (gpurt) {
             msaa_scale(r.surf_info, dt.msx, dt.msy);
             const bool color = r.edram_mode == 4 && r.ps_dxbc;
@@ -2186,7 +2212,7 @@ PresentSrc replay() {
                     nrt = i + 1;
                 }
             Rt* drt = rt_depth(r.surf_info, r.depth_info);
-            if (!drt || fail) { g_rp[RP_RT] += gp_now() - t_rt; ++no_rt; continue; }
+            if (!drt || fail) { rp_close(RP_RT, t_rt, t_rt_in); ++no_rt; continue; }
             dt.nrt = nrt; dt.rt_w = drt->t.w; dt.rt_h = kRtH;
             const GLuint fbo = draw_fbo(crts, nrt, drt);
             g_sc.sync();
@@ -2195,9 +2221,9 @@ PresentSrc replay() {
             g_sc.sync();
             g_sc.bind_fbo(g_scene_fbo);
         }
-        g_rp[RP_RT] += gp_now() - t_rt;
+        rp_close(RP_RT, t_rt, t_rt_in);
         // 4. Program, constants, textures, state, draw.
-        const uint64_t t_bind = gp_now();
+        const uint64_t t_bind = gp_now(), t_bind_in = g_rp_scoped;
         g_sc.use_program(prog);
         if (!swz.empty() && !view_swizzle_on()) {   // system constants with the resolved textures' swizzles
             uint8_t sys[kLswGlClipPlaneOffset];
@@ -2217,12 +2243,18 @@ PresentSrc replay() {
             g_sc.bind_ubo(0, g_arena, r.cb_sys_off, kLswGlClipPlaneOffset);
         }
         g_sc.bind_ubo(5, g_arena, r.cb_sys_off + kLswGlClipPlaneOffset, kLswGlClipPlaneSize);
-        g_sc.bind_ubo(1, g_arena, r.cb_vsf_off, std::max<uint32_t>(r.cb_vsf_size, 16));
-        g_sc.bind_ubo(2, g_arena, r.cb_psf_off, std::max<uint32_t>(r.cb_psf_size, 16));
+        // A full 256-entry float block means relative addressing: the record padded it to 512 entries
+        // (kernel_stubs.cpp put_float, LSWTCS_CBPAD) and the shader declares 512 (spirv_shader_translator.cc), so
+        // bind all of it. Bound at 256 entries, skinning's c[a0+112..115] with a0 = 255 read past the range and
+        // flung a vertex of Yoda across the screen (Switch 2026-10-11).
+        static const bool cb_padded = [] { const char* e = getenv("LSWTCS_CBPAD"); return !(e && e[0] == '0'); }();
+        auto float_cb_size = [](uint32_t size) { return cb_padded && size >= 256 * 16 ? 512u * 16 : std::max<uint32_t>(size, 16); };
+        g_sc.bind_ubo(1, g_arena, r.cb_vsf_off, float_cb_size(r.cb_vsf_size));
+        g_sc.bind_ubo(2, g_arena, r.cb_psf_off, float_cb_size(r.cb_psf_size));
         g_sc.bind_ubo(3, g_arena, r.cb_bool_off, 40 * 4);
         g_sc.bind_ubo(4, g_arena, r.cb_fetch_off, 192 * 4);
         for (const UnitBind& u : units) g_sc.bind_unit(u.unit, u.target, u.tex, u.sampler, view_swizzle_on(), u.swz);
-        g_rp[RP_BIND] += gp_now() - t_bind;
+        rp_close(RP_BIND, t_bind, t_bind_in);
         {
             RpScope rp(RP_STATE);
             StateKey k;
@@ -2299,6 +2331,8 @@ PresentSrc replay() {
         }
         ++drawn;
     }
+    rp_close(RP_LOOP, t_loop, t_loop_in);
+    RpScope rp_tail(RP_TAIL);
     // Present source: the resolve target at the frontbuffer address, else colour RT 0 of pitch 1280.
     const char* shown = "scene";
     if (gpurt) {
@@ -2352,7 +2386,7 @@ PresentSrc replay() {
             fflush(stdout);
         }
     }
-    if (g_replays <= 5 || (g_replays % 120) == 0) {
+    if (gldiag_on() && (g_replays <= 5 || (g_replays % 120) == 0)) {
         {
             std::lock_guard<std::mutex> lk(g_prog_mtx);
             printf("[GLPROG] %u compiled (%llu ms of worker time), %u from binary cache, %u binaries written, %u boot-queued, "
@@ -2983,6 +3017,8 @@ extern "C" void _mesa_glthread_init(void* ctx);
 extern "C" void* _mesa_get_dispatch(void* ctx);
 extern "C" void _glapi_set_dispatch(void* table);
 extern "C" void lsw_set_new_thread_core(int core);   // platform_switch.cpp
+extern "C" void lsw_core_load_start();               // platform_switch.cpp: [CPULOAD] samplers
+extern "C" void lsw_core_load(float out[4]);
 // DIAG (LSWTCS_GLSYNCLOG=1, glthread on): GL calls glthread cannot queue make the render thread wait for the worker.
 // switch-mesa's _mesa_glthread_finish_before reports each one (mesa_glthread_edits.py); [GLSYNC] lists the top
 // waits per replay next to [GLPROF]. Only the render context runs glthread, so only the render thread calls this.
@@ -3061,6 +3097,7 @@ void swap_job(void*) {
 
 void render_thread_main() {
     pin_to_core(1, "render thread");
+    lsw_core_load_start();
     g_gl_ok = egl_init();
     if (g_gl_ok) resources_init();
     if (g_gl_ok) program_cache_init();
@@ -3086,7 +3123,7 @@ void render_thread_main() {
         const uint64_t t0 = gp_now();
         if (!g_glpipe) span_begin();
         const PresentSrc shown = replay();
-        arena_fence();
+        { RpScope rp(RP_FENCE); arena_fence(); }
         const uint64_t t_replay = gp_now() - t0;
         g_gpuprof[GP_REPLAY] += t_replay;
         maybe_capture(shown);
@@ -3116,7 +3153,7 @@ void render_thread_main() {
             if (!swapped) ++g_swap_fail;
         }
         frame_done(presented);
-        {   // DIAG: [GLPROF] render-thread stages, average per replay over the last 60
+        if (gldiag_on()) {   // DIAG: [GLPROF] render-thread stages, average per replay over the last 60
             static uint64_t last[RP_COUNT], replay_ns = 0, max_ns = 0, t_last = 0;
             static uint32_t n = 0;
             replay_ns += t_replay;
@@ -3144,6 +3181,10 @@ void render_thread_main() {
                        ch[SC_TEX], ch[SC_SWZ], ch[SC_SMP], ch[SC_STATE], ch[SC_RESET], double(g_blit_count - bl_last) / n,
                        double(g_blit_px - px_last) / n / 1e6);
                 bl_last = g_blit_count; px_last = g_blit_px;
+                float load[4];
+                lsw_core_load(load);
+                printf("[CPULOAD] busy %%: core0 %.0f, core1 %.0f, core2 %.0f, core3 %.0f (-1 = no sampler)\n", load[0], load[1],
+                       load[2], load[3]);
                 glsync_report(n);
                 fflush(stdout);
                 t_last = now; replay_ns = 0; max_ns = 0; n = 0;

@@ -123,6 +123,75 @@ extern "C" void lsw_offcore_end() {
     g_offcore_prev_core = -1;
 }
 
+// DIAG: per-core load ([CPULOAD], printed with [GLPROF]). Horizon reports a core's idle ticks only to a thread running
+// on that core (InfoType_IdleTickCount, sub-id -1 = the caller's core), so one sampler thread per core, at the lowest
+// application priority, reads its core's counter every 100 ms. A sampler only misses its wake-up when its core has no
+// idle time at all, so a missing sample means the core was fully busy. libnx threads with 16 KB stacks: std::thread
+// would get the 8 MB minimum above. Opt-in (LSWTCS_CPULOAD=1): on hardware (2026-10-11 s8) it read core 0 as 66-75 %
+// busy while the guest threads alone used >90 % of it ([SCHEDPROF] cpu=), so its numbers are not trusted yet.
+namespace {
+struct CoreSample { std::atomic<uint32_t> seq{0}; uint64_t idle = 0, tick = 0; };
+CoreSample g_core_sample[4];
+Thread g_core_thread[4];
+bool g_core_thread_ok[4];
+void core_sampler(void* arg) {
+    CoreSample& s = g_core_sample[uintptr_t(arg)];
+    for (;;) {
+        uint64_t idle = 0;
+        if (R_SUCCEEDED(svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, UINT64_MAX))) {
+            const uint64_t tick = armGetSystemTick();
+            s.seq.fetch_add(1, std::memory_order_acq_rel);   // odd: being written
+            s.idle = idle; s.tick = tick;
+            s.seq.fetch_add(1, std::memory_order_acq_rel);
+        }
+        svcSleepThread(100000000);
+    }
+}
+}  // namespace
+extern "C" void lsw_core_load_start() {
+    const char* e = getenv("LSWTCS_CPULOAD");
+    if (!(e && e[0] == '1')) return;
+    for (int c = 0; c < 4; ++c) {
+        const Result rc = threadCreate(&g_core_thread[c], core_sampler, reinterpret_cast<void*>(uintptr_t(c)), nullptr,
+                                       0x4000, 0x3B, c);
+        const Result rs = R_SUCCEEDED(rc) ? threadStart(&g_core_thread[c]) : rc;
+        g_core_thread_ok[c] = R_SUCCEEDED(rs);
+        printf("[CPULOAD] core %d sampler: rc 0x%X / 0x%X\n", c, rc, rs);
+    }
+    fflush(stdout);
+}
+// [SCHEDPROF] cpu= (kernel_stubs.cpp): the calling thread's handle, and a thread's CPU time across all cores.
+extern "C" uint64_t lsw_thread_token() { return threadGetCurHandle(); }
+extern "C" uint64_t lsw_thread_cpu_ns(uint64_t token) {
+    uint64_t ticks = 0;
+    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, Handle(token), UINT64_MAX))) return 0;
+    return armTicksToNs(ticks);
+}
+// Busy % per core since the previous call (one caller: the render thread). -1 = no sampler on that core.
+extern "C" void lsw_core_load(float out[4]) {
+    static uint64_t prev_idle[4], prev_tick[4];
+    for (int c = 0; c < 4; ++c) {
+        out[c] = -1.0f;
+        if (!g_core_thread_ok[c]) continue;
+        CoreSample& s = g_core_sample[c];
+        uint64_t idle, tick;
+        uint32_t q0, q1;
+        do {
+            q0 = s.seq.load(std::memory_order_acquire);
+            idle = s.idle; tick = s.tick;
+            q1 = s.seq.load(std::memory_order_acquire);
+        } while ((q0 & 1) || q0 != q1);
+        if (!tick) continue;
+        if (prev_tick[c] && tick > prev_tick[c]) {
+            const double busy = 1.0 - double(idle - prev_idle[c]) / double(tick - prev_tick[c]);
+            out[c] = float(std::clamp(busy, 0.0, 1.0) * 100.0);
+        } else if (prev_tick[c]) {
+            out[c] = 100.0f;   // no new sample: the sampler never got the core
+        }
+        if (tick > prev_tick[c]) { prev_idle[c] = idle; prev_tick[c] = tick; }
+    }
+}
+
 // C11 thrd_create for Mesa: newlib defines thrd_success = 4, but switch-mesa 20.1's u_thread_create() does
 // `if (ret) return 0;` (assumes thrd_success == 0), so every Mesa worker thread was created and then reported as
 // failed: util_queue_init() returned false -> glthread never enabled, Mesa's other queues (e.g. the shader disk-cache

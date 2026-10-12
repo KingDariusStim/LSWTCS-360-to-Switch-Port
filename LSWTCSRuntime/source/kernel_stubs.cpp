@@ -704,6 +704,12 @@ static uint64_t g_sp_run[LSW_SCHED_MAX + 1];         // same, never reset (per-f
 static uint64_t g_sp_last = 0, g_sp_lastdump = 0, g_sp_switches = 0;
 static int      g_sp_cur = -1;
 static int schedprof_on() { static int v = -1; if (v < 0) { const char* e = getenv("LSWTCS_SCHEDPROF"); v = (e && e[0] == '1') ? 1 : 0; } return v; }
+// CPU time of each id's host thread (cpu=), next to its turn time: a thread that holds the turn while blocked in a host
+// wait shows turn > cpu, and its core sits idle meanwhile (Switch 2026-10-11 s8: core 0 only 66-70 % busy at
+// IDLE ~1 %). Platform hooks: Switch platform_switch.cpp (thread handle + InfoType_ThreadTickCount); elsewhere none.
+extern "C" __attribute__((weak)) uint64_t lsw_thread_token() { return 0; }
+extern "C" __attribute__((weak)) uint64_t lsw_thread_cpu_ns(uint64_t) { return 0; }
+static uint64_t g_sp_token[LSW_SCHED_MAX], g_sp_cpu_last[LSW_SCHED_MAX];
 static void sched_turn_set(int n) {   // caller holds g_sched_mtx
     if (schedprof_on() && n != g_sched_turn) {
         static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
@@ -721,7 +727,15 @@ static void sched_turn_set(int n) {   // caller holds g_sched_mtx
                 double pct = 100.0 * double(g_sp_acc[i]) / tot;
                 double avg_us = g_sp_cnt[i] ? 1e6 * double(g_sp_acc[i]) / double(f.QuadPart) / double(g_sp_cnt[i]) : 0;
                 if (i == LSW_SCHED_MAX) k += snprintf(b + k, sizeof b - k, " IDLE=%.1f%%", pct);
-                else if (pct >= 0.5) k += snprintf(b + k, sizeof b - k, " %d(%08X)=%.1f%%/%.0fus", i, g_sp_entry[i], pct, avg_us);
+                else if (pct >= 0.5) {
+                    k += snprintf(b + k, sizeof b - k, " %d(%08X)=%.1f%%/%.0fus", i, g_sp_entry[i], pct, avg_us);
+                    if (g_sp_token[i]) {
+                        const uint64_t c = lsw_thread_cpu_ns(g_sp_token[i]);   // 0 = not available (Eden: other threads)
+                        if (c && g_sp_cpu_last[i] && c >= g_sp_cpu_last[i])
+                            k += snprintf(b + k, sizeof b - k, " cpu=%.1f%%", 100.0 * double(c - g_sp_cpu_last[i]) / 1e9 * double(f.QuadPart) / tot);
+                        if (c) g_sp_cpu_last[i] = c;
+                    }
+                }
                 g_sp_acc[i] = 0; g_sp_cnt[i] = 0;
             }
             dbg_ram("%s\n", b);
@@ -856,6 +870,7 @@ static void sched_register(int id) {
       if (sp && id < LSW_SCHED_MAX && !g_sp_thread[id])
           g_sp_thread[id] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId()); }
     std::unique_lock<std::mutex> lk(g_sched_mtx);
+    if (id < LSW_SCHED_MAX && schedprof_on()) g_sp_token[id] = lsw_thread_token();
     if (id >= g_sched_count) g_sched_count = id + 1;
     g_sched_alive[id] = true; g_sched_runnable[id] = true;
     if (g_sched_turn == -1) sched_turn_set(id);         // idle → claim immediately
@@ -2935,6 +2950,17 @@ static int g_imlog_left_fwd();
 static int g_pktwin = 0;
 static std::string g_pktwin_buf;     // buffered window; printed only if it ends in a 40-vertex quad list
 static int g_pktwin_arm = 0;         // windows left to capture (file "pktwin_now" in the working dir arms 3)
+// DIAG (LSWTCS_CWLOG=<index count>, e.g. 8055 = Yoda in Kashyyyk): the last packet that wrote each of the VS float
+// constants c48..c63, and at every draw with that many indices the values of c51..c58 with their writers ([CWLOG],
+// trace.log), logged when they change. For LOAD_ALU_CONSTANT the source dwords are re-read at the draw: "src now
+// differs" = the game rewrote the constant memory between the walk's copy and the draw (Yoda spike 2026-10-12: the
+// skinning shader's c53..c55 block arrives shifted by one register in glitched frames).
+struct CwInfo { uint32_t op, src, index, size, ib_pos; };
+static CwInfo g_cw_dw[1024];   // per dword of VS c0..c255 (regs 0x4000..0x43FF); op 0x100 = type-0 write, src = IB dword address
+static bool g_cw_on = false;    // LSWTCS_CWLOG set
+static inline void cw_note(uint32_t reg, uint32_t op, uint32_t src, uint32_t index, uint32_t size, uint32_t pos) {
+    if (g_cw_on && reg >= 0x4000 && reg < 0x4400) g_cw_dw[reg - 0x4000] = {op, src, index, size, pos};
+}
 static inline void regset_note(uint32_t reg, uint32_t val) {
     // DIAG: writes to fetch slot 0 (regs 0x4800-0x4805) while the imlog_now window is open.
     if (reg >= 0x4800 && reg < 0x4806 && g_imlog_left_fwd() > 0) {
@@ -3714,17 +3740,30 @@ static void gpu_shm_invalidate(uint32_t phys) {   // a CP write landed here: reh
     if (!g_shm_pages.empty() && phys < 0x20000000u) g_shm_pages[phys >> kShmPageShift].epoch = 0;
 }
 static void gpu_shm_reset() { for (GpuShmPage& p : g_shm_pages) p.valid = 0; }
+// LSWTCS_SHMLATE=1 (opt-in): a vertex page that changes mid-frame reaches every draw of the frame. The walk
+// reads guest memory when it records a draw, the 360's GPU reads it later: the game rewrites dynamic vertex pages after
+// the IB that uses them was walked (0.5-1.8 pages per frame at Kashyyyk, [GPUPROF] "changed mid-frame"), so the draws
+// recorded before the change may draw older bytes than the 360 would. On a mid-frame change the new bytes are written over this frame's
+// earlier arena copies of the page and uploaded in the frame's prelude, before any draw. Written for the Yoda spike
+// (2026-10-12), which turned out to be out-of-bounds vertex fetches (LSWTCS_VFETCHCLAMP, xenia-canary *_fetch.cc), not
+// this: unmeasured on hardware, so off by default.
+static std::unordered_map<uint32_t, std::vector<uint32_t>> g_shm_copies;   // page -> arena offsets of its copies this frame
+static uint32_t g_shm_copies_frame = 0;
+static bool shm_late_on() { static const bool on = [] { const char* e = getenv("LSWTCS_SHMLATE"); return e && e[0] == '1'; }(); return on; }
 // Appends upload runs for the guest physical range [a, a + sz) to f.ranges.
 static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
     static int always = -1; if (always < 0) { const char* e = getenv("LSWTCS_SHMALWAYS"); always = (e && e[0] == '1') ? 1 : 0; }
     if (g_shm_pages.empty()) g_shm_pages.assign(kShmPages, GpuShmPage{0, 0, 0, 0});
     const uint8_t* phys = g_base + 0x80000000ull;
     uint32_t p0 = a >> kShmPageShift, p1 = (a + sz - 1) >> kShmPageShift, run = UINT32_MAX;
+    const bool late = shm_late_on();
+    if (late && g_shm_copies_frame != g_shm_frame) { g_shm_copies.clear(); g_shm_copies_frame = g_shm_frame; }
     auto flush = [&](uint32_t pend) {
         uint32_t start = run << kShmPageShift, bytes = (pend - run) << kShmPageShift;
         LswGpuRange rg{start, bytes, f.alloc_uninit(bytes, 16)};
         memcpy(f.arena.data() + rg.arena_off, phys + start, bytes);
         f.ranges.push_back(rg);
+        if (late) for (uint32_t q = run; q < pend; ++q) g_shm_copies[q].push_back(rg.arena_off + ((q - run) << kShmPageShift));
         g_gpuprof[GP_VBYTES] += bytes;
         run = UINT32_MAX;
     };
@@ -3749,7 +3788,18 @@ static void gpu_shm_track(LswGpuFrame& f, uint32_t a, uint32_t sz) {
             const uint8_t* src = phys + (size_t(p) << kShmPageShift);
             uint64_t h = xxh ? XXH3_64bits(src, kShmPageSize) : lsw_hash_bytes(src, kShmPageSize);
             ++g_gpuprof[GP_N_PAGEHASH];
-            if (pg.frame == g_shm_frame) { ++g_gpuprof[GP_N_REHASH]; if (pg.valid && pg.hash != h) { ++g_gpuprof[GP_N_MIDCHANGE]; ++g_gpuprof[GP_N_MID_WALK + g_shm_epoch_src]; } }
+            if (pg.frame == g_shm_frame) { ++g_gpuprof[GP_N_REHASH]; if (pg.valid && pg.hash != h) { ++g_gpuprof[GP_N_MIDCHANGE]; ++g_gpuprof[GP_N_MID_WALK + g_shm_epoch_src];
+                if (late) {   // LSWTCS_SHMLATE: the earlier draws of this frame get the new bytes too
+                    std::vector<uint32_t>& copies = g_shm_copies[p];
+                    for (uint32_t off : copies) memcpy(f.arena.data() + off, src, kShmPageSize);
+                    LswGpuRange rg{p << kShmPageShift, kShmPageSize, f.alloc_uninit(kShmPageSize, 16)};
+                    memcpy(f.arena.data() + rg.arena_off, src, kShmPageSize);
+                    f.prelude.push_back(rg);
+                    copies.push_back(rg.arena_off);
+                    static int nl = 0; if (++nl <= 40)
+                        dbg_ram("[SHMLATE] page %08X changed mid-frame (epoch source %d): %zu earlier copies patched + prelude upload\n",
+                                p << kShmPageShift, g_shm_epoch_src, copies.size() - 1);
+                } } }
             const bool changed = !pg.valid || pg.hash != h;
             if (changed) pg.stable = 0;
             else if (pg.frame != g_shm_frame && pg.stable < kShmStableFrames) ++pg.stable;
@@ -4030,6 +4080,55 @@ static bool gpu_record_draw_impl(uint32_t initiator, uint32_t dma_base, uint32_t
     static const bool recprof = [] { const char* e = getenv("LSWTCS_PREPPROF"); return e && e[0] == '1'; }();
     static uint64_t rp_consts = 0, rp_tail = 0, rp_n = 0;
     uint64_t rp0 = recprof ? gp_now() : 0;
+    {   // DIAG LSWTCS_CWLOG=<index count> (see cw_note): every draw with that many indices goes into a ring (the last
+        // ~3 s: all 256 VS float constants with the packet that wrote each, the vertex fetch constant, a hash of the vertex
+        // stream); F12 (RenderDoc's capture key, PC) writes the ring to cwdump_<n>.txt: the first record in full, then
+        // per record only the registers that changed since the previous record of the same draw slot.
+        static const uint32_t cw_n = [] { const char* e = getenv("LSWTCS_CWLOG"); return e ? uint32_t(atoi(e)) : 0u; }();
+        g_cw_on = cw_n != 0;
+        if (cw_n && (initiator >> 16) == cw_n) {
+            struct CwRec { uint32_t frame, draw, vs, slot; uint64_t t, vh; uint32_t fetch[4]; uint32_t regs[1024]; CwInfo w[1024]; };
+            static std::vector<CwRec> ring(1600);   // ~25 KB each: ~40 MB, about 3 s of Yoda draws
+            static size_t head = 0, filled = 0;
+            static uint32_t slot_frame = ~0u, slot = 0;
+            if (slot_frame != g_shm_frame) { slot_frame = g_shm_frame; slot = 0; } else ++slot;
+            CwRec& c = ring[head]; head = (head + 1) % ring.size(); filled = std::min(filled + 1, ring.size());
+            c.frame = g_shm_frame; c.draw = g_draw_total; c.vs = g_vs_addr; c.slot = slot; c.t = gp_now();
+            memcpy(c.fetch, &g_xe_regs[0x48BC], sizeof c.fetch);
+            memcpy(c.regs, &g_xe_regs[0x4000], sizeof c.regs);
+            memcpy(c.w, g_cw_dw, sizeof c.w);
+            const uint32_t va = c.fetch[2] & ~3u, vsz = std::min<uint32_t>(((c.fetch[3] >> 2) & 0xFFFFFFu) * 4u, 1u << 20);
+            c.vh = (va && va < 0x1FF00000u && vsz) ? XXH3_64bits(g_base + 0x80000000ull + va, vsz) : 0;
+#ifdef _WIN32
+            static bool was_down = false; static uint32_t dumps = 0;
+            const bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+            if (down && !was_down && filled && dumps < 20) {
+                char path[64]; snprintf(path, sizeof path, "cwdump_%u.txt", ++dumps);
+                if (FILE* fp = fopen(path, "w")) {
+                    auto fl = [](uint32_t u) { float x; memcpy(&x, &u, 4); return x; };
+                    std::vector<const CwRec*> prev(64, nullptr);
+                    for (size_t i = 0; i < filled; ++i) {
+                        const CwRec& e = ring[(head + ring.size() - filled + i) % ring.size()];
+                        fprintf(fp, "R frame %u slot %u draw %u t %.3f vs %08X fetch %08X %08X %08X %08X vhash %016llX\n", e.frame, e.slot, e.draw,
+                                e.t / 1e9, e.vs, e.fetch[0], e.fetch[1], e.fetch[2], e.fetch[3], (unsigned long long)e.vh);
+                        const CwRec* pr = e.slot < 64 ? prev[e.slot] : nullptr;
+                        for (uint32_t cr = 0; cr < 256; ++cr) {
+                            const uint32_t* v = &e.regs[cr * 4];
+                            if (pr && !memcmp(v, &pr->regs[cr * 4], 16)) continue;
+                            const CwInfo& wi = e.w[cr * 4];
+                            fprintf(fp, "  c%03u %08X %08X %08X %08X (%g %g %g %g) w op %X src %08X base %X n %u\n", cr, v[0], v[1], v[2], v[3],
+                                    fl(v[0]), fl(v[1]), fl(v[2]), fl(v[3]), wi.op, wi.src, wi.index, wi.size);
+                        }
+                        if (e.slot < 64) prev[e.slot] = &e;
+                    }
+                    fclose(fp);
+                    printf("[CWLOG] F12: %zu records written to %s\n", filled, path); fflush(stdout);
+                }
+            }
+            was_down = down;
+#endif
+        }
+    }
     LswGpuDrawRec& r = f.draws.emplace_back();   // built in place (zeroed once): a local copied in was 2 x 1760 B per draw
     r.kind = 0; r.edram_mode = edram_mode;
     if (g_imlog_left > 0) { printf("[IMLOG]   draw mode=%u prim=%u n=%u vs=0x%08X key=%016llX ps=0x%08X/%u ps_ok=%d pskey=%016llX cmask=0x%X\n", edram_mode, initiator & 0x3F, initiator >> 16,
@@ -4388,6 +4487,9 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 // pm4_reg_side_effect: 0x578-0x57F). Same result as the loop below, ~1/3 of the walker's samples.
                 const uint32_t* src = ib_host + pos + 1;
                 for (uint32_t i = 0; i < n; i++) g_xe_regs[reg + i] = __builtin_bswap32(src[i]);
+                if (g_cw_on && reg < 0x4400 && reg + n > 0x4000)
+                    for (uint32_t r = std::max(reg, 0x4000u); r < std::min(reg + n, 0x4400u); ++r)
+                        cw_note(r, 0x100, phys_addr + (pos + 1 + (r - reg)) * 4, reg, n, pos);
                 auto hooks = [&](uint32_t lo, uint32_t hi) {
                     for (uint32_t r = std::max(reg, lo); r < std::min(reg + n, hi); ++r) {
                         regset_note(r, g_xe_regs[r]); pm4_reg_side_effect(r, g_xe_regs[r]);
@@ -4397,7 +4499,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
             } else
             for (uint32_t i = 0; i < cnt && pos + 1 + i < dword_count; i++) {
                 uint32_t r = one_reg ? reg : reg + i;
-                if (r < 0x6000) { uint32_t v = ib_rd(pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); }
+                if (r < 0x6000) { uint32_t v = ib_rd(pos + 1 + i); g_xe_regs[r] = v; regset_note(r, v); pm4_reg_side_effect(r, v); cw_note(r, 0, 0, r, 1, pos); }
             }
             if (reg < 0x4800 && reg + cnt > 0x4000 && LSW_ENV_SET("LSWTCS_XVS")) {
                 static int m = 0;
@@ -4530,7 +4632,8 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 uint32_t base  = (ctype==0)?0x4000 : (ctype==1)?0x4800 :
                                  (ctype==2)?0x4900 : (ctype==3)?0x4908 : (ctype==4)?0x2000 : 0;
                 if (base) for (uint32_t i = 0; i < body - 1 && pos + 2 + i < dword_count; i++)
-                    if (base + coff + i < 0x6000) { uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[base + coff + i] = v; regset_note(base + coff + i, v); }
+                    if (base + coff + i < 0x6000) { uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[base + coff + i] = v; regset_note(base + coff + i, v);
+                        cw_note(base + coff + i, 0x2D, 0, coff, body - 1, pos); }
             } else if (op == 0x2F && body >= 3) {          // LOAD_ALU_CONSTANT (from memory)
                 // Matches Xenia ExecutePacketType3_LOAD_ALU_CONSTANT. This is how the game
                 // uploads its matrices/fetch constants (15k packets per run, OPHIST); it was
@@ -4551,6 +4654,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                             if (r >= 0x6000) break;
                             uint32_t v = ib_read(src, i);
                             g_xe_regs[r] = v; regset_note(r, v);
+                            cw_note(r, 0x2F, src + i * 4, index, size, pos);
                         }
                     }
                     // XVS diag: every load that covers VS c0..c3 (dwords 0..15) — the matrix.
@@ -4569,7 +4673,7 @@ static void pm4_extract_ib(uint32_t phys_addr, uint32_t dword_count, int depth) 
                 uint32_t index = ib_rd(pos + 1) & 0xFFFFu;   // absolute register index
                 for (uint32_t i = 0; i + 1 < body && pos + 2 + i < dword_count; ++i) {
                     uint32_t r = index + i; if (r >= 0x6000) break;
-                    uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[r] = v; regset_note(r, v);
+                    uint32_t v = ib_rd(pos + 2 + i); g_xe_regs[r] = v; regset_note(r, v); cw_note(r, op, 0, index, body - 1, pos);
                 }
             } else if (op == 0x27 && body >= 2) {          // IM_LOAD (microcode by addr)
                 g_imload27++;
