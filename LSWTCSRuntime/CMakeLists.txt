@@ -138,7 +138,7 @@ target_link_libraries(LSWTCSRuntime PRIVATE
     GameCode
     XenosInterp
     XenosDxbc
-    lsw_xma lsw_avcodec lsw_avutil bcrypt
+    lsw_xma lsw_avcodec lsw_avutil bcrypt ws2_32   # ws2_32: lsw_net_host.cpp
     "${WINSDK_LIB}/d3d12.lib"
     "${WINSDK_LIB}/dxgi.lib"
     "${WINSDK_LIB}/dxguid.lib"

@@ -1515,10 +1515,29 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx) {
 // MmFreePhysicalMemory(type r3, base_address r4) [Xenia xboxkrnl_memory.cc]
 PPC_FUNC(__imp__MmFreePhysicalMemory)       { PPC_FUNC_PROLOGUE(); g_phys_free_block(ctx.r4.u32); }
 PPC_FUNC(__imp__MmQueryAddressProtect)      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__ExAllocatePool)             { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__ExAllocatePoolTypeWithTag)  { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__ExAllocatePoolWithTag)      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__ExFreePool)                 { PPC_FUNC_PROLOGUE(); }
+// Kernel pool (ExAllocatePool[WithTag|TypeWithTag](size r3, tag r4, type r5) / ExFreePool(p r3)). Used by the
+// network library (QNet allocator sub_829CBBD0, tag 'NWNP'); the old stubs returned 0, so hosting a session failed
+// with E_OUTOFMEMORY right after the local join (Switch, 2026-10-15). Blocks come from g_phys_alloc (4 KB granular,
+// freed blocks recycled by size); ExFreePool frees only blocks it handed out. LSWTCS_EXPOOL=0: old stubs.
+static std::mutex g_expool_mtx;
+static std::unordered_set<uint32_t> g_expool_blocks;
+static uint32_t expool_alloc(uint32_t size) {
+    static const bool on = [] { const char* e = getenv("LSWTCS_EXPOOL"); return !(e && e[0] == '0'); }();
+    if (!on || !size || size > 0x01000000u) return 0;
+    uint32_t a = g_phys_alloc(size);
+    if (a) { std::lock_guard<std::mutex> lk(g_expool_mtx); g_expool_blocks.insert(a); }
+    static int n = 0; if (n++ < 16) dbg_ram("[EXPOOL] alloc 0x%X -> 0x%08X\n", size, a);
+    return a;
+}
+PPC_FUNC(__imp__ExAllocatePool)             { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = expool_alloc(ctx.r3.u32); }
+PPC_FUNC(__imp__ExAllocatePoolTypeWithTag)  { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = expool_alloc(ctx.r3.u32); }
+PPC_FUNC(__imp__ExAllocatePoolWithTag)      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = expool_alloc(ctx.r3.u32); }
+PPC_FUNC(__imp__ExFreePool) {
+    PPC_FUNC_PROLOGUE();
+    bool mine;
+    { std::lock_guard<std::mutex> lk(g_expool_mtx); mine = g_expool_blocks.erase(ctx.r3.u32) != 0; }
+    if (mine) g_phys_free_block(ctx.r3.u32);
+}
 
 // ── File I/O ──────────────────────────────────────────────────────────────────
 //
@@ -1985,7 +2004,23 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile) {
     ctx.r3.u32 = 0;
 }
 
-PPC_FUNC(__imp__NtDuplicateObject)          { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
+// Handle out-pointers of the kernel object creators: any guest address the fold maps (0x80000000-0xDFFFFFFF). The
+// old bound 0x94000000 dropped handles written to stacks in the physical views (the main thread's stack is at
+// 0xA111xxxx): the voice engine's CreateEvent read handle 0 and failed, and with it the network library (two-Switch
+// test 2026-10-15). LSWTCS_KOBJOUT=0 restores the old bound.
+static bool kout_ok(uint32_t p) {
+    static const uint32_t hi = [] { const char* e = getenv("LSWTCS_KOBJOUT"); return (e && e[0] == '0') ? 0x94000000u : 0xE0000000u; }();
+    return p >= 0x80000000u && p < hi;
+}
+// NtDuplicateObject(handle r3, out_handle* r4, options r5): the old stub succeeded without writing the new handle.
+// The duplicate is the same handle value (kobj handles are not reference counted; the voice engine duplicates the
+// current-thread pseudo handle). LSWTCS_KOBJOUT=0: old behaviour.
+PPC_FUNC(__imp__NtDuplicateObject) {
+    PPC_FUNC_PROLOGUE();
+    static const bool on = [] { const char* e = getenv("LSWTCS_KOBJOUT"); return !(e && e[0] == '0'); }();
+    if (on && kout_ok(ctx.r4.u32)) PPC_STORE_U32(ctx.r4.u32, ctx.r3.u32);
+    ctx.r3.u32 = 0;
+}
 
 // ── Blocking waits (LSWTCS_BLOCKWAIT, default ON; =0 = old cooperative polling) ─────────────────
 // A guest thread whose wait is not satisfied leaves the scheduler rotation and blocks on the host
@@ -2047,7 +2082,7 @@ PPC_FUNC(__imp__NtCreateEvent) {
     HANDLE h = CreateEvent(nullptr, manual, initial, nullptr);
     if (!h) { ctx.r3.u32 = 0xC0000001u; return; }
     uint32_t id = kobj_new(h);
-    if (ctx.r3.u32 >= 0x80000000u && ctx.r3.u32 < 0x94000000u) PPC_STORE_U32(ctx.r3.u32, id);
+    if (kout_ok(ctx.r3.u32)) PPC_STORE_U32(ctx.r3.u32, id);
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__NtSetEvent) {
@@ -2144,7 +2179,7 @@ PPC_FUNC(__imp__NtCreateSemaphore) {
     HANDLE h = CreateSemaphore(nullptr, init, maxc, nullptr);
     if (!h) { ctx.r3.u32 = 0xC0000001u; return; }
     uint32_t id = kobj_new(h);
-    if (ctx.r3.u32 >= 0x80000000u && ctx.r3.u32 < 0x94000000u) PPC_STORE_U32(ctx.r3.u32, id);
+    if (kout_ok(ctx.r3.u32)) PPC_STORE_U32(ctx.r3.u32, id);
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__NtReleaseSemaphore) {
@@ -2166,7 +2201,7 @@ PPC_FUNC(__imp__NtCreateMutant) {
     HANDLE h = CreateMutex(nullptr, owner ? TRUE : FALSE, nullptr);
     if (!h) { ctx.r3.u32 = 0xC0000001u; return; }
     uint32_t id = kobj_new(h);
-    if (ctx.r3.u32 >= 0x80000000u && ctx.r3.u32 < 0x94000000u) PPC_STORE_U32(ctx.r3.u32, id);
+    if (kout_ok(ctx.r3.u32)) PPC_STORE_U32(ctx.r3.u32, id);
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__NtReleaseMutant) {
@@ -2189,7 +2224,7 @@ PPC_FUNC(__imp__NtCreateTimer) {
     HANDLE h = CreateWaitableTimer(nullptr, ttype != 0, nullptr);
     if (!h) { ctx.r3.u32 = 0xC0000001u; return; }
     uint32_t id = kobj_new(h);
-    if (ctx.r3.u32 >= 0x80000000u && ctx.r3.u32 < 0x94000000u) PPC_STORE_U32(ctx.r3.u32, id);
+    if (kout_ok(ctx.r3.u32)) PPC_STORE_U32(ctx.r3.u32, id);
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__NtSetTimerEx) {
@@ -2394,7 +2429,7 @@ PPC_FUNC(__imp__ExCreateThread) {
     uint32_t flags      = ctx.r9.u32;
 
     uint32_t fake_handle = ++g_fake_handle_counter;
-    if (handle_ptr >= 0x82000000u && handle_ptr < 0x94000000u)
+    if (handle_ptr >= 0x82000000u && kout_ok(handle_ptr))
         PPC_STORE_U32(handle_ptr, fake_handle);
 
     dbg_ram("[ExCreateThread] entry=0x%08X arg=0x%08X apiStartup=0x%08X flags=0x%X -> handle=0x%08X lr=0x%08X\n",
@@ -2537,9 +2572,18 @@ PPC_FUNC(__imp__RtlUnwind)                  { PPC_FUNC_PROLOGUE(); }
 PPC_FUNC(__imp__RtlMultiByteToUnicodeN)     { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 
 // Silent XAM-family stubs log their first 4 calls with lr, so a flow that depends on one shows up.
-#define LSW_XSTUB_LOG() do { static int _xs = 0; if (_xs < 4) { _xs++; dbg_ram("[XSTUB] %s #%d lr=0x%08X r3=0x%X r4=0x%X r5=0x%08X r6=0x%08X\n", __func__, _xs, (uint32_t)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32); } } while (0)
+#define LSW_XSTUB_LOG() do { static int _xs = 0; if (_xs < 4) { _xs++; dbg_ram("[XSTUB] %s #%d lr=0x%08X r3=0x%X r4=0x%X r5=0x%08X r6=0x%08X\n", __func__, _xs, (uint32_t)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32); \
+    if (_xs == 1) { printf("[XSTUB] %s lr=0x%08X r3=0x%X r4=0x%X r5=0x%08X\n", __func__, (uint32_t)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32); fflush(stdout); } } } while (0)
 // ── XAM ───────────────────────────────────────────────────────────────────────
-PPC_FUNC(__imp__XamVoiceCreate)             { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// XamVoiceCreate(unk r3, unk r4, voice* r5): the voice engine calls it when a session is hosted. Online mode
+// answers as Xenia does (no voice device: handle 0, ACCESS_DENIED) instead of success without a handle.
+PPC_FUNC(__imp__XamVoiceCreate) {
+    PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG();
+    static const bool net = [] { const char* e = getenv("LSWTCS_NET"); return e && atoi(e) >= 1; }();
+    if (!net) { ctx.r3.u32 = 0; return; }
+    if (ctx.r5.u32 >= 0x80000000u && ctx.r5.u32 < 0xE0000000u) PPC_STORE_U32(ctx.r5.u32, 0);
+    ctx.r3.u32 = 5;   // ERROR_ACCESS_DENIED
+}
 PPC_FUNC(__imp__XamVoiceClose)              { PPC_FUNC_PROLOGUE(); }
 PPC_FUNC(__imp__XamVoiceSubmitPacket)       { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamVoiceHeadsetPresent)     { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
@@ -2650,23 +2694,7 @@ PPC_FUNC(__imp__XNotifyGetNext) {
     }
     ctx.r3.u32 = 0;
 }
-PPC_FUNC(__imp__XamUserGetSigninState)      {
-    PPC_FUNC_PROLOGUE();
-    // XamUserGetSigninState(dwUserIndex) -> XUSER_SIGNIN_STATE (0=NotSignedIn,
-    // 1=SignedInLocally, 2=SignedInToLive). The old stub returned 0 for everyone, so a
-    // game that gates loading on a signed-in profile would wait at the title forever.
-    // Report user 0 as SignedInLocally so the title can advance to load.
-    uint32_t user = ctx.r3.u32;
-    static std::atomic<uint32_t> s_calls{0}; uint32_t s_n = ++s_calls;
-    if (s_n <= 4 || s_n % 2000 == 0) dbg_ram("[XamSigninState] #%u user=%u -> %u\n", s_n, user, (user==0)?1u:0u);
-    ctx.r3.u32 = (user == 0) ? 1u : 0u;
-}
-PPC_FUNC(__imp__XamUserReadProfileSettings) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamUserCheckPrivilege)      { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamUserAreUsersFriends)     { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamLoaderTerminateTitle)    { PPC_FUNC_PROLOGUE(); printf("[EXIT] XamLoaderTerminateTitle called! lr=0x%08X\n",(uint32_t)ctx.lr); fflush(stdout); exit(0); }
-PPC_FUNC(__imp__XamSessionCreateHandle)     { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamSessionRefObjByHandle)   { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 
 // ── XMsg ──────────────────────────────────────────────────────────────────────
 // XMsgStartIORequest(App r3, Message r4, XOVERLAPPED* r5, Buffer r6, cbBuffer r7).
@@ -2674,6 +2702,10 @@ PPC_FUNC(__imp__XamSessionRefObjByHandle)   { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG
 // result is written into the XOVERLAPPED (+0 result, +4 length, +12 hEvent signaled) later.
 // A title that polls overlapped.result for != ERROR_IO_INCOMPLETE waits FOREVER on the old
 // stub — the prime suspect class for the post-mount frontend park. Complete it inline.
+// Network layer (lsw_net.inc, included at the end of this file): XGI session / XLiveBase messages in online mode.
+static bool lsw_net_xmsg(uint32_t app, uint32_t msg, uint32_t buf, uint32_t len, uint32_t* result);
+static uint64_t lsw_net_user_xuid(uint32_t user);
+static uint32_t xam_ovl_return(uint8_t* base, uint32_t ovl, uint32_t result, uint32_t length);
 static void xmsg_complete_overlapped(uint8_t* base, uint32_t ovl, const char* who) {
     if (ovl < 0x80000000u || ovl >= 0x94000000u) return;
     uint32_t ev = PPC_LOAD_U32(ovl + 12);
@@ -2685,11 +2717,32 @@ static void xmsg_complete_overlapped(uint8_t* base, uint32_t ovl, const char* wh
     static int n = 0; if (n < 12) { n++;
         dbg_ram("[XAM] %s completed ovl=0x%08X (hEvent=0x%08X signaled=%d)\n", who, ovl, ev, (int)signaled); }
 }
+// Guest thread last error (KTHREAD = [PCR r13 + 256], LastWin32ErrorCode at +352; the game's GetLastError is
+// sub_822A3938). XAM's XMsg calls without an overlapped leave their result there, and the SDK wrappers read it:
+// XSessionJoinLocal (sub_829F4080) turned a stale error (183 from a CreateEvent) into FUNCTION_FAILED, so the
+// network library deleted every session it hosted and the game showed "load failed" (Switch, 2026-10-15).
+static void guest_set_last_error(PPCContext& ctx, uint8_t* base, uint32_t err) {
+    const uint32_t pcr = ctx.r13.u32;
+    if (pcr < 0x80000000u || pcr >= 0xE0000000u || PPC_LOAD_U32(pcr + 336) != 0) return;
+    const uint32_t kt = PPC_LOAD_U32(pcr + 256);
+    if (kt >= 0x80000000u && kt < 0xE0000000u) PPC_STORE_U32(kt + 352, err);
+}
 PPC_FUNC(__imp__XMsgStartIORequest) {
     PPC_FUNC_PROLOGUE();
     static int n = 0; if (n < 12) { n++;
         dbg_ram("[XAM] XMsgStartIORequest app=0x%X msg=0x%08X ovl=0x%08X buf=0x%08X len=%u\n",
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32); }
+    if (ctx.r3.u32 == 0xFB && ctx.r5.u32 >= 0x80000000u && ctx.r5.u32 < 0xE0000000u) {   // DIAG: XOVERLAPPED of session calls
+        static int m = 0; if (m++ < 32) { printf("[XMSGOVL] msg=%08X ovl=%08X event=%08X routine=%08X context=%08X lr=%08X\n",
+            ctx.r4.u32, ctx.r5.u32, PPC_LOAD_U32(ctx.r5.u32 + 12), PPC_LOAD_U32(ctx.r5.u32 + 16), PPC_LOAD_U32(ctx.r5.u32 + 20), (uint32_t)ctx.lr); fflush(stdout); }
+    }
+    uint32_t res;
+    if (lsw_net_xmsg(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, &res)) {
+        if (res == 0x001510F0u) res = 0;   // S_LOGON_CONNECTION_ESTABLISHED is a success
+        if (!ctx.r5.u32) guest_set_last_error(ctx, base, res);
+        ctx.r3.u32 = xam_ovl_return(base, ctx.r5.u32, res, 0); return;
+    }
+    if (!ctx.r5.u32) guest_set_last_error(ctx, base, 0);
     xmsg_complete_overlapped(base, ctx.r5.u32, "XMsgStartIORequest");
     ctx.r3.u32 = 0;
 }
@@ -6145,7 +6198,12 @@ PPC_FUNC(__imp__ObReferenceObjectByHandle) {
     ctx.r3.u32 = 0;
 }
 PPC_FUNC(__imp__KeInitializeApc)          { PPC_FUNC_PROLOGUE(); }
-PPC_FUNC(__imp__XMsgInProcessCall)        { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+// XMsgInProcessCall(app r3, message r4, param1 r5, param2 r6): synchronous; param1 is the buffer.
+PPC_FUNC(__imp__XMsgInProcessCall) {
+    PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG();
+    uint32_t res;
+    ctx.r3.u32 = lsw_net_xmsg(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, &res) ? res : 0u;
+}
 PPC_FUNC(__imp__XamGetSystemVersion)      { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 // XGetVideoMode(X_VIDEO_MODE* r3): old stub returned without filling the struct →
 // the game read garbage/zero video mode (0x0, standard 0). Fill 1280x720 NTSC 60Hz
@@ -6188,8 +6246,6 @@ PPC_FUNC(__imp__XeKeysQwNeRsaPrvCrypt)         { PPC_FUNC_PROLOGUE(); ctx.r3.u32
 PPC_FUNC(__imp__vsprintf)                      { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XeCryptRandom)                 { PPC_FUNC_PROLOGUE(); }
 
-PPC_FUNC(__imp__NetDll_XNetStartup)         { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetCleanup)         { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XUsbcamCreate)              { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XUsbcamDestroy)             { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XUsbcamGetConfig)           { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
@@ -6208,86 +6264,6 @@ PPC_FUNC(__imp__XeCryptShaInit)             { PPC_FUNC_PROLOGUE(); }
 PPC_FUNC(__imp__XeCryptShaUpdate)           { PPC_FUNC_PROLOGUE(); }
 PPC_FUNC(__imp__XexGetModuleHandle)         { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XexGetProcedureAddress)     { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetConnect) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetCreateKey) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetDnsLookup) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetDnsRelease) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetConnectStatus) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetInAddrToServer) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetInAddrToString) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetInAddrToXnAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetQosListen) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetQosLookup) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetQosRelease) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetQosServiceLookup) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetRandom) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetRegisterKey) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetServerToInAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetTsAddrToInAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetUnregisterInAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetUnregisterKey) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetXnAddrToInAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetXnAddrToMachineId) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSACleanup) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSAStartup) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetBroadcastVersionStatus) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetDebugXnAddr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetOpt) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetGetTitleXnAddr) {
-    PPC_FUNC_PROLOGUE();
-    // (r3=caller id, r4=XNADDR* out). Returning 0 = XNET_GET_XNADDR_PENDING made the
-    // frontend init poll forever (sub_827D7060 spin). Returning 8 (NONE/offline)
-    // diverted [T]10 boot into a stall — the offline path is the game's rarely-tested
-    // one. Mimic Xenia instead: STATIC (1) with a plausible XNADDR (the game boots to
-    // the title screen with this answer under Xenia). LSWTCS_XNET=0 restores PENDING,
-    // =8 the offline answer, for A/B.
-    static int mode = -1;
-    if (mode < 0) { const char* e = getenv("LSWTCS_XNET"); mode = e ? atoi(e) : 1; }
-    if (mode != 0 && ctx.r4.u32 >= 0x80000000u && ctx.r4.u32 < 0x94000000u) {
-        uint8_t* xn = base + ctx.r4.u32;
-        memset(xn, 0, 36);
-        if (mode == 1) {
-            xn[0] = 192; xn[1] = 168; xn[2] = 1; xn[3] = 100;   // ina = 192.168.1.100
-            static const uint8_t mac[6] = {0x00, 0x22, 0x48, 0x01, 0x02, 0x03};
-            memcpy(xn + 10, mac, 6);                             // abEnet
-        }
-    }
-    ctx.r3.u32 = (mode == 0) ? 0u : (uint32_t)mode;
-}
-PPC_FUNC(__imp__NetDll_XNetQosGetListenStats) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_XNetSetOpt) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_bind) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_closesocket) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_connect) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_getpeername) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_getsockname) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_getsockopt) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_ioctlsocket) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_listen) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_setsockopt) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_shutdown) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_socket) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSACancelOverlappedIO) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSACloseEvent) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSACreateEvent) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSAEventSelect) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSAGetLastError) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSAGetOverlappedResult) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSARecv) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSARecvFrom) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSAResetEvent) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSASend) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSASendTo) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSASetEvent) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_WSASetLastError) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_accept) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_inet_addr) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_recv) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_recvfrom) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_select) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_send) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll_sendto) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__ExRegisterTitleTerminateNotification) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__KeAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[2]; lswtcs_spin_enter(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__KeInitializeSemaphore) {
@@ -6341,8 +6317,6 @@ PPC_FUNC(__imp__KeReleaseSpinLockFromRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin
 PPC_FUNC(__imp__KeTryToAcquireSpinLockAtRaisedIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[5]; lswtcs_spin_enter(); ctx.r3.u32 = 1; }  // always "acquires" under the GIL
 PPC_FUNC(__imp__KfLowerIrql) { PPC_FUNC_PROLOGUE(); ++g_spin_dbg[6]; ctx.r3.u32 = 0; }  // not counted (see KeRaiseIrqlToDpcLevel)
 PPC_FUNC(__imp__MmGetPhysicalAddress) { PPC_FUNC_PROLOGUE(); /* virt == phys in our port */ }
-PPC_FUNC(__imp__NetDll_WSAWaitForMultipleEvents) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__NetDll___WSAFDIsSet) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolume) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XAudioQueryDriverPerformance) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
@@ -6583,6 +6557,17 @@ PPC_FUNC(__imp__XMsgStartIORequestEx) {
     static int n = 0; if (n < 12) { n++;
         dbg_ram("[XAM] XMsgStartIORequestEx app=0x%X msg=0x%08X ovl=0x%08X buf=0x%08X len=%u\n",
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32); }
+    if (ctx.r3.u32 == 0xFB && ctx.r5.u32 >= 0x80000000u && ctx.r5.u32 < 0xE0000000u) {   // DIAG: XOVERLAPPED of session calls
+        static int m = 0; if (m++ < 32) { printf("[XMSGOVL] Ex msg=%08X ovl=%08X event=%08X routine=%08X context=%08X lr=%08X\n",
+            ctx.r4.u32, ctx.r5.u32, PPC_LOAD_U32(ctx.r5.u32 + 12), PPC_LOAD_U32(ctx.r5.u32 + 16), PPC_LOAD_U32(ctx.r5.u32 + 20), (uint32_t)ctx.lr); fflush(stdout); }
+    }
+    uint32_t res;
+    if (lsw_net_xmsg(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, &res)) {
+        if (res == 0x001510F0u) res = 0;   // S_LOGON_CONNECTION_ESTABLISHED is a success
+        if (!ctx.r5.u32) guest_set_last_error(ctx, base, res);
+        ctx.r3.u32 = xam_ovl_return(base, ctx.r5.u32, res, 0); return;
+    }
+    if (!ctx.r5.u32) guest_set_last_error(ctx, base, 0);
     xmsg_complete_overlapped(base, ctx.r5.u32, "XMsgStartIORequestEx");
     ctx.r3.u32 = 0;
 }
@@ -6591,29 +6576,25 @@ PPC_FUNC(__imp__XMsgSystemProcessCall) {
     static int n = 0; if (n < 12) { n++;
         dbg_ram("[XAM] XMsgSystemProcessCall app=0x%X msg=0x%08X buf=0x%08X len=%u\n",
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32); }
-    ctx.r3.u32 = 0;
+    uint32_t res;
+    ctx.r3.u32 = lsw_net_xmsg(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, &res) ? res : 0u;
 }
-PPC_FUNC(__imp__XNetLogonGetMachineID) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XNetLogonGetTitleID) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamAlloc) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamCreateEnumeratorHandle) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamFree) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamGetPrivateEnumStructureFromHandle) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamUserGetMembershipTierFromXUID) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-PPC_FUNC(__imp__XamUserGetOnlineCountryFromXUID) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-// XamUserGetXUID(user r3, type_mask r4, u64* xuid r5) — Xenia xam_user.cc. Only user 0 is
-// signed in (offline profile, Xenia's default XUID).
-PPC_FUNC(__imp__XamUserGetXUID) {
+// XamAlloc(flags r3, size r4, void** out r5) / XamFree(p r3) — Xenia xam_info.cc; same pool as ExAllocatePool.
+PPC_FUNC(__imp__XamAlloc) {
     PPC_FUNC_PROLOGUE();
-    uint32_t user = ctx.r3.u32, p = ctx.r5.u32;
-    static int n = 0; if (n < 4) { n++; dbg_ram("[XAM] XamUserGetXUID user=%u mask=0x%X out=0x%08X lr=0x%08X\n", user, ctx.r4.u32, p, (uint32_t)ctx.lr); }
-    if (!(p >= 0x80000000u && p < 0x94000000u)) { ctx.r3.u32 = 0x80070057u; return; }   // E_INVALIDARG
-    PPC_STORE_U64(p, 0);
-    if (user >= 4) { ctx.r3.u32 = 0x80070057u; return; }
-    if (user != 0) { ctx.r3.u32 = 0x80070525u; return; }                                 // NO_SUCH_USER
-    PPC_STORE_U64(p, 0xB13EBABEBABEBABEull);
+    uint32_t a = expool_alloc(ctx.r4.u32);
+    if (ctx.r5.u32 >= 0x80000000u && ctx.r5.u32 < 0xE0000000u) PPC_STORE_U32(ctx.r5.u32, a);
+    ctx.r3.u32 = a ? 0u : 0x8007000Eu;
+}
+PPC_FUNC(__imp__XamCreateEnumeratorHandle) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__XamFree) {
+    PPC_FUNC_PROLOGUE();
+    bool mine;
+    { std::lock_guard<std::mutex> lk(g_expool_mtx); mine = g_expool_blocks.erase(ctx.r3.u32) != 0; }
+    if (mine) g_phys_free_block(ctx.r3.u32);
     ctx.r3.u32 = 0;
 }
+PPC_FUNC(__imp__XamGetPrivateEnumStructureFromHandle) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamUserWriteProfileSettings) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XexCheckExecutablePrivilege) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__NtResumeThread) {
@@ -6625,7 +6606,6 @@ PPC_FUNC(__imp__NtResumeThread) {
 }
 // ── Saved-game content (Xenia xam_content.cc semantics; storage layout above content_translate) ──
 static const uint32_t kXContentDataSize = 0x134;   // XCONTENT_DATA: device u32, type u32, display_name u16[128], file_name char[42], pad
-static const uint64_t kLswXuid = 0xB13EBABEBABEBABEull;   // = XamUserGetXUID
 static std::string content_base_dir() {
     static const std::string d = [] {
         const char* e = getenv("LSWTCS_SAVEDIR"); std::string r = e ? e : "saves/";
@@ -6809,7 +6789,7 @@ PPC_FUNC(__imp__XamContentGetCreator) {
     else {
         bool save = type == 1;   // saved games are always the user's own
         PPC_STORE_U32(is_p, save ? 1u : 0u);
-        if (xuid_p >= 0x80000000u && xuid_p < 0x94000000u) PPC_STORE_U64(xuid_p, save ? kLswXuid : 0ull);
+        if (xuid_p >= 0x80000000u && xuid_p < 0x94000000u) PPC_STORE_U64(xuid_p, save ? lsw_net_user_xuid(0) : 0ull);
     }
     ctx.r3.u32 = xam_ovl_return(base, ctx.r7.u32, result, 0);
 }
@@ -6889,19 +6869,6 @@ PPC_FUNC(__imp__XamParseGamerTileKey) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ct
 PPC_FUNC(__imp__XamReadTileToTexture) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamUserCreateAchievementEnumerator) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__XamUserCreateStatsEnumerator) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
-// XamUserGetName(user r3, char* buffer r4, buffer_len r5 incl. NUL) — Xenia xam_user.cc.
-PPC_FUNC(__imp__XamUserGetName) {
-    PPC_FUNC_PROLOGUE();
-    uint32_t user = ctx.r3.u32, p = ctx.r4.u32, len = ctx.r5.u32;
-    static int n = 0; if (n < 4) { n++; dbg_ram("[XAM] XamUserGetName user=%u buf=0x%08X len=%u lr=0x%08X\n", user, p, len, (uint32_t)ctx.lr); }
-    bool p_ok = p >= 0x80000000u && p < 0x94000000u;
-    if (user >= 4) { ctx.r3.u32 = 0x00000057u; return; }                      // INVALID_PARAMETER
-    if (user != 0) { if (p_ok) PPC_STORE_U8(p, 0); ctx.r3.u32 = 0x00000525u; return; }
-    const char name[] = "Player";
-    uint32_t n_copy = len < sizeof(name) ? len : (uint32_t)sizeof(name);
-    if (p_ok) for (uint32_t i = 0; i < n_copy; ++i) PPC_STORE_U8(p + i, (uint8_t)name[i]);
-    ctx.r3.u32 = 0;
-}
 PPC_FUNC(__imp__XamWriteGamerTile) { PPC_FUNC_PROLOGUE(); LSW_XSTUB_LOG(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__DbgBreakPoint) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__FscGetCacheElementCount) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
@@ -7464,3 +7431,5 @@ PPC_FUNC(__imp__NtReadFileScatter) {
 PPC_FUNC(__imp__ObCreateSymbolicLink) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 PPC_FUNC(__imp__ObDeleteSymbolicLink) { PPC_FUNC_PROLOGUE(); ctx.r3.u32 = 0; }
 
+// ── Network multiplayer + Switch-account identity (LSWTCS_NET, LSWTCS_SWITCHID) ──
+#include "lsw_net.inc"

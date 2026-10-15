@@ -425,11 +425,237 @@ static void dbgprint_guest_str(uint8_t* base, uint32_t a, char* out, size_t n) {
         }
     out[k] = 0;
 }
+static void guest_printf(uint8_t* base, PPCContext& ctx, const char* tag);
 PPC_FUNC(sub_824541D0) {
     static int on = -1;
     static uint64_t n = 0;
     if (on < 0) { const char* e = getenv("LSWTCS_DBGPRINT"); on = !(e && e[0] == '0'); }
-    if (on && ++n <= 5000) {
+    if (on && ++n <= 5000) guest_printf(base, ctx, "DBGPRINT");
+    __imp__sub_824541D0(ctx, base);
+}
+extern "C" int lsw_qnet_verbose;   // lsw_net.inc: set at the first game packet received
+int lsw_qnet_verbose = 0;
+// DIAG (LSWTCS_QNETLOG, default on): sub_82496F10 is the network session manager's log function (360SessionManager.cpp:
+// "SearchForHosts() called", "Hosting game", "NotifyStateChanged from %s to %s (hr=0x%x)", "Game search 0x%p failed
+// with result %x"), empty in the retail image. Printed as [QNETLOG] lines, first 2000. Added 2026-10-14: on two
+// Switches, hosting and searching sent no network traffic at all.
+extern "C" PPC_FUNC(__imp__sub_82496F10);
+PPC_FUNC(sub_82496F10) {
+    static int on = -1;
+    static uint64_t n = 0;
+    if (on < 0) { const char* e = getenv("LSWTCS_QNETLOG"); on = !(e && e[0] == '0'); }
+    if (on && (++n <= 2000 || (lsw_qnet_verbose && n <= 2000 + 300))) guest_printf(base, ctx, "QNETLOG");
+    __imp__sub_82496F10(ctx, base);
+}
+// Session manager host (sub_82494368) / search (sub_82495358) entry: both return at once when the network user index
+// [0x82F1FC10] is -1, and otherwise call the network library object at this+708 (vtable slot 2 = host, 9 = search).
+extern "C" PPC_FUNC(__imp__sub_82494368);
+extern "C" PPC_FUNC(__imp__sub_82495358);
+static void qnet_entry_log(uint8_t* base, PPCContext& ctx, const char* what) {
+    static int n = 0;
+    if (++n > 64) return;
+    const uint32_t self = ctx.r3.u32, obj = self >= 0x80000000u ? PPC_LOAD_U32(self + 708) : 0;
+    const uint32_t vt = obj >= 0x80000000u ? PPC_LOAD_U32(obj) : 0;
+    printf("[QNET] %s this=%08X r4=%08X r5=%08X user[82F1FC10]=%d lib=%08X vt=%08X host=%08X search=%08X lr=%08X\n", what,
+           self, ctx.r4.u32, ctx.r5.u32, int32_t(PPC_LOAD_U32(0x82F1FC10u)), obj, vt,
+           vt >= 0x80000000u ? PPC_LOAD_U32(vt + 8) : 0, vt >= 0x80000000u ? PPC_LOAD_U32(vt + 36) : 0, uint32_t(ctx.lr));
+    fflush(stdout);
+}
+// Network library creation (called from session manager init sub_82494160 at boot): sub_829BE820(2, this+704,
+// &this->lib) -> allocate 260 bytes (sub_829C08F0), XNotify listener (sub_82536308), init (sub_829B71C0) -> HRESULT.
+// On both Switches (2026-10-14) this->lib stayed null: these log each step's result.
+extern "C" PPC_FUNC(__imp__sub_829BE820);
+extern "C" PPC_FUNC(__imp__sub_829C08F0);
+extern "C" PPC_FUNC(__imp__sub_82536308);
+extern "C" PPC_FUNC(__imp__sub_829B71C0);
+#define QNET_RET_PROBE(A, what)                                                                                     \
+    PPC_FUNC(sub_##A) {                                                                                             \
+        static int n = 0;                                                                                           \
+        const uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32, a5 = ctx.r5.u32, lr = uint32_t(ctx.lr), sp = ctx.r1.u32;     \
+        __imp__sub_##A(ctx, base);                                                                                  \
+        if (ctx.r1.u32 != sp) { printf("[QNET] R1 MISMATCH " what ": r1 %08X -> %08X lr=%08X\n", sp, ctx.r1.u32, lr); \
+                                fflush(stdout); }                                                                   \
+        if ((++n <= 8 || (lsw_qnet_verbose && n <= 8 + 300))) { printf("[QNET] " what "(%08X, %08X, %08X) -> %08X lr=%08X\n", a3, a4, a5, ctx.r3.u32, lr);    \
+                        fflush(stdout); }                                                                           \
+    }
+// Voice engine create (sub_82ADB058, called by LibInit): its steps. The event / thread / duplicate helpers are used
+// everywhere, so those log only when called from the network library / voice code (lr 0x829B0000-0x82AF0000).
+#define QNET_RET_PROBE_LR(A, what)                                                                                  \
+    PPC_FUNC(sub_##A) {                                                                                             \
+        static int n = 0;                                                                                           \
+        const uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32, a5 = ctx.r5.u32, lr = uint32_t(ctx.lr);                     \
+        __imp__sub_##A(ctx, base);                                                                                  \
+        if (lr >= 0x829B0000u && lr < 0x82AF0000u && (++n <= 16 || (lsw_qnet_verbose && n <= 16 + 300))) {                                                   \
+            printf("[QNET] " what "(%08X, %08X, %08X) -> %08X lr=%08X\n", a3, a4, a5, ctx.r3.u32, lr); fflush(stdout); } \
+    }
+extern "C" PPC_FUNC(__imp__sub_82ADB058);
+extern "C" PPC_FUNC(__imp__sub_82AD9370);
+extern "C" PPC_FUNC(__imp__sub_82ADEBB0);
+extern "C" PPC_FUNC(__imp__sub_82AE02F0);
+extern "C" PPC_FUNC(__imp__sub_82ADC000);
+extern "C" PPC_FUNC(__imp__sub_82ADF7D0);
+extern "C" PPC_FUNC(__imp__sub_82534EC0);
+extern "C" PPC_FUNC(__imp__sub_82538A38);
+extern "C" PPC_FUNC(__imp__sub_82AEFB60);
+extern "C" PPC_FUNC(__imp__sub_8229F3D0);
+QNET_RET_PROBE(82ADB058, "VoiceCreate")
+QNET_RET_PROBE(82AD9370, "VoiceStep1")
+QNET_RET_PROBE(82ADEBB0, "VoiceLocalTalker")
+QNET_RET_PROBE(82AE02F0, "VoiceRemoteTalker")
+QNET_RET_PROBE(82ADC000, "VoiceRemoteSub")
+QNET_RET_PROBE(82ADF7D0, "VoiceRemoteFinish")
+QNET_RET_PROBE_LR(82534EC0, "VoiceEvent")
+QNET_RET_PROBE_LR(82538A38, "VoiceThread")
+QNET_RET_PROBE_LR(82AEFB60, "VoiceDupHandle")
+QNET_RET_PROBE_LR(8229F3D0, "Voice8229F3D0")
+QNET_RET_PROBE(829BE820, "LibCreate")
+QNET_RET_PROBE(829C08F0, "LibAlloc")
+QNET_RET_PROBE(82536308, "LibNotifyListener")
+QNET_RET_PROBE(829B71C0, "LibInit")
+// Host crash when the first player joined (Switch A, 2026-10-15): the library's pending-request slot (+740 of the
+// connection object) held 3, and releasing it (sub_829C73F0 -> sub_829CDFC8(obj): obj-1036 / obj-72) dereferenced
+// 0xFFFFFBF7. These log the stores into +740 (sub_829C4928/4A20/4AE8/CAAD0/CB390/C3DD8: this in r3, value after the
+// call) and the release; sub_829CDFC8 skips an object that is not a guest pointer (LSWTCS_QNETGUARD=0: off).
+extern "C" PPC_FUNC(__imp__sub_829C73F0);
+extern "C" PPC_FUNC(__imp__sub_829CDFC8);
+#define QNET_SLOT_PROBE(A)                                                                                          \
+    extern "C" PPC_FUNC(__imp__sub_##A);                                                                            \
+    PPC_FUNC(sub_##A) {                                                                                             \
+        static int n = 0;                                                                                           \
+        const uint32_t self = ctx.r3.u32, a4 = ctx.r4.u32, a5 = ctx.r5.u32, lr = uint32_t(ctx.lr);                   \
+        __imp__sub_##A(ctx, base);                                                                                  \
+        if ((++n <= 16 || (lsw_qnet_verbose && n <= 16 + 300)) && self >= 0x80000000u && self < 0xE0000000u) {                                               \
+            printf("[QNET] sub_" #A "(this=%08X, %08X, %08X) -> %08X; [+740]=%08X [+744]=%08X [+752]=%08X lr=%08X\n", \
+                   self, a4, a5, ctx.r3.u32, PPC_LOAD_U32(self + 740), PPC_LOAD_U32(self + 744),                     \
+                   PPC_LOAD_U32(self + 752), lr); fflush(stdout); }                                                \
+    }
+// Packet path on the host: sub_829D0BE8 (receive completion) -> sub_829CFF20 (process) / sub_829D0AC0 (re-post).
+extern "C" PPC_FUNC(__imp__sub_829CFF20);
+extern "C" PPC_FUNC(__imp__sub_829D0AC0);
+extern "C" PPC_FUNC(__imp__sub_829BF1D0);
+// Library message queue insert (sub_829C5B40(queue r3, msg r4)): the pump later dequeued stack addresses.
+extern "C" PPC_FUNC(__imp__sub_829C5B40);
+PPC_FUNC(sub_829C5B40) {
+    static int n = 0;
+    if ((++n <= 48 || (lsw_qnet_verbose && n <= 48 + 300))) { printf("[QNET] enqueue queue=%08X msg=%08X lr=%08X\n", ctx.r3.u32, ctx.r4.u32, uint32_t(ctx.lr)); fflush(stdout); }
+    __imp__sub_829C5B40(ctx, base);
+}
+QNET_RET_PROBE(829CFF20, "PktProcess")
+QNET_RET_PROBE(829D0AC0, "RecvRepost")
+QNET_RET_PROBE(829BF1D0, "StateUpdate")
+// Event -> message conversion (sub_829CB7A8(conn, msg** r4)): events from sub_829CDF58(*(conn+104), 0, event**),
+// type at event+4, built by sub_829CAAD0/CB6E0/CAD10/CB390/C4928/C4A20/C4AE8/C8A28. These log each event and the
+// message handed out.
+extern "C" PPC_FUNC(__imp__sub_829CDF58);
+PPC_FUNC(sub_829CDF58) {
+    static int n = 0;
+    const uint32_t out = ctx.r5.u32, lr = uint32_t(ctx.lr);
+    __imp__sub_829CDF58(ctx, base);
+    if (lr >= 0x829CB7A8u && lr < 0x829CB940u && out >= 0x80000000u && out < 0xE0000000u && PPC_LOAD_U32(out) != 0 &&
+        (++n <= 32 || (lsw_qnet_verbose && n <= 32 + 300))) {   // non-empty events only (empty polls used up the cap)
+        const uint32_t ev = PPC_LOAD_U32(out);
+        printf("[QNET] event -> %08X: %08X type=%d +8=%08X +20=%08X +24=%08X\n", ctx.r3.u32, ev,
+               ev >= 0x80000000u && ev < 0xE0000000u ? int32_t(PPC_LOAD_U32(ev + 4)) : -1,
+               ev >= 0x80000000u && ev < 0xE0000000u ? PPC_LOAD_U32(ev + 8) : 0,
+               ev >= 0x80000000u && ev < 0xE0000000u ? PPC_LOAD_U32(ev + 20) : 0,
+               ev >= 0x80000000u && ev < 0xE0000000u ? PPC_LOAD_U32(ev + 24) : 0);
+        fflush(stdout);
+    }
+}
+// Pump dequeue (sub_829C0788(queue r3, 0, msg** r5) -> hr). Two-Switch test 2026-10-15: right after the first join
+// packet the host's pump (sub_829BF1D0) re-entered itself with every message read from stack garbage (r1 dropping
+// 0x835FF830 -> 7A0 -> 5F0 -> ...): the dequeue said success (hr 0) without a message, the pump dispatched on the word
+// at address 4 and its handler called back into the pump. Guard (LSWTCS_QNETGUARD, default on): success without a
+// valid message reads as "empty" (S_FALSE), so the pump returns. lsw_qnet_verbose (set by lsw_net.inc at the first
+// game packet received) logs every dequeue from then on (300 lines).
+extern "C" PPC_FUNC(__imp__sub_829C0788);
+PPC_FUNC(sub_829C0788) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LSWTCS_QNETGUARD"); on = !(e && e[0] == '0'); }
+    static int n = 0;
+    const uint32_t out = ctx.r5.u32, q = ctx.r3.u32, sp = ctx.r1.u32, lr = uint32_t(ctx.lr);
+    const bool out_ok = out >= 0x80000000u && out < 0xE0000000u;
+    if (on && out_ok) PPC_STORE_U32(out, 0);   // no stale message from the caller's stack slot
+    __imp__sub_829C0788(ctx, base);
+    const uint32_t msg = out_ok ? PPC_LOAD_U32(out) : 0;
+    const bool msg_ok = msg >= 0x80000000u && msg < 0xE0000000u;
+    const int32_t type = msg_ok ? int32_t(PPC_LOAD_U32(msg + 4)) : -1;
+    if (lsw_qnet_verbose && ++n <= 300) {
+        printf("[QNET] pump dequeue q=%08X -> hr=%08X msg=%08X type=%d r1=%08X lr=%08X\n", q, ctx.r3.u32, msg, type, sp, lr);
+        fflush(stdout);
+    }
+    if (on && ctx.r3.u32 == 0 && !msg_ok) {
+        static int g = 0;
+        if (g++ < 32) { printf("[QNET] pump dequeue: success without a message (msg=%08X), reported empty (r1=%08X)\n", msg, sp); fflush(stdout); }
+        if (out_ok) PPC_STORE_U32(out, 0);
+        ctx.r3.u32 = 1;   // S_FALSE: the pump's "bne" exits
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_829CB7A8);
+PPC_FUNC(sub_829CB7A8) {
+    static int n = 0;
+    const uint32_t out = ctx.r4.u32, self = ctx.r3.u32;
+    __imp__sub_829CB7A8(ctx, base);
+    const uint32_t msg = out >= 0x80000000u && out < 0xE0000000u ? PPC_LOAD_U32(out) : 0;
+    if ((msg || lsw_qnet_verbose) && (++n <= 32 || (lsw_qnet_verbose && n <= 32 + 600))) {
+        printf("[QNET] dequeue conn=%08X -> hr=%08X msg=%08X type=%d [+328]=%08X [+752]=%08X r1=%08X\n", self, ctx.r3.u32, msg,
+               msg >= 0x80000000u && msg < 0xE0000000u ? int32_t(PPC_LOAD_U32(msg + 4)) : -1,
+               self >= 0x80000000u && self < 0xE0000000u ? PPC_LOAD_U32(self + 328) : 0,
+               self >= 0x80000000u && self < 0xE0000000u ? PPC_LOAD_U32(self + 752) : 0, ctx.r1.u32);
+        fflush(stdout);
+    }
+}
+QNET_SLOT_PROBE(829CB6E0)
+QNET_SLOT_PROBE(829CAD10)
+QNET_SLOT_PROBE(829C8A28)
+// sub_829C9478(conn r3, msg** r4): called by the dequeue when no event is pending; returns 0 when it produced a
+// message. After the join packet the dequeue said "message ready" with none: log its result and slot every call.
+extern "C" PPC_FUNC(__imp__sub_829C9478);
+PPC_FUNC(sub_829C9478) {
+    static int n = 0;
+    const uint32_t self = ctx.r3.u32, out = ctx.r4.u32, sp = ctx.r1.u32, lr = uint32_t(ctx.lr);
+    const bool ok = self >= 0x80000000u && self < 0xE0000000u, out_ok = out >= 0x80000000u && out < 0xE0000000u;
+    const uint32_t before = out_ok ? PPC_LOAD_U32(out) : 0, f328 = ok ? PPC_LOAD_U32(self + 328) : 0, f752 = ok ? PPC_LOAD_U32(self + 752) : 0;
+    __imp__sub_829C9478(ctx, base);
+    if (++n <= 8 || (lsw_qnet_verbose && n <= 8 + 600)) {
+        const uint32_t msg = out_ok ? PPC_LOAD_U32(out) : 0;
+        printf("[QNET] C9478 conn=%08X out=%08X before=%08X -> hr=%08X msg=%08X [+328] %08X->%08X [+752] %08X->%08X [+740]=%08X r1=%08X lr=%08X\n",
+               self, out, before, ctx.r3.u32, msg, f328, ok ? PPC_LOAD_U32(self + 328) : 0, f752, ok ? PPC_LOAD_U32(self + 752) : 0,
+               ok ? PPC_LOAD_U32(self + 740) : 0, sp, lr);
+        fflush(stdout);
+    }
+}
+QNET_SLOT_PROBE(829C4928)
+QNET_SLOT_PROBE(829C4A20)
+QNET_SLOT_PROBE(829C4AE8)
+QNET_SLOT_PROBE(829CAAD0)
+QNET_SLOT_PROBE(829CB390)
+QNET_SLOT_PROBE(829C3DD8)
+PPC_FUNC(sub_829C73F0) {
+    static int n = 0;
+    const uint32_t self = ctx.r3.u32;
+    if ((++n <= 32 || (lsw_qnet_verbose && n <= 32 + 300)) && self >= 0x80000000u && self < 0xE0000000u) {
+        printf("[QNET] release this=%08X [+740]=%08X [+744]=%08X [+752]=%08X lr=%08X r1=%08X\n", self, PPC_LOAD_U32(self + 740),
+               PPC_LOAD_U32(self + 744), PPC_LOAD_U32(self + 752), uint32_t(ctx.lr), ctx.r1.u32);
+        fflush(stdout);
+    }
+    __imp__sub_829C73F0(ctx, base);
+}
+PPC_FUNC(sub_829CDFC8) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LSWTCS_QNETGUARD"); on = !(e && e[0] == '0'); }
+    if (on && (ctx.r3.u32 < 0x80000000u || ctx.r3.u32 >= 0xE0000000u)) {
+        static int n = 0;
+        if (n++ < 16) { printf("[QNET] sub_829CDFC8: object %08X is not a guest pointer, skipped (lr=%08X)\n", ctx.r3.u32, uint32_t(ctx.lr)); fflush(stdout); }
+        return;
+    }
+    __imp__sub_829CDFC8(ctx, base);
+}
+PPC_FUNC(sub_82494368) { qnet_entry_log(base, ctx, "HostGame"); __imp__sub_82494368(ctx, base); }
+PPC_FUNC(sub_82495358) { qnet_entry_log(base, ctx, "SearchForHosts"); __imp__sub_82495358(ctx, base); }
+// Formats a guest printf (format r3, up to 5 integer arguments r4-r8; %s when the argument points at guest text).
+static void guest_printf(uint8_t* base, PPCContext& ctx, const char* tag) {
+    {
         char fmt[200], out[400];
         dbgprint_guest_str(base, ctx.r3.u32, fmt, sizeof fmt);
         const uint32_t a[5] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32};
@@ -445,16 +671,16 @@ PPC_FUNC(sub_824541D0) {
             char s[96];
             const uint32_t v = ai < 5 ? a[ai++] : 0;
             if (*q == 's') dbgprint_guest_str(base, v, s, sizeof s);
-            else if (*q == 'x' || *q == 'X') snprintf(s, sizeof s, "%x", v);
+            else if (*q == 'x' || *q == 'X' || *q == 'p') snprintf(s, sizeof s, "%x", v);
             else if (*q == 'f' || *q == 'g') snprintf(s, sizeof s, "<float>");
             else snprintf(s, sizeof s, "%d", int32_t(v));
             o += size_t(snprintf(out + o, sizeof out - o, "%s", s));
             if (o >= sizeof out) o = sizeof out - 1;
         }
         out[o] = 0;
-        printf("[DBGPRINT] %s (lr=%08X)\n", out, uint32_t(ctx.lr));
+        printf("[%s] %s (lr=%08X)\n", tag, out, uint32_t(ctx.lr));
+        fflush(stdout);
     }
-    __imp__sub_824541D0(ctx, base);
 }
 
 static void camcmd_log_install() {

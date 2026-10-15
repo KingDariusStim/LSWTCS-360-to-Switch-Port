@@ -10,8 +10,11 @@
 param([Parameter(Mandatory)][string]$Cmd, [string]$A, [string]$B, [Parameter(ValueFromRemainingArguments)][string[]]$Names)
 $ErrorActionPreference = 'Stop'
 $sh = New-Object -ComObject Shell.Application
-$dev = $sh.NameSpace(17).Items() | Where-Object { $_.Name -eq 'Nintendo Switch' }
-if (-not $dev) { throw 'Nintendo Switch not connected over USB (start the MTP responder, e.g. DBI)' }
+$devs = @($sh.NameSpace(17).Items() | Where-Object { $_.Name -eq 'Nintendo Switch' })
+if (-not $devs.Count) { throw 'Nintendo Switch not connected over USB (start the MTP responder, e.g. DBI)' }
+# Two consoles connected: LSW_MTP_DEV=0 / 1 picks one (order as Explorer lists them).
+if ($devs.Count -gt 1 -and $env:LSW_MTP_DEV -eq $null) { throw "$($devs.Count) consoles connected: set LSW_MTP_DEV=0..$($devs.Count - 1)" }
+$dev = $devs[[int]$env:LSW_MTP_DEV]
 $sd = $dev.GetFolder.Items() | Where-Object { $_.Name -eq 'SD Card' }
 if (-not $sd) { throw 'no "SD Card" storage on the device' }
 function Get-Size($item) { [long]$item.ExtendedProperty('System.Size') }   # .Size reads 0 over MTP
